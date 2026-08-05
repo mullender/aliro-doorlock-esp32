@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>aliro-doorlock-esp32 installer tests</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 1rem; line-height: 1.5; }
+    h1 { font-size: 1.5rem; }
+    section { margin: 1.5rem 0; padding: 1rem; border-left: 4px solid #ccc; }
+    .ok { border-left-color: #2a2; }
+    .fail { border-left-color: #c22; }
+    .summary { font-size: 1.1rem; font-weight: bold; padding: 1rem; border: 1px solid #ccc; margin: 1rem 0; }
+    .summary.ok { background: #d4f4d4; color: #113; }
+    .summary.fail { background: #f4d4d4; color: #311; }
+    pre { background: #f4f4f4; padding: 0.5rem; overflow-x: auto; font-size: 0.85em; }
+    @media (prefers-color-scheme: dark) {
+      pre { background: #333; color: #eee; }
+      .summary.ok { background: #123; color: #dfd; }
+      .summary.fail { background: #321; color: #fdd; }
+    }
+    .qr-preview { display: inline-block; margin: 0.5rem; padding: 0.5rem; background: white; }
+    .qr-preview svg { display: block; }
+  </style>
+</head>
+<body>
+
+<h1>aliro-doorlock-esp32 installer tests</h1>
+<p>Open this file directly in a browser (no server needed). Each expected result is compared to the actual result and reported below.</p>
+
+<div id="summary" class="summary">Running...</div>
+
+<h2>Positive vectors</h2>
+<div id="positive"></div>
+
+<h2>Negative vectors</h2>
+<div id="negative"></div>
+
+<h2>QR preview (positive vectors)</h2>
+<div id="qr-previews"></div>
+
+<script src="../vendor/qrcode.js"></script>
+<script type="module">
+import { validateMTPayload, validateManualCode, validatePair, __internals } from "../js/matter-payload.js";
+import { renderMTasSVG } from "../js/qr-render.js";
+import { VECTORS, NEGATIVE_VECTORS } from "./test-vectors.js";
+
+let pass = 0, fail = 0;
+
+function section(container, title, ok, details) {
+  const el = document.createElement("section");
+  el.className = ok ? "ok" : "fail";
+  el.innerHTML = `<strong>${ok ? "PASS" : "FAIL"}</strong> — ${title}` +
+                 (details ? `<pre>${details}</pre>` : "");
+  container.appendChild(el);
+  if (ok) pass++; else fail++;
+}
+
+const positiveEl = document.getElementById("positive");
+const negativeEl = document.getElementById("negative");
+const qrEl = document.getElementById("qr-previews");
+
+// Positive vectors — every one must validate.
+for (const v of VECTORS) {
+  const pair = validatePair(v.mt, v.manualCode);
+  section(positiveEl, v.label, pair.valid,
+          pair.valid ? `mt=${v.mt}\nmanual=${v.manualCode}` : pair.error);
+
+  // QR render should not throw and should produce a non-empty SVG.
+  try {
+    const svg = renderMTasSVG(v.mt, { size: 240 });
+    const looksLikeSvg = svg.startsWith("<svg") && svg.includes("</svg>") && svg.length > 500;
+    section(positiveEl, `${v.label} → renders SVG`, looksLikeSvg,
+            `svg length=${svg.length} chars`);
+
+    const box = document.createElement("div");
+    box.className = "qr-preview";
+    box.innerHTML = svg + `<div style="font-family:monospace;font-size:0.7em;padding-top:.3em;text-align:center;color:#000;">${v.mt}</div>`;
+    qrEl.appendChild(box);
+  } catch (e) {
+    section(positiveEl, `${v.label} → renders SVG`, false, String(e));
+  }
+}
+
+// Negative vectors — every one must fail with the expected error.
+for (const v of NEGATIVE_VECTORS) {
+  const pair = validatePair(v.mt, v.manualCode);
+  const ok = !pair.valid && v.expectError.test(pair.error || "");
+  section(negativeEl, v.label, ok,
+          `mt=${JSON.stringify(v.mt)}\nmanual=${JSON.stringify(v.manualCode)}\n` +
+          `got: ${pair.valid ? "PASSED (should have failed)" : pair.error}\n` +
+          `expected error regex: ${v.expectError}`);
+}
+
+// Verhoeff self-test using the Matter shared example's body directly.
+// This is the ONLY Verhoeff test vector we know is authoritative for
+// this project — the shared MT: manual code 34970112332 has check
+// digit 2 by construction. If this test fails, either the algorithm
+// or the Matter manual-code encoding has changed.
+{
+  const body = [3, 4, 9, 7, 0, 1, 1, 2, 3, 3];
+  const cd = __internals.verhoeffCheckDigit(body);
+  section(negativeEl, "Verhoeff self-test (Matter shared example body → 2)",
+          cd === 2, `got check digit ${cd}`);
+}
+
+// Final summary
+const s = document.getElementById("summary");
+s.className = "summary " + (fail === 0 ? "ok" : "fail");
+s.textContent = `${pass} passed, ${fail} failed`;
+if (fail === 0) {
+  document.title = "PASS — " + document.title;
+} else {
+  document.title = "FAIL — " + document.title;
+}
+</script>
+</body>
+</html>
