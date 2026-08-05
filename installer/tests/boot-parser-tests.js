@@ -105,7 +105,7 @@ export async function runBootParserTests(container) {
     const port = {
       readable: stream,
       async setSignals(value) {
-        signalChanges.push(value.requestToSend);
+        signalChanges.push(value);
         if (value.requestToSend === false) {
           controller.enqueue(encoder.encode(validLog));
           controller.close();
@@ -113,7 +113,12 @@ export async function runBootParserTests(container) {
       },
     };
     const result = await parseMatterOnboardingCodes(port, { timeoutMs: 300 });
-    const ok = result.ok && signalChanges.join(",") === "true,false" &&
+    const expectedSignals = [
+      { dataTerminalReady: false, requestToSend: true },
+      { dataTerminalReady: false, requestToSend: false },
+    ];
+    const ok = result.ok &&
+      JSON.stringify(signalChanges) === JSON.stringify(expectedSignals) &&
       !stream.locked;
     const el = document.createElement("section");
     el.className = ok ? "ok" : "fail";

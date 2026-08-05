@@ -21,8 +21,8 @@
 // bytes until BOTH lines match or the timeout fires, releases the
 // reader, and returns.
 //
-// It NEVER writes to flash. At most, it toggles RTS once to reset the
-// device and request a fresh boot log.
+// It NEVER writes to flash. At most, it holds BOOT inactive and toggles
+// RTS once to reset the device and request a fresh boot log.
 //
 // Regexes are tolerant of:
 //   - "CHIP:SVR" vs "CHIP: SVR" spacing
@@ -83,9 +83,17 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
       logger("boot-parser: no codes yet, resetting device once");
       resetPromise = (async () => {
         try {
-          await port.setSignals({ requestToSend: true });
+          // DTR controls GPIO9/BOOT on the NanoC6. Keep it false while
+          // RTS resets the chip, or the ROM starts in download mode.
+          await port.setSignals({
+            dataTerminalReady: false,
+            requestToSend: true,
+          });
           await new Promise((resolve) => setTimeout(resolve, 100));
-          await port.setSignals({ requestToSend: false });
+          await port.setSignals({
+            dataTerminalReady: false,
+            requestToSend: false,
+          });
         } catch (err) {
           logger(`boot-parser: reset failed: ${err.message}`, "error");
         }
