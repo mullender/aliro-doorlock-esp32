@@ -111,7 +111,7 @@ for (const v of NEGATIVE_VECTORS) {
 
 // Boot parser fixtures
 const bpEl = document.getElementById("boot-parser");
-const bp = runBootParserTests(bpEl);
+const bp = await runBootParserTests(bpEl);
 pass += bp.pass;
 fail += bp.fail;
 

@@ -1,0 +1,32 @@
+# Release overlay for the M5Stack NanoC6 devkit build.
+#
+# Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. Only the
+# NanoC6-specific deltas from that base live here. The base supplies
+# every Aliro, Thread, BLE, mbedTLS, and partition setting; do NOT
+# duplicate those here. The overlay is a single-file audit of what
+# this project changes on top of the stock aliro config.
+#
+# The build script passes:
+#   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"
+# so the entries below override any conflicting values from the base.
+
+# --- Single button on GPIO 9, active-low --------------------------------
+# The M5 NanoC6 exposes one user button wired to GPIO 9, active-low
+# (the same pin used by the ROM bootloader for download-mode entry).
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=9
+CONFIG_BSP_BUTTON_1_LEVEL=0
+
+# --- No LEDs ------------------------------------------------------------
+# The NanoC6 carries an on-board RGB LED but the devkit build does not
+# drive it. Zero LEDs keeps the led_strip / RGB backends out of the
+# binary entirely.
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console -----------------------------------------------
+# The NanoC6 USB-C connector is wired to the ESP32-C6 USB Serial/JTAG
+# controller. Make that controller the primary bidirectional console.
+# A secondary USB console can transmit logs, but it cannot receive
+# console input.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

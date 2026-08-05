@@ -3,6 +3,102 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
+## 2026-08-05: NanoC6 serial-output investigation
+
+### Approved findings
+
+- The `aliro-c6-v0.0.1-devkit` build uses UART0 as its primary
+  console. USB Serial/JTAG is only the secondary output channel.
+- ESP-IDF documents that the secondary USB channel supports output
+  only. Console input and REPL commands require USB Serial/JTAG as
+  the primary console.
+- `CONFIG_ENABLE_CHIP_SHELL` is disabled in the built firmware. The
+  installer's `matter onboardingcodes` fallback command cannot run.
+- The published ELF has no `PrintOnboardingCodes` symbol and no
+  `SetupQRCode` or `Manual pairing code` strings. Contrary to an
+  older ledger entry below, the pinned `esp-matter` door-lock example
+  does not print the Matter onboarding codes.
+- Neither the ESP Web Tools reset action nor the NanoC6 physical reset
+  produced visible USB logs. This confirms that the fault is not only
+  in the web reset action.
+- HomeKey-ESP32 uses `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, which is
+  the correct console mode for a board connected through native USB.
+
+The user approved these facts after the physical-reset test.
+
+### Decision
+
+- Publish a new prerelease. Do not replace the known-bad v0.0.1
+  asset.
+- Make USB Serial/JTAG the primary console.
+- Apply a small, audited source patch during the pinned build so the
+  door-lock example calls `PrintOnboardingCodes()` after Matter starts.
+- Replace the invalid shell-command fallback with a hardware reset
+  request. The reset gives the parser a second chance to read the
+  boot-time pairing lines.
+
+## 2026-08-05: First release build prep (on `feat/first-release`)
+
+Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.
+
+### Findings
+
+- **Shared esp-matter tree is dirty and git-lfs missing.** Snapshotted
+  the target commit (`85c76a1`) via `git archive | tar -x` into a
+  temp directory instead of a fresh clone or worktree. The archive
+  writes an empty `connectedhomeip/connectedhomeip/` placeholder;
+  we replaced it with a symlink into the shared checkout's populated
+  submodule so we don't have to re-clone the 14 GB tree. Shared tree
+  untouched.
+- **ESP-IDF v5.5.4 confirmed** from
+  `components/esp_common/include/esp_idf_version.h` (MAJOR=5,
+  MINOR=5, PATCH=4). Skipped the `idf.py --version` call after a
+  hang.
+- **`CONFIG_ESP_MATTER_NVS_USE_COMPACT_ATTR_STORAGE` is unknown to
+  esp-matter `85c76a1`.** `idf.py` drops it as an unrecognised
+  symbol at set-target time. Removed from the overlay. Documented
+  in `firmware/RELEASE.md` so a future esp-matter bump can revisit.
+- **esp-matter `export.sh` reads `ESP_MATTER_PATH` without a
+  default.** With `set -u` (nounset) in the build script, the
+  source of that file trips on unbound-variable. `build_release.sh`
+  now sets `ESP_MATTER_PATH=$ESP_MATTER_SRC` before sourcing.
+- **Existing merged binaries in the shared esp-matter checkout** came
+  from earlier ad-hoc builds against a dirty tree. They were not used.
+
+### Decisions
+
+- **Feature branch:** `feat/first-release`, off `origin/main`.
+- **Release overlay contents:** exactly five verified BSP symbols:
+  `BSP_BUTTONS_NUM=1`, `BSP_BUTTON_1_TYPE_GPIO=y`,
+  `BSP_BUTTON_1_GPIO=9`, `BSP_BUTTON_1_LEVEL=0`, `BSP_LEDS_NUM=0`.
+  Nothing else. The base `sdkconfig.esp32c6.aliro` supplies every
+  other setting.
+- **Git ignores artifacts.** The binary and its SHA-256 live at
+  `artifacts/aliro-c6-v0.0.1-devkit/` locally and are uploaded to
+  the GitHub Release; not tracked.
+- **Snapshot approach** (`git archive` + connectedhomeip symlink)
+  documented in `firmware/RELEASE.md` as the reproducible path.
+
+### Result
+
+- The clean build completed. The app image is 1,606,208 bytes. The
+  merged factory image is 4,194,304 bytes.
+- Factory SHA-256:
+  `675247acf8660a8a0cab68dcb15634075a35f9ffa40842d9b3054f8a392d7fcf`.
+- The app image checksum and validation hash are valid.
+- The generated config enables Thread and Aliro over NFC. It disables
+  the Wi-Fi station. The factory image has no portal or Wi-Fi
+  credential markers.
+- GitHub prerelease `aliro-c6-v0.0.1-devkit` now contains the factory
+  binary, SHA-256 file, and part manifest.
+- The `github-pages` environment now allows tags that match
+  `aliro-c6-*`. Workflow run `31031424301` passed after this rule was
+  added.
+- The live installer selects ESP32-C6 and offset `0`. The public 4 MB
+  binary matches the release SHA-256.
+
+---
+
 ## 2026-08-05 — GitHub push (completed)
 
 Both local repos are now on GitHub. The submodule reference resolves.
