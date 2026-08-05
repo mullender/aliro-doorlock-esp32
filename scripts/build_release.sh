@@ -16,7 +16,7 @@
 #                    exits if unset.
 #
 # Optional environment:
-#   TAG              release tag; default aliro-c6-v0.0.1-devkit
+#   TAG              release tag; default aliro-c6-v0.0.2-devkit
 #   ESP_MATTER_REVISION
 #                    required when ESP_MATTER_SRC is a git archive
 #
@@ -32,7 +32,7 @@ set -euo pipefail
 : "${ESP_MATTER_SRC:?set to absolute path of a clean esp-matter source tree}"
 : "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
 
-TAG="${TAG:-aliro-c6-v0.0.1-devkit}"
+TAG="${TAG:-aliro-c6-v0.0.2-devkit}"
 PINNED_ESP_MATTER="85c76a1788c5b70b4b0811734af8616dda15e7ac"
 PINNED_CONNECTEDHOMEIP="efefc94fee39d8d1fbbc3c27b9d7fc9025095887"
 
@@ -72,30 +72,50 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OVERLAY="$REPO_ROOT/firmware/overlay/sdkconfig.release.nanoc6"
+APP_PATCH="$REPO_ROOT/firmware/patches/0001-print-onboarding-codes.patch"
 if [[ ! -f "$OVERLAY" ]]; then
   echo "error: overlay not found at $OVERLAY" >&2
   exit 2
 fi
-
-APP_DIR="$ESP_MATTER_SRC/examples/door_lock"
-
-# Copy the overlay into the example dir so idf.py's SDKCONFIG_DEFAULTS
-# search resolves it relative to the app directory. The cleanup trap
-# below removes the copy.
-OVERLAY_LOCAL="$APP_DIR/sdkconfig.release.nanoc6"
-if [[ -e "$OVERLAY_LOCAL" ]]; then
-  echo "error: refusing to overwrite existing $OVERLAY_LOCAL" >&2
+if [[ ! -f "$APP_PATCH" ]]; then
+  echo "error: app patch not found at $APP_PATCH" >&2
   exit 2
 fi
-cp "$OVERLAY" "$OVERLAY_LOCAL"
+
+APP_DIR="$ESP_MATTER_SRC/examples/door_lock"
+OVERLAY_LOCAL="$APP_DIR/sdkconfig.release.nanoc6"
+PATCH_APPLIED=0
+OVERLAY_COPIED=0
 
 cleanup() {
   # Restore the pristine example directory by removing artifacts the
   # build created (except build/, which is what the caller wants).
   # The overlay copy is ours; safe to delete.
-  [[ -f "$OVERLAY_LOCAL" ]] && command rm -f "$OVERLAY_LOCAL"
+  if [[ "$OVERLAY_COPIED" == "1" && -f "$OVERLAY_LOCAL" ]]; then
+    command rm -f "$OVERLAY_LOCAL"
+  fi
+  if [[ "$PATCH_APPLIED" == "1" ]]; then
+    if ! patch --batch --reverse -p1 -d "$ESP_MATTER_SRC" < "$APP_PATCH" >/dev/null; then
+      echo "warning: could not remove the release source patch" >&2
+    fi
+  fi
 }
 trap cleanup EXIT
+
+if [[ -e "$OVERLAY_LOCAL" ]]; then
+  echo "error: refusing to overwrite existing $OVERLAY_LOCAL" >&2
+  exit 2
+fi
+
+# The pinned example does not call PrintOnboardingCodes(). Apply the
+# audited project delta for this build, then remove it in cleanup.
+patch --batch --forward -p1 -d "$ESP_MATTER_SRC" < "$APP_PATCH"
+PATCH_APPLIED=1
+
+# Copy the overlay into the example dir so idf.py's SDKCONFIG_DEFAULTS
+# search resolves it relative to the app directory.
+cp "$OVERLAY" "$OVERLAY_LOCAL"
+OVERLAY_COPIED=1
 
 cd "$APP_DIR"
 

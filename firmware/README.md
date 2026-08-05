@@ -10,6 +10,8 @@ overlay (`overlay/sdkconfig.release.nanoc6`) layered on top of the
 stock `sdkconfig.esp32c6.aliro`.
 
 - `overlay/sdkconfig.release.nanoc6` contains the board changes.
+- `patches/0001-print-onboarding-codes.patch` makes the pinned example
+  print its Matter pairing codes after startup.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot.

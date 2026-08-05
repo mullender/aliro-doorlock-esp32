@@ -11,10 +11,8 @@
 //     timeoutMs?: number,                    default 12_000
 //     signal?: AbortSignal,                  optional external cancel
 //     logger?: (msg, level) => void,         default console.log
-//     requestReemit?: boolean,               default true — write
-//                                             "matter onboardingcodes\n"
-//                                             on timeout as a last-ditch
-//                                             refresh
+//     requestReset?: boolean,                default true — reset the
+//                                             device once at mid-timeout
 //   })
 //     -> Promise<{ mt: string, manualCode: string, log: string }>
 //
@@ -23,8 +21,8 @@
 // bytes until BOTH lines match or the timeout fires, releases the
 // reader, and returns.
 //
-// It NEVER writes to flash. It only writes the harmless shell command
-// `matter onboardingcodes\n` as a fallback re-emit.
+// It NEVER writes to flash. At most, it toggles RTS once to reset the
+// device and request a fresh boot log.
 //
 // Regexes are tolerant of:
 //   - "CHIP:SVR" vs "CHIP: SVR" spacing
@@ -62,7 +60,7 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     signal,
     logger = (msg, level) => (level === "error" ? console.error(msg) : console.log(msg)),
-    requestReemit = true,
+    requestReset = true,
   } = opts;
 
   if (!port || !port.readable) {
@@ -77,9 +75,27 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
   let mtFromUrl = null;
   let buffer = "";
   let rawLog = "";
-  let reemitted = false;
+  let resetTimer = null;
+  let resetPromise = Promise.resolve();
+
+  if (requestReset) {
+    resetTimer = setTimeout(() => {
+      logger("boot-parser: no codes yet, resetting device once");
+      resetPromise = (async () => {
+        try {
+          await port.setSignals({ requestToSend: true });
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await port.setSignals({ requestToSend: false });
+        } catch (err) {
+          logger(`boot-parser: reset failed: ${err.message}`, "error");
+        }
+      })();
+    }, timeoutMs / 2);
+  }
 
   const cleanup = async () => {
+    if (resetTimer !== null) clearTimeout(resetTimer);
+    await resetPromise;
     try { reader.releaseLock(); } catch { /* already released */ }
   };
 
@@ -144,28 +160,6 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
       }
       if (mt && manualCode) break;
 
-      // If nothing matched after ~half the budget and we haven't asked
-      // yet, request a re-emit.
-      const midpoint = timeoutMs / 2;
-      if (
-        requestReemit &&
-        !reemitted &&
-        performance.now() - started > midpoint &&
-        (!mt || !manualCode)
-      ) {
-        reemitted = true;
-        logger("boot-parser: no codes yet, requesting shell re-emit");
-        try {
-          const writer = port.writable?.getWriter();
-          if (writer) {
-            const encoder = new TextEncoder();
-            await writer.write(encoder.encode("\nmatter onboardingcodes\n"));
-            writer.releaseLock();
-          }
-        } catch (err) {
-          logger(`boot-parser: re-emit write failed: ${err.message}`, "error");
-        }
-      }
     }
   } finally {
     await cleanup();

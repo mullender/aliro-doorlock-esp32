@@ -4,7 +4,7 @@
 // SerialPort. Wire this in from tests/index.html alongside the
 // matter-payload tests.
 
-import { __internals } from "../js/boot-parser.js";
+import { parseMatterOnboardingCodes, __internals } from "../js/boot-parser.js";
 import { LOG_FIXTURES } from "./boot-log-fixtures.js";
 
 const { RE_MT, RE_MANUAL, RE_MT_URL, RE_ANSI } = __internals;
@@ -41,7 +41,7 @@ function parseLog(log) {
   return { mt, manualCode };
 }
 
-export function runBootParserTests(container) {
+export async function runBootParserTests(container) {
   let pass = 0, fail = 0;
   for (const f of LOG_FIXTURES) {
     const result = parseLog(f.log);
@@ -66,5 +66,62 @@ export function runBootParserTests(container) {
     }
     container.appendChild(el);
   }
+
+  const validLog = [
+    "CHIP:SVR: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
+    "CHIP:SVR: Manual pairing code: [34970112332]",
+    "",
+  ].join("\n");
+  const encoder = new TextEncoder();
+
+  {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(validLog));
+        controller.close();
+      },
+    });
+    let signalChanges = 0;
+    const port = {
+      readable: stream,
+      async setSignals() { signalChanges += 1; },
+    };
+    const result = await parseMatterOnboardingCodes(port, { timeoutMs: 500 });
+    const ok = result.ok && signalChanges === 0 && !stream.locked;
+    const el = document.createElement("section");
+    el.className = ok ? "ok" : "fail";
+    el.innerHTML = `<strong>${ok ? "PASS" : "FAIL"}</strong> — ` +
+      "complete boot log does not reset the device";
+    container.appendChild(el);
+    if (ok) pass++; else fail++;
+  }
+
+  {
+    let controller;
+    const stream = new ReadableStream({
+      start(value) { controller = value; },
+    });
+    const signalChanges = [];
+    const port = {
+      readable: stream,
+      async setSignals(value) {
+        signalChanges.push(value.requestToSend);
+        if (value.requestToSend === false) {
+          controller.enqueue(encoder.encode(validLog));
+          controller.close();
+        }
+      },
+    };
+    const result = await parseMatterOnboardingCodes(port, { timeoutMs: 300 });
+    const ok = result.ok && signalChanges.join(",") === "true,false" &&
+      !stream.locked;
+    const el = document.createElement("section");
+    el.className = ok ? "ok" : "fail";
+    el.innerHTML = `<strong>${ok ? "PASS" : "FAIL"}</strong> — ` +
+      "midpoint reset captures a new boot log";
+    container.appendChild(el);
+    if (ok) pass++; else fail++;
+  }
+
   return { pass, fail };
 }

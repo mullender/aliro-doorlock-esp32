@@ -3,6 +3,40 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
+## 2026-08-05: NanoC6 serial-output investigation
+
+### Approved findings
+
+- The `aliro-c6-v0.0.1-devkit` build uses UART0 as its primary
+  console. USB Serial/JTAG is only the secondary output channel.
+- ESP-IDF documents that the secondary USB channel supports output
+  only. Console input and REPL commands require USB Serial/JTAG as
+  the primary console.
+- `CONFIG_ENABLE_CHIP_SHELL` is disabled in the built firmware. The
+  installer's `matter onboardingcodes` fallback command cannot run.
+- The published ELF has no `PrintOnboardingCodes` symbol and no
+  `SetupQRCode` or `Manual pairing code` strings. Contrary to an
+  older ledger entry below, the pinned `esp-matter` door-lock example
+  does not print the Matter onboarding codes.
+- Neither the ESP Web Tools reset action nor the NanoC6 physical reset
+  produced visible USB logs. This confirms that the fault is not only
+  in the web reset action.
+- HomeKey-ESP32 uses `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, which is
+  the correct console mode for a board connected through native USB.
+
+The user approved these facts after the physical-reset test.
+
+### Decision
+
+- Publish a new prerelease. Do not replace the known-bad v0.0.1
+  asset.
+- Make USB Serial/JTAG the primary console.
+- Apply a small, audited source patch during the pinned build so the
+  door-lock example calls `PrintOnboardingCodes()` after Matter starts.
+- Replace the invalid shell-command fallback with a hardware reset
+  request. The reset gives the parser a second chance to read the
+  boot-time pairing lines.
+
 ## 2026-08-05: First release build prep (on `feat/first-release`)
 
 Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.

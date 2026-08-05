@@ -1,0 +1,10 @@
+diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
+index 21d0641..c9073cb 100644
+--- a/examples/door_lock/main/app_main.cpp
++++ b/examples/door_lock/main/app_main.cpp
+@@ -29,0 +30 @@
++#include <setup_payload/OnboardingCodesUtil.h>
+@@ -210,0 +212,3 @@ extern "C" void app_main()
++    /* Emit the values consumed by the browser installer. */
++    PrintOnboardingCodes(chip::RendezvousInformationFlag::kBLE);
++

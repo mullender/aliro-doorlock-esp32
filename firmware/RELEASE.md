@@ -1,7 +1,7 @@
 # Aliro NanoC6 release build
 
-This document explains how to build the first installable devkit
-release from the pinned sources below.
+This document explains how to build the current devkit release from
+the pinned sources below.
 
 ## Pins
 
@@ -12,7 +12,7 @@ release from the pinned sources below.
 | esp-matter commit | `85c76a1788c5b70b4b0811734af8616dda15e7ac` |
 | connectedhomeip commit | `efefc94fee39d8d1fbbc3c27b9d7fc9025095887` |
 | ESP-IDF version | `5.5.4` (tag `v5.5.4`) |
-| Release tag | `aliro-c6-v0.0.1-devkit` |
+| Release tag | `aliro-c6-v0.0.2-devkit` |
 | Merged image size | 4 MiB (4 194 304 bytes), padded with `0xFF` |
 
 The build never modifies the shared `~/Development/esp-matter` checkout.
@@ -24,7 +24,7 @@ submodule pins and mirrored blobs).
 ## Release overlay
 
 `firmware/overlay/sdkconfig.release.nanoc6` holds only the NanoC6
-deltas from the stock `sdkconfig.esp32c6.aliro`. Five settings, all
+deltas from the stock `sdkconfig.esp32c6.aliro`. Six settings, all
 verified against esp-matter `85c76a1`:
 
 - `CONFIG_BSP_BUTTONS_NUM=1`
@@ -32,10 +32,19 @@ verified against esp-matter `85c76a1`:
 - `CONFIG_BSP_BUTTON_1_GPIO=9` (NanoC6 user button, shared with ROM BOOT)
 - `CONFIG_BSP_BUTTON_1_LEVEL=0` (active-low)
 - `CONFIG_BSP_LEDS_NUM=0` (no on-board RGB LED code)
+- `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (native USB is the primary
+  console)
 
 The stock `sdkconfig.esp32c6.aliro` supplies every other setting:
 Thread MTD, BLE peripheral, Wi-Fi station off, mbedTLS trimming,
 Aliro-over-NFC on, and the 4 MB partition layout.
+
+The pinned door-lock example does not call
+`PrintOnboardingCodes()`. The build script applies
+`firmware/patches/0001-print-onboarding-codes.patch` before the build.
+The patch prints the Matter QR payload and manual pairing code after
+Matter starts. The script removes the patch from the clean source tree
+when it exits.
 
 ### Symbols we intentionally do NOT set
 
@@ -68,12 +77,13 @@ scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 
 `build_release.sh`:
 
-1. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
-2. Runs `idf.py set-target esp32c6` with
+1. Applies the onboarding-code patch to the clean source tree.
+2. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
+3. Runs `idf.py set-target esp32c6` with
    `SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"`.
-3. Runs `idf.py build`.
-4. Prints `idf.py size` for the audit.
-5. Removes the temporary overlay copy on exit.
+4. Runs `idf.py build`.
+5. Prints `idf.py size` for the audit.
+6. Removes the temporary overlay and source patch on exit.
 
 `prepare_release.sh`:
 
@@ -86,9 +96,9 @@ scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 ## Artifacts
 
 ```
-artifacts/aliro-c6-v0.0.1-devkit/
-  aliro-c6-v0.0.1-devkit-factory.bin          4 MiB, padded 0xFF
-  aliro-c6-v0.0.1-devkit-factory.bin.sha256   sha256 sidecar
+artifacts/aliro-c6-v0.0.2-devkit/
+  aliro-c6-v0.0.2-devkit-factory.bin          4 MiB, padded 0xFF
+  aliro-c6-v0.0.2-devkit-factory.bin.sha256   sha256 sidecar
   manifest.txt                                per-part audit
 ```
 
@@ -97,23 +107,36 @@ GitHub Release matching the tag; the installer's
 `.github/workflows/deploy-installer.yml` picks them up from there and
 serves them from Pages.
 
-### Verified build for `aliro-c6-v0.0.1-devkit`
+### Verified build for `aliro-c6-v0.0.2-devkit`
 
 The build completed on 2026-08-05 with esptool.py 4.12.0.
 
 Installer: <https://mullender.github.io/aliro-doorlock-esp32/>
 
-- App image: 1,606,208 bytes
+- App image: 1,596,064 bytes
 - Factory image: 4,194,304 bytes
 - Factory SHA-256:
-  `675247acf8660a8a0cab68dcb15634075a35f9ffa40842d9b3054f8a392d7fcf`
+  `8c2556071ffe1935e99d0a3373d45d7693c94616fe0f19f98c0de5681e21aa10`
 - App image checksum and validation hash: valid
+- Native USB Serial/JTAG: primary console
+- `PrintOnboardingCodes()` and its two pairing-code log strings:
+  present in the ELF
 - Thread: enabled
 - Aliro over NFC: enabled
 - Wi-Fi station: disabled
 - Portal and Wi-Fi credential markers: not found
 - Pages manifest: ESP32-C6, factory image at offset `0`
 - Public binary SHA-256: matches the release artifact
+
+The last two public checks apply after the release workflow publishes
+the image.
+
+### Known issue in `aliro-c6-v0.0.1-devkit`
+
+Version 0.0.1 used UART0 as its primary console and did not call
+`PrintOnboardingCodes()`. It cannot provide the boot logs or pairing
+codes that the browser installer needs. Keep it as a historical
+prerelease. Do not use it for NanoC6 hardware validation.
 
 ## Reproducibility notes
 

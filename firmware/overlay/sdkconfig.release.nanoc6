@@ -23,3 +23,10 @@ CONFIG_BSP_BUTTON_1_LEVEL=0
 # drive it. Zero LEDs keeps the led_strip / RGB backends out of the
 # binary entirely.
 CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console -----------------------------------------------
+# The NanoC6 USB-C connector is wired to the ESP32-C6 USB Serial/JTAG
+# controller. Make that controller the primary bidirectional console.
+# A secondary USB console can transmit logs, but it cannot receive
+# console input.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
