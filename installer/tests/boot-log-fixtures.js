@@ -9,13 +9,12 @@
 
 export const LOG_FIXTURES = [
   {
-    label: "canonical SDK 1.x output — both lines present, in order",
+    label: "ESP-IDF 5.5 output from the NanoC6",
     log: [
       "I (2500) esp_ot_init: OpenThread interface up",
-      "CHIP:SVR: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
-      "CHIP:SVR: Copy/paste the below URL in a browser to see the QR Code:",
-      "CHIP:SVR: https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3AY.K9042C00KA0648G00",
-      "CHIP:SVR: Manual pairing code: [34970112332]",
+      "I (1110) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
+      "I (1110) chip[SVR]: Copy/paste the below URL in a browser to see the QR Code:",
+      "I (1110) chip[SVR]: Manual pairing code: [34970112332]",
       "I (2510) app: door lock ready",
     ].join("\n"),
     expect: { mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" },
@@ -66,13 +65,21 @@ export const LOG_FIXTURES = [
     expect: { mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" },
   },
   {
-    label: "only the QR-URL line survives (tagged line lost in log noise)",
+    label: "hosted QR URL is not a setup-data source",
     log: [
       "some junk",
       "CHIP:SVR: https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT%3AY.K9042C00KA0648G00",
       "CHIP:SVR: Manual pairing code: [34970112332]",
     ].join("\n"),
-    expect: { mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" },
+    expectFail: true,
+  },
+  {
+    label: "valid codes with different discriminators fail validation",
+    log: [
+      "I (1110) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
+      "I (1110) chip[SVR]: Manual pairing code: [00054912336]",
+    ].join("\n"),
+    expectParseFailure: true,
   },
   {
     label: "MT: line only, no manual — expected to fail parse",

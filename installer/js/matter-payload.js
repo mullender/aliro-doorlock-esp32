@@ -1,33 +1,22 @@
-// matter-payload.js
-//
-// Lightweight validators for Matter setup payloads. This is NOT a general-purpose
-// Matter SDK. It only does what the flasher needs:
-//
-//   1. Sanity-check an `MT:` string parsed out of the firmware boot log
-//      (character set + version prefix + reasonable length).
-//   2. Sanity-check an 11-digit manual pairing code by recomputing its Verhoeff
-//      check digit and comparing.
-//   3. A tiny cross-check that the two codes plausibly refer to the same device
-//      (their embedded discriminator matches).
-//
-// The full binary decode of the MT: payload is intentionally NOT implemented.
-// The flasher trusts the firmware to produce a valid pair; it just refuses to
-// display something that clearly is not a valid pair. If a stronger check is
-// required later, add a Base38 decoder here and pull the discriminator from
-// bits 15..26 of the TLV setup payload per the Matter Core Specification.
-//
-// References:
-//   - Matter Core Specification 1.4, section 5.1.5 "Onboarding Payload"
-//   - connectedhomeip/src/setup_payload/QRCodeSetupPayloadGenerator.cpp
-//   - connectedhomeip/src/setup_payload/ManualSetupPayloadGenerator.cpp
+// This module validates the two Matter setup codes that the firmware prints.
+// It implements only the fixed setup fields that this installer needs.
 
-// Matter's Base38 alphabet, exactly as defined in the spec.
-const BASE38_ALPHABET =
-  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-.";
+const BASE38_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-.";
+const QR_FIXED_BYTES = 11;
+const MAX_SETUP_PIN = 99999998;
+const FORBIDDEN_SETUP_PINS = new Set([
+  11111111,
+  22222222,
+  33333333,
+  44444444,
+  55555555,
+  66666666,
+  77777777,
+  88888888,
+  12345678,
+  87654321,
+]);
 
-// Verhoeff tables — used by the Matter manual pairing code check digit.
-// Source: https://en.wikipedia.org/wiki/Verhoeff_algorithm
-// (also embedded verbatim in connectedhomeip/src/setup_payload/)
 const VERHOEFF_D = [
   [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
   [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
@@ -55,8 +44,6 @@ const VERHOEFF_P = [
 const VERHOEFF_INV = [0, 4, 3, 2, 1, 5, 6, 7, 8, 9];
 
 function verhoeffCheckDigit(digits) {
-  // digits: array of ints, most-significant first, WITHOUT the check digit.
-  // Returns the check digit that should be appended.
   let c = 0;
   const reversed = [...digits].reverse();
   for (let i = 0; i < reversed.length; i++) {
@@ -65,87 +52,166 @@ function verhoeffCheckDigit(digits) {
   return VERHOEFF_INV[c];
 }
 
-/**
- * Sanity-check an MT: setup payload string.
- * Returns { valid: boolean, error?: string }.
- *
- * Passes iff:
- *   - starts with "MT:"
- *   - remaining chars are all in the Base38 alphabet
- *   - length is within a plausible range (Matter payloads are 17-24 chars for
- *     the short form; the pass through here is lenient because vendor-specific
- *     extensions can add TLV bytes)
- */
-export function validateMTPayload(mt) {
-  if (typeof mt !== "string") {
-    return { valid: false, error: "not a string" };
-  }
-  if (!mt.startsWith("MT:")) {
-    return { valid: false, error: "missing MT: prefix" };
-  }
-  const body = mt.slice(3);
-  if (body.length < 16) {
-    return { valid: false, error: `body too short (${body.length} chars)` };
-  }
-  if (body.length > 128) {
-    // Arbitrary sanity ceiling. Real payloads with TLV extensions can grow
-    // but 128 chars would decode to more than 700 bits of setup data.
-    return { valid: false, error: `body implausibly long (${body.length} chars)` };
-  }
-  for (let i = 0; i < body.length; i++) {
-    if (BASE38_ALPHABET.indexOf(body[i]) < 0) {
-      return {
-        valid: false,
-        error: `char ${JSON.stringify(body[i])} at position ${i} not in Base38 alphabet`,
-      };
+function chunkSizeForDecode(remaining) {
+  if (remaining >= 5) return { chars: 5, bytes: 3 };
+  if (remaining === 4) return { chars: 4, bytes: 2 };
+  if (remaining === 2) return { chars: 2, bytes: 1 };
+  throw new Error("invalid Base38 length");
+}
+
+export function decodeBase38(value) {
+  if (typeof value !== "string") throw new TypeError("Base38 value is not a string");
+  const bytes = [];
+  let offset = 0;
+  while (offset < value.length) {
+    const { chars, bytes: byteCount } = chunkSizeForDecode(value.length - offset);
+    let decoded = 0;
+    for (let i = chars - 1; i >= 0; i--) {
+      const digit = BASE38_ALPHABET.indexOf(value[offset + i]);
+      if (digit < 0) throw new Error("invalid Base38 character");
+      decoded = decoded * 38 + digit;
     }
+    for (let i = 0; i < byteCount; i++) {
+      bytes.push(decoded & 0xff);
+      decoded = Math.floor(decoded / 256);
+    }
+    if (decoded !== 0) throw new Error("Base38 chunk is too large");
+    offset += chars;
+  }
+  return new Uint8Array(bytes);
+}
+
+export function encodeBase38(bytes) {
+  if (!(bytes instanceof Uint8Array) && !Array.isArray(bytes)) {
+    throw new TypeError("Base38 input is not a byte array");
+  }
+  let output = "";
+  for (let offset = 0; offset < bytes.length; offset += 3) {
+    const count = Math.min(3, bytes.length - offset);
+    let value = 0;
+    for (let i = count - 1; i >= 0; i--) value = value * 256 + bytes[offset + i];
+    const chars = count === 3 ? 5 : count === 2 ? 4 : 2;
+    for (let i = 0; i < chars; i++) {
+      output += BASE38_ALPHABET[value % 38];
+      value = Math.floor(value / 38);
+    }
+  }
+  return output;
+}
+
+function readBits(bytes, offset, count) {
+  let value = 0;
+  for (let bit = 0; bit < count; bit++) {
+    if (bytes[Math.floor((offset + bit) / 8)] & (1 << ((offset + bit) % 8))) {
+      value += 2 ** bit;
+    }
+  }
+  return value;
+}
+
+export function decodeMTPayload(mt) {
+  const syntax = validateMTPayload(mt);
+  if (!syntax.valid) throw new Error(syntax.error);
+  const bytes = decodeBase38(mt.slice(3));
+  if (bytes.length < QR_FIXED_BYTES) throw new Error("payload has too few bytes");
+  let offset = 0;
+  const take = (count) => {
+    const value = readBits(bytes, offset, count);
+    offset += count;
+    return value;
+  };
+  const decoded = {
+    version: take(3),
+    vendorId: take(16),
+    productId: take(16),
+    commissioningFlow: take(2),
+    rendezvousInfo: take(8),
+    discriminator: take(12),
+    passcode: take(27),
+    padding: take(4),
+    bytes,
+  };
+  if (decoded.version !== 0) throw new Error(`unsupported payload version ${decoded.version}`);
+  if (decoded.padding !== 0) throw new Error("payload padding is not zero");
+  return decoded;
+}
+
+export function decodeManualCode(code) {
+  const syntax = validateManualCode(code);
+  if (!syntax.valid) throw new Error(syntax.error);
+  const chunk1 = Number(code.slice(0, 1));
+  const chunk2 = Number(code.slice(1, 6));
+  const chunk3 = Number(code.slice(6, 10));
+  if (chunk1 >= 8) throw new Error("manual code uses an unsupported version");
+  const hasVendorProduct = ((chunk1 >> 2) & 1) === 1;
+  if (hasVendorProduct) throw new Error("long manual codes are not supported");
+  return {
+    shortDiscriminator: ((chunk1 & 0x3) << 2) | ((chunk2 >> 14) & 0x3),
+    passcode: (chunk2 & 0x3fff) | ((chunk3 & 0x1fff) << 14),
+  };
+}
+
+export function validateMTPayload(mt) {
+  if (typeof mt !== "string") return { valid: false, error: "not a string" };
+  if (!mt.startsWith("MT:")) return { valid: false, error: "missing MT: prefix" };
+  const body = mt.slice(3);
+  if (body.length < 16) return { valid: false, error: `body too short (${body.length} chars)` };
+  if (body.length > 128) return { valid: false, error: `body too long (${body.length} chars)` };
+  for (let i = 0; i < body.length; i++) {
+    if (!BASE38_ALPHABET.includes(body[i])) {
+      return { valid: false, error: `char ${JSON.stringify(body[i])} at position ${i} not in Base38 alphabet` };
+    }
+  }
+  try {
+    decodeBase38(body);
+  } catch (error) {
+    return { valid: false, error: error.message };
   }
   return { valid: true };
 }
 
-/**
- * Sanity-check an 11-digit Matter manual pairing code.
- * Returns { valid: boolean, error?: string }.
- *
- * Passes iff:
- *   - exactly 11 digits (0-9)
- *   - Verhoeff check digit at position 10 matches recomputation
- *
- * Does NOT verify that the encoded discriminator / passcode are in-range.
- * That check belongs to the phone-side commissioner.
- */
 export function validateManualCode(code) {
-  if (typeof code !== "string") {
-    return { valid: false, error: "not a string" };
-  }
+  if (typeof code !== "string") return { valid: false, error: "not a string" };
   if (!/^\d{11}$/.test(code)) {
     return { valid: false, error: `expected 11 digits, got ${JSON.stringify(code)}` };
   }
   const digits = code.split("").map(Number);
-  const body = digits.slice(0, 10);
-  const claimed = digits[10];
-  const expected = verhoeffCheckDigit(body);
-  if (claimed !== expected) {
+  const expected = verhoeffCheckDigit(digits.slice(0, 10));
+  if (digits[10] !== expected) {
     return {
       valid: false,
-      error: `Verhoeff check digit mismatch: claimed ${claimed}, expected ${expected}`,
+      error: `Verhoeff check digit mismatch: claimed ${digits[10]}, expected ${expected}`,
     };
   }
   return { valid: true };
 }
 
-/**
- * Validate a pair of codes as coming from the same device.
- * Today this just runs both sanity checks. A future version can decode the
- * discriminator from each and compare.
- */
+export function isValidSetupPIN(pin) {
+  return Number.isInteger(pin) && pin >= 1 && pin <= MAX_SETUP_PIN &&
+    !FORBIDDEN_SETUP_PINS.has(pin);
+}
+
 export function validatePair(mt, manualCode) {
   const mtResult = validateMTPayload(mt);
   if (!mtResult.valid) return { valid: false, error: `MT: ${mtResult.error}` };
-  const mcResult = validateManualCode(manualCode);
-  if (!mcResult.valid) return { valid: false, error: `manual code: ${mcResult.error}` };
+  const manualResult = validateManualCode(manualCode);
+  if (!manualResult.valid) return { valid: false, error: `manual code: ${manualResult.error}` };
+  try {
+    const qr = decodeMTPayload(mt);
+    const manual = decodeManualCode(manualCode);
+    if (!isValidSetupPIN(qr.passcode) || !isValidSetupPIN(manual.passcode)) {
+      return { valid: false, error: "codes contain a forbidden setup PIN" };
+    }
+    if ((qr.discriminator >> 8) !== manual.shortDiscriminator) {
+      return { valid: false, error: "codes have different discriminators" };
+    }
+    if (qr.passcode !== manual.passcode) {
+      return { valid: false, error: "codes have different passcodes" };
+    }
+  } catch (error) {
+    return { valid: false, error: `payload decode failed: ${error.message}` };
+  }
   return { valid: true };
 }
 
-// Export internals for the test harness only.
-export const __internals = { verhoeffCheckDigit, BASE38_ALPHABET };
+export const __internals = { verhoeffCheckDigit, BASE38_ALPHABET, readBits };

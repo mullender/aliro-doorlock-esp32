@@ -40,15 +40,19 @@
 <h2>Boot log parser</h2>
 <div id="boot-parser"></div>
 
+<h2>Setup flow state</h2>
+<div id="setup-flow"></div>
+
 <h2>QR preview (positive vectors)</h2>
 <div id="qr-previews"></div>
 
 <script src="../vendor/qrcode.js"></script>
 <script type="module">
-import { validateMTPayload, validateManualCode, validatePair, __internals } from "../js/matter-payload.js";
+import { decodeBase38, decodeMTPayload, decodeManualCode, encodeBase38, validatePair, __internals } from "../js/matter-payload.js";
 import { renderMTasSVG } from "../js/qr-render.js";
-import { VECTORS, NEGATIVE_VECTORS } from "./test-vectors.js";
+import { BASE38_VECTORS, INVALID_BASE38_VECTORS, VECTORS, NEGATIVE_VECTORS } from "./test-vectors.js";
 import { runBootParserTests } from "./boot-parser-tests.js";
+import { runSetupFlowTests } from "./setup-flow-tests.js";
 
 let pass = 0, fail = 0;
 
@@ -65,11 +69,39 @@ const positiveEl = document.getElementById("positive");
 const negativeEl = document.getElementById("negative");
 const qrEl = document.getElementById("qr-previews");
 
+for (const vector of BASE38_VECTORS) {
+  const decoded = [...decodeBase38(vector.encoded)];
+  const encoded = encodeBase38(vector.bytes);
+  section(positiveEl, `official Base38 vector ${vector.encoded}`,
+    encoded === vector.encoded && JSON.stringify(decoded) === JSON.stringify(vector.bytes),
+    `encoded=${encoded}\ndecoded=${decoded.join(",")}`);
+}
+
+for (const encoded of INVALID_BASE38_VECTORS) {
+  let rejected = false;
+  try { decodeBase38(encoded); } catch { rejected = true; }
+  section(negativeEl, `official invalid Base38 vector ${encoded}`, rejected);
+}
+
 // Positive vectors — every one must validate.
 for (const v of VECTORS) {
   const pair = validatePair(v.mt, v.manualCode);
   section(positiveEl, v.label, pair.valid,
           pair.valid ? `mt=${v.mt}\nmanual=${v.manualCode}` : pair.error);
+
+  try {
+    const bytes = decodeBase38(v.mt.slice(3));
+    const encoded = encodeBase38(bytes);
+    const qr = decodeMTPayload(v.mt);
+    const manual = decodeManualCode(v.manualCode);
+    const roundTrips = encoded === v.mt.slice(3) &&
+      qr.discriminator === v.discriminator && qr.passcode === v.passcode &&
+      manual.shortDiscriminator === (v.discriminator >> 8) && manual.passcode === v.passcode;
+    section(positiveEl, `${v.label} → Base38 encode/decode round trip`, roundTrips,
+      `encoded=${encoded}\ndiscriminator=${qr.discriminator}\npasscode=${qr.passcode}`);
+  } catch (e) {
+    section(positiveEl, `${v.label} → Base38 encode/decode round trip`, false, String(e));
+  }
 
   // QR render should not throw and should produce a non-empty SVG.
   try {
@@ -114,6 +146,11 @@ const bpEl = document.getElementById("boot-parser");
 const bp = await runBootParserTests(bpEl);
 pass += bp.pass;
 fail += bp.fail;
+
+const sfEl = document.getElementById("setup-flow");
+const sf = await runSetupFlowTests(sfEl);
+pass += sf.pass;
+fail += sf.fail;
 
 // Final summary
 const s = document.getElementById("summary");

@@ -18,8 +18,19 @@
     code, .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95em; }
     .warn { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-border); border-left: 4px solid var(--warn-border); padding: 0.9rem 1rem; margin: 1rem 0; border-radius: 4px; }
     .warn strong { display: block; margin-bottom: 0.3rem; }
-    .install-row { margin: 1.5rem 0; text-align: center; }
+    .install-row { margin: 1rem 0; text-align: center; }
+    .install-card { margin: 1.5rem 0; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: 6px; }
+    .install-card h2 { margin-top: 0; }
+    .update-card { border: 2px solid var(--accent); }
+    .danger-card { border: 2px solid #b22; background: rgba(180, 25, 25, 0.08); }
+    .danger-card h2 { color: #b22; }
+    button[slot="activate"] { font: inherit; font-weight: 700; padding: 0.7rem 1rem; border: 0; border-radius: 4px; cursor: pointer; }
+    .update-card button[slot="activate"] { color: #fff; background: var(--accent); }
+    .danger-card button[slot="activate"] { color: #fff; background: #a11; }
     .browser-note { color: var(--muted); font-size: 0.9em; text-align: center; margin-top: 0.3rem; }
+    .setup-result { margin: 0.75rem auto 1.5rem; max-width: 42rem; text-align: center; }
+    .setup-status { min-height: 1.5em; color: var(--muted); }
+    .setup-result button { font: inherit; margin: 0.35rem; padding: 0.4rem 0.85rem; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 4px; cursor: pointer; }
     footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); font-size: 0.85em; color: var(--muted); }
 
     /* Pairing panel (hidden until a successful flash + parse) */
@@ -55,7 +66,7 @@
     /* Print: hide install row, keep pairing */
     @media print {
       body { background: white; color: black; }
-      .install-row, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
+      .install-row, .setup-result, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
       .pairing { display: block !important; border: none; padding: 0; }
       .qr-box { border: none; }
     }
@@ -72,14 +83,6 @@
   as a Matter door-lock over Thread.
 </p>
 
-<div class="warn" role="alert">
-  <strong>Factory install erases the entire flash.</strong>
-  Any existing Matter fabric membership, Thread credentials, and Aliro
-  reader configuration on this board will be lost. This is intentional
-  for first-time setup. For an over-the-air update of an already
-  commissioned device, use the OTA flow — not this installer.
-</div>
-
 <h2>Before you start</h2>
 <ul>
   <li>A USB-C data-capable cable and an M5 NanoC6 with the Unit NFC
@@ -91,22 +94,72 @@
   <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
 </ul>
 
-<div class="install-row">
-  <esp-web-install-button
-    manifest="./manifest.json"
-    id="install-button">
-    <button slot="unsupported">
-      Web Serial is not available in this browser. Use Chrome or Edge on
-      desktop.
-    </button>
-    <button slot="not-allowed">
-      Web Serial requires HTTPS (this page must be served securely).
-    </button>
-  </esp-web-install-button>
-  <div class="browser-note">
-    Chrome or Edge on desktop only. This page never sends your device's
-    setup data to a remote service.
+<section class="install-card update-card" aria-labelledby="update-heading">
+  <h2 id="update-heading">Update firmware — keep setup</h2>
+  <p>
+    Use this update only on a device that was previously installed from this
+    repository with the approved
+    <code>esp32c6-door-lock-4mb-v1</code> partition layout. If the device uses
+    a different layout, or if you are not certain, you must use Factory
+    install below.
+  </p>
+  <p>This update keeps Matter fabrics, Thread credentials, and Aliro reader
+    configuration.</p>
+  <div class="install-row">
+    <esp-web-install-button
+      manifest="./manifest-update.json"
+      id="update-button"
+      data-install-mode="update"
+      erase-first="false"
+      inert>
+      <button slot="activate" disabled>Update firmware — keep setup</button>
+      <button slot="unsupported">
+        Web Serial is not available in this browser. Use Chrome or Edge on
+        desktop.
+      </button>
+      <button slot="not-allowed">
+        Web Serial requires HTTPS (this page must be served securely).
+      </button>
+    </esp-web-install-button>
   </div>
+</section>
+
+<div class="browser-note">
+  Chrome or Edge on desktop only. This page never sends your device's
+  setup data to a remote service.
+</div>
+
+<section class="install-card danger-card" aria-labelledby="factory-heading">
+  <h2 id="factory-heading">Factory install — erase everything</h2>
+  <p><strong>Use this for a first install or recovery.</strong> It erases the
+    entire flash. You will lose Matter fabrics, Thread credentials, and Aliro
+    reader configuration.</p>
+  <div class="install-row">
+    <esp-web-install-button
+      manifest="./manifest.json"
+      id="factory-button"
+      data-install-mode="factory"
+      erase-first="true"
+      inert>
+      <button slot="activate" disabled>Factory install — erase everything</button>
+      <button slot="unsupported">
+        Web Serial is not available in this browser. Use Chrome or Edge on
+        desktop.
+      </button>
+      <button slot="not-allowed">
+        Web Serial requires HTTPS (this page must be served securely).
+      </button>
+    </esp-web-install-button>
+  </div>
+</section>
+
+<div class="setup-result">
+  <div class="setup-status" id="setup-status" role="status" aria-live="polite">
+    Choose Update to keep setup on an approved layout. Choose Factory install
+    for a first install, recovery, or a different layout.
+  </div>
+  <button type="button" id="cancel-code-read" hidden>Cancel code read</button>
+  <button type="button" id="retry-install" hidden>Reload and retry</button>
 </div>
 
 <div class="dev-banner" id="dev-banner" hidden>
@@ -237,9 +290,9 @@
 
 <script src="./vendor/qrcode.js"></script>
 <script type="module">
-import { validateMTPayload, validateManualCode, validatePair } from "./js/matter-payload.js";
 import { renderMTasSVG } from "./js/qr-render.js";
-import { parseMatterOnboardingCodes } from "./js/boot-parser.js";
+import { createSetupFlow } from "./js/setup-flow.js";
+import { configureInstallButtons } from "./js/install-controller.js";
 
 const pairingEl = document.getElementById("pairing");
 const qrEl = document.getElementById("qr");
@@ -247,47 +300,41 @@ const qrCaptionEl = document.getElementById("qr-caption");
 const manualEl = document.getElementById("manual-code");
 const flashMsgEl = document.getElementById("flash-msg");
 const devBannerEl = document.getElementById("dev-banner");
+const factoryButton = document.getElementById("factory-button");
+const updateButton = document.getElementById("update-button");
+const setupFlow = createSetupFlow({
+  elements: {
+    pairing: pairingEl,
+    qr: qrEl,
+    qrCaption: qrCaptionEl,
+    manual: manualEl,
+    status: document.getElementById("setup-status"),
+    cancel: document.getElementById("cancel-code-read"),
+    retry: document.getElementById("retry-install"),
+  },
+  renderQRCode: renderMTasSVG,
+  eventTarget: factoryButton,
+  scrollPairing: () => pairingEl.scrollIntoView({ behavior: "smooth", block: "start" }),
+});
 
-let currentMT = null;
-let currentManual = null;
-
-/**
- * Show the pairing panel with a validated (MT:, manual code) pair.
- * Called by Phase 4's serial log parser once the boot log lines are read.
- */
-function showPairing(mt, manualCode) {
-  const validation = validatePair(mt, manualCode);
-  if (!validation.valid) {
-    flashMsgEl.textContent = "Refused to display: " + validation.error;
-    return;
-  }
-  currentMT = mt;
-  currentManual = manualCode;
-  const svg = renderMTasSVG(mt, { size: 300 });
-  qrEl.innerHTML = svg;
-  qrCaptionEl.textContent = mt;
-  manualEl.textContent = manualCode.replace(/(\d{4})(\d{4})(\d{3})/, "$1-$2-$3");
-  pairingEl.classList.add("visible");
-  pairingEl.setAttribute("aria-hidden", "false");
-  pairingEl.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-// Expose for Phase 4 integration (the ESP Web Tools callback calls
-// window.__aliroShowPairing(mt, manualCode) after parsing the boot log).
-window.__aliroShowPairing = showPairing;
+document.getElementById("cancel-code-read").addEventListener("click", () => setupFlow.cancel());
+document.getElementById("retry-install").addEventListener("click", () => location.reload());
 
 // Copy actions
 document.getElementById("copy-mt").addEventListener("click", async () => {
+  const { mt: currentMT } = setupFlow.getCurrent();
   if (!currentMT) return;
   try { await navigator.clipboard.writeText(currentMT); flashMsgEl.textContent = "MT: copied"; }
   catch (e) { flashMsgEl.textContent = "Copy failed: " + e.message; }
 });
 document.getElementById("copy-manual").addEventListener("click", async () => {
+  const { manualCode: currentManual } = setupFlow.getCurrent();
   if (!currentManual) return;
   try { await navigator.clipboard.writeText(currentManual); flashMsgEl.textContent = "Manual code copied"; }
   catch (e) { flashMsgEl.textContent = "Copy failed: " + e.message; }
 });
 document.getElementById("download-svg").addEventListener("click", () => {
+  const { mt: currentMT } = setupFlow.getCurrent();
   if (!currentMT) return;
   const svg = renderMTasSVG(currentMT, { size: 512 });
   const blob = new Blob([svg], { type: "image/svg+xml" });
@@ -307,34 +354,9 @@ tabs.forEach(t => t.addEventListener("click", () => {
     p.setAttribute("aria-hidden", p.id === t.getAttribute("aria-controls") ? "false" : "true"));
 }));
 
-// Wire the post-install callback added by the vendored esp-web-tools fork.
-// Runs on every successful flash. Contract: read the boot log, extract the
-// two Matter setup lines, hand them to showPairing. MUST release the serial
-// reader before resolving, or ESP Web Tools' downstream initialisation fails.
-const installBtn = document.getElementById("install-button");
-if (installBtn) {
-  installBtn.onPostFlash = async (port) => {
-    flashMsgEl.textContent = "Reading pairing codes from device...";
-    try {
-      const result = await parseMatterOnboardingCodes(port, {
-        timeoutMs: 15000,
-        logger: (msg, level) =>
-          (level === "error" ? console.error : console.log)(`[boot-parser] ${msg}`),
-      });
-      if (!result.ok) {
-        flashMsgEl.textContent = result.error;
-        console.warn("[boot-parser] full log follows:\n" + result.log);
-        return;
-      }
-      flashMsgEl.textContent = "";
-      showPairing(result.mt, result.manualCode);
-    } catch (err) {
-      flashMsgEl.textContent = "Reader error: " + err.message;
-    }
-    // parseMatterOnboardingCodes releases the reader in its finally block;
-    // ESP Web Tools' Improv init can safely take the port after this resolves.
-  };
-}
+customElements.whenDefined("esp-web-install-button").then(() => {
+  configureInstallButtons({ factoryButton, updateButton, setupFlow });
+});
 
 // Dev mode: ?dev=1 shows the shared example payload without flashing.
 // Useful for reviewing the UI and testing pairing flow with a bench device
@@ -342,34 +364,13 @@ if (installBtn) {
 const params = new URLSearchParams(location.search);
 if (params.get("dev") === "1") {
   devBannerEl.hidden = false;
-  showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
+  setupFlow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
 }
 </script>
 
-<!-- ESP Web Tools install button.
-     Loaded from ./vendor/dist/install-button.js in the deployed site
-     (built from the vendored fork). Locally, before scripts/setup_vendor.sh
-     has been run, falls back to the CDN copy of 10.4.0 — the fallback does
-     NOT expose onPostFlash so the pairing panel will not appear
-     automatically; use ?dev=1 to review the UI. -->
-<script type="module">
-  // Try the vendored build first; fall back to CDN if it 404s.
-  const tryLocal = document.createElement("script");
-  tryLocal.type = "module";
-  tryLocal.src = "./vendor/dist/install-button.js";
-  tryLocal.onerror = () => {
-    console.warn(
-      "vendor/dist/install-button.js not found; falling back to unpkg 10.4.0. " +
-      "The onPostFlash callback will NOT be available in this fallback. " +
-      "Run scripts/setup_vendor.sh to bootstrap the vendored fork."
-    );
-    const fallback = document.createElement("script");
-    fallback.type = "module";
-    fallback.src = "https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module";
-    document.body.appendChild(fallback);
-  };
-  document.body.appendChild(tryLocal);
-</script>
+<!-- The deploy workflow builds this file from the pinned fork submodule. -->
+<script type="module" src="./vendor/dist/install-button.js"
+  onerror="document.getElementById('setup-status').textContent='The local installer component did not load. Reload the page. If this continues, report a deployment fault.'"></script>
 
 </body>
 </html>
