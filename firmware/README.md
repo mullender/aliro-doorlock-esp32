@@ -12,6 +12,14 @@ stock `sdkconfig.esp32c6.aliro`.
 - `overlay/sdkconfig.release.nanoc6` contains the board changes.
 - `patches/0001-print-onboarding-codes.patch` makes the pinned example
   print its Matter pairing codes after startup.
+- `patches/0002-advertise-aliro-credentials-only.patch` advertises
+  Aliro and user credentials without PIN or over-the-air PIN support.
+- `patches/0003-add-nanoc6-rgb-feedback.patch` controls the NanoC6
+  RGB LED from the verified Aliro transaction result.
+- `patches/0004-wire-aliro-ecp-and-generic-tags.patch` supplies the
+  reader group identifier to ECP and handles selected non-ISO-DEP tags.
+- `patches/0005-add-m5nfc-aliro-ecp.patch` adds ECP and activation
+  results to the pinned managed `m5nfc` component.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot.
