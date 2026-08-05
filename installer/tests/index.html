@@ -37,6 +37,9 @@
 <h2>Negative vectors</h2>
 <div id="negative"></div>
 
+<h2>Boot log parser</h2>
+<div id="boot-parser"></div>
+
 <h2>QR preview (positive vectors)</h2>
 <div id="qr-previews"></div>
 
@@ -45,6 +48,7 @@
 import { validateMTPayload, validateManualCode, validatePair, __internals } from "../js/matter-payload.js";
 import { renderMTasSVG } from "../js/qr-render.js";
 import { VECTORS, NEGATIVE_VECTORS } from "./test-vectors.js";
+import { runBootParserTests } from "./boot-parser-tests.js";
 
 let pass = 0, fail = 0;
 
@@ -104,6 +108,12 @@ for (const v of NEGATIVE_VECTORS) {
   section(negativeEl, "Verhoeff self-test (Matter shared example body → 2)",
           cd === 2, `got check digit ${cd}`);
 }
+
+// Boot parser fixtures
+const bpEl = document.getElementById("boot-parser");
+const bp = runBootParserTests(bpEl);
+pass += bp.pass;
+fail += bp.fail;
 
 // Final summary
 const s = document.getElementById("summary");
