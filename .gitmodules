@@ -1,0 +1,4 @@
+[submodule "installer/vendor/esp-web-tools"]
+	path = installer/vendor/esp-web-tools
+	url = https://github.com/mullender/esp-web-tools.git
+	branch = homekey-post-install-hook
