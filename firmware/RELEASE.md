@@ -1,7 +1,7 @@
-# Release build — Aliro NanoC6
+# Aliro NanoC6 release build
 
-How the first installable devkit release is built. Reproducible from a
-clean shell given the pins below.
+This document explains how to build the first installable devkit
+release from the pinned sources below.
 
 ## Pins
 
@@ -10,6 +10,7 @@ clean shell given the pins below.
 | Target board | M5Stack NanoC6 (ESP32-C6FH4, 4 MB flash) |
 | Firmware source | `esp-matter/examples/door_lock` |
 | esp-matter commit | `85c76a1788c5b70b4b0811734af8616dda15e7ac` |
+| connectedhomeip commit | `efefc94fee39d8d1fbbc3c27b9d7fc9025095887` |
 | ESP-IDF version | `5.5.4` (tag `v5.5.4`) |
 | Release tag | `aliro-c6-v0.0.1-devkit` |
 | Merged image size | 4 MiB (4 194 304 bytes), padded with `0xFF` |
@@ -38,7 +39,7 @@ Aliro-over-NFC on, and the 4 MB partition layout.
 
 ### Symbols we intentionally do NOT set
 
-- `CONFIG_ESP_MATTER_NVS_USE_COMPACT_ATTR_STORAGE` — not present in
+- `CONFIG_ESP_MATTER_NVS_USE_COMPACT_ATTR_STORAGE` is not present in
   esp-matter `85c76a1`; `idf.py` treats it as unknown and drops it.
   Trimmed from the overlay. If a later esp-matter release adds it,
   re-evaluate.
@@ -52,10 +53,15 @@ first). The build script also sets `ESP_MATTER_PATH` before sourcing
 `esp-matter/export.sh`, because that script reads it without a default
 value and the script runs with `set -u` (nounset).
 
+If `ESP_MATTER_SRC` is a git archive, set `ESP_MATTER_REVISION` to the
+pinned esp-matter commit. The script checks this value and checks the
+connectedhomeip checkout before it starts the build.
+
 ```
 # from a clean shell:
 . ~/Development/esp-idf/export.sh
 export ESP_MATTER_SRC=/absolute/path/to/clean/esp-matter/snapshot
+export ESP_MATTER_REVISION=85c76a1788c5b70b4b0811734af8616dda15e7ac
 scripts/build_release.sh                       # build only
 scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 ```
@@ -77,7 +83,7 @@ scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 4. Writes the merged image, its SHA-256 sidecar, and a per-part
    `manifest.txt` under `artifacts/<tag>/`.
 
-## Artefacts
+## Artifacts
 
 ```
 artifacts/aliro-c6-v0.0.1-devkit/
@@ -86,20 +92,32 @@ artifacts/aliro-c6-v0.0.1-devkit/
   manifest.txt                                per-part audit
 ```
 
-`artifacts/` is `.gitignore`d. The binary and sidecar are uploaded to a
+Git ignores `artifacts/`. The binary and sidecar are uploaded to a
 GitHub Release matching the tag; the installer's
 `.github/workflows/deploy-installer.yml` picks them up from there and
 serves them from Pages.
 
+### Verified build for `aliro-c6-v0.0.1-devkit`
+
+The build completed on 2026-08-05 with esptool.py 4.12.0.
+
+- App image: 1,606,208 bytes
+- Factory image: 4,194,304 bytes
+- Factory SHA-256:
+  `675247acf8660a8a0cab68dcb15634075a35f9ffa40842d9b3054f8a392d7fcf`
+- App image checksum and validation hash: valid
+- Thread: enabled
+- Aliro over NFC: enabled
+- Wi-Fi station: disabled
+- Portal and Wi-Fi credential markers: not found
+
 ## Reproducibility notes
 
-- The merged image is byte-stable given the same esp-matter commit,
-  IDF version, and overlay. If the SHA-256 changes across two builds
-  with identical inputs, inspect `manifest.txt` for the drift.
-- `esp_aliro_lib` is pulled as a precompiled component (`^1.0.1`).
-  Its licence permits redistribution of built firmware; confirm the
-  current clause on the component registry entry before publishing
-  binaries publicly.
+- The source pins reduce build drift. Build timestamps can still change
+  the binary. The SHA-256 value on the GitHub Release is the authority
+  for the published image.
+- The build resolves `esp_aliro_lib` version `1.1.0`. Its Apache-2.0
+  license permits redistribution of the built firmware.
 - The connectedhomeip symlink shortcut is fine for reproducibility
   because that submodule is pinned by esp-matter's own submodule
   ref at commit `85c76a1`. A future clean-room build should verify

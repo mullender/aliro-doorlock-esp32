@@ -9,13 +9,12 @@ esp-matter commit and ESP-IDF version, with a small NanoC6 release
 overlay (`overlay/sdkconfig.release.nanoc6`) layered on top of the
 stock `sdkconfig.esp32c6.aliro`.
 
-- `overlay/sdkconfig.release.nanoc6` — the delta.
-- `RELEASE.md` — pins, overlay symbols, reproducibility notes,
-  artefact contract.
-- `../scripts/build_release.sh` — layered build against a clean
-  esp-matter snapshot.
-- `../scripts/prepare_release.sh` — merge to a 4 MB factory bin +
-  sha256.
+- `overlay/sdkconfig.release.nanoc6` contains the board changes.
+- `RELEASE.md` contains the source pins, overlay symbols, build notes,
+  and artifact contract.
+- `../scripts/build_release.sh` builds from a clean esp-matter snapshot.
+- `../scripts/prepare_release.sh` creates a 4 MB factory binary and its
+  SHA-256 file.
 
 See also `../docs/run_aliro_door_lock_on_nanoc6_plan.md` for the
 manual bring-up flow.

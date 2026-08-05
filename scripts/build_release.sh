@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build_release.sh — build the Aliro NanoC6 release image against a
+# Build the Aliro NanoC6 release image against a
 # pinned esp-matter checkout.
 #
 # The script does NOT touch the shared ~/Development/esp-matter checkout.
@@ -17,14 +17,12 @@
 #
 # Optional environment:
 #   TAG              release tag; default aliro-c6-v0.0.1-devkit
-#   BUILD_ROOT       parent directory for the build tree; default is a
-#                    fresh mktemp under ESP_MATTER_SRC's parent
+#   ESP_MATTER_REVISION
+#                    required when ESP_MATTER_SRC is a git archive
 #
 # Outputs:
-#   $BUILD_ROOT/build/                     idf.py build tree
-#   $BUILD_ROOT/build/door_lock.bin        the app image
-#   $BUILD_ROOT/build/partition_table/     partition table image
-#   $BUILD_ROOT/build/bootloader/          bootloader image
+#   $ESP_MATTER_SRC/examples/door_lock/build/              build tree
+#   $ESP_MATTER_SRC/examples/door_lock/build/door_lock.bin app image
 #
 # The merged 4 MB factory image and its .sha256 sidecar are produced by
 # scripts/prepare_release.sh, which consumes the outputs of this script.
@@ -35,14 +33,40 @@ set -euo pipefail
 : "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
 
 TAG="${TAG:-aliro-c6-v0.0.1-devkit}"
+PINNED_ESP_MATTER="85c76a1788c5b70b4b0811734af8616dda15e7ac"
+PINNED_CONNECTEDHOMEIP="efefc94fee39d8d1fbbc3c27b9d7fc9025095887"
 
 if [[ ! -f "$ESP_MATTER_SRC/examples/door_lock/sdkconfig.esp32c6.aliro" ]]; then
   echo "error: $ESP_MATTER_SRC does not look like an esp-matter tree" >&2
   exit 2
 fi
+if [[ ! "$TAG" =~ ^aliro-c6-[A-Za-z0-9._-]+$ ]]; then
+  echo "error: invalid Aliro release tag: $TAG" >&2
+  exit 2
+fi
+
+SOURCE_ROOT="$(cd "$ESP_MATTER_SRC" && pwd -P)"
+GIT_ROOT="$(git -C "$ESP_MATTER_SRC" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$GIT_ROOT" && "$(cd "$GIT_ROOT" && pwd -P)" == "$SOURCE_ROOT" ]]; then
+  ESP_MATTER_REVISION="$(git -C "$ESP_MATTER_SRC" rev-parse HEAD)"
+else
+  : "${ESP_MATTER_REVISION:?set to the pinned commit for a git-archive source tree}"
+fi
+if [[ "$ESP_MATTER_REVISION" != "$PINNED_ESP_MATTER" ]]; then
+  echo "error: esp-matter revision is $ESP_MATTER_REVISION" >&2
+  echo "       expected $PINNED_ESP_MATTER" >&2
+  exit 2
+fi
+
 if [[ ! -e "$ESP_MATTER_SRC/connectedhomeip/connectedhomeip/BUILD.gn" ]]; then
   echo "error: connectedhomeip submodule not populated under $ESP_MATTER_SRC" >&2
   echo "       (a symlink to the shared submodule is fine)" >&2
+  exit 2
+fi
+CONNECTEDHOMEIP_REVISION="$(git -C "$ESP_MATTER_SRC/connectedhomeip/connectedhomeip" rev-parse HEAD)"
+if [[ "$CONNECTEDHOMEIP_REVISION" != "$PINNED_CONNECTEDHOMEIP" ]]; then
+  echo "error: connectedhomeip revision is $CONNECTEDHOMEIP_REVISION" >&2
+  echo "       expected $PINNED_CONNECTEDHOMEIP" >&2
   exit 2
 fi
 
@@ -56,13 +80,17 @@ fi
 APP_DIR="$ESP_MATTER_SRC/examples/door_lock"
 
 # Copy the overlay into the example dir so idf.py's SDKCONFIG_DEFAULTS
-# search resolves it relative to the app directory. Removed by the
-# `finally` cleanup below.
+# search resolves it relative to the app directory. The cleanup trap
+# below removes the copy.
 OVERLAY_LOCAL="$APP_DIR/sdkconfig.release.nanoc6"
+if [[ -e "$OVERLAY_LOCAL" ]]; then
+  echo "error: refusing to overwrite existing $OVERLAY_LOCAL" >&2
+  exit 2
+fi
 cp "$OVERLAY" "$OVERLAY_LOCAL"
 
 cleanup() {
-  # Restore the pristine example directory by removing artefacts the
+  # Restore the pristine example directory by removing artifacts the
   # build created (except build/, which is what the caller wants).
   # The overlay copy is ours; safe to delete.
   [[ -f "$OVERLAY_LOCAL" ]] && command rm -f "$OVERLAY_LOCAL"

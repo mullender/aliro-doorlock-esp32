@@ -3,7 +3,7 @@
 # Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. Only the
 # NanoC6-specific deltas from that base live here. The base supplies
 # every Aliro, Thread, BLE, mbedTLS, and partition setting; do NOT
-# duplicate those here — the overlay is a single-file audit of what
+# duplicate those here. The overlay is a single-file audit of what
 # this project changes on top of the stock aliro config.
 #
 # The build script passes:

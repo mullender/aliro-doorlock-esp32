@@ -26,7 +26,7 @@ installer/vendor/dist/
 .env.*
 lab_notes/*.local.md
 
-# Release artefacts — produced by scripts/prepare_release.sh, uploaded to
+# Release artifacts produced by scripts/prepare_release.sh. Upload them to
 # a GitHub Release rather than tracked in git.
 artifacts/
 

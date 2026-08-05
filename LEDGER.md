@@ -3,7 +3,7 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
-## 2026-08-05 — First release build prep (on `feat/first-release`)
+## 2026-08-05: First release build prep (on `feat/first-release`)
 
 Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.
 
@@ -28,32 +28,34 @@ Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.
   default.** With `set -u` (nounset) in the build script, the
   source of that file trips on unbound-variable. `build_release.sh`
   now sets `ESP_MATTER_PATH=$ESP_MATTER_SRC` before sourcing.
-- **Existing merged binaries under `artifacts/`** (from earlier
-  ad-hoc builds against a dirty tree) must NOT be published. The
-  `.gitignore` addition for `artifacts/` means they never make it
-  into the branch.
+- **Existing merged binaries in the shared esp-matter checkout** came
+  from earlier ad-hoc builds against a dirty tree. They were not used.
 
 ### Decisions
 
 - **Feature branch:** `feat/first-release`, off `origin/main`.
-- **Release overlay contents:** exactly five verified BSP symbols —
+- **Release overlay contents:** exactly five verified BSP symbols:
   `BSP_BUTTONS_NUM=1`, `BSP_BUTTON_1_TYPE_GPIO=y`,
   `BSP_BUTTON_1_GPIO=9`, `BSP_BUTTON_1_LEVEL=0`, `BSP_LEDS_NUM=0`.
   Nothing else. The base `sdkconfig.esp32c6.aliro` supplies every
   other setting.
-- **Artefacts are gitignored.** The binary and its SHA-256 live at
+- **Git ignores artifacts.** The binary and its SHA-256 live at
   `artifacts/aliro-c6-v0.0.1-devkit/` locally and are uploaded to
   the GitHub Release; not tracked.
 - **Snapshot approach** (`git archive` + connectedhomeip symlink)
   documented in `firmware/RELEASE.md` as the reproducible path.
 
-### Blocked
+### Result
 
-- Build execution runs on the user's main shell (sandbox blocks
-  it here). Artefact facts (size, SHA-256, part manifest) will be
-  integrated back into `RELEASE.md` after the build completes.
-- Push, release publication, and hardware flashing are explicitly
-  out of scope for this session per the task instructions.
+- The clean build completed. The app image is 1,606,208 bytes. The
+  merged factory image is 4,194,304 bytes.
+- Factory SHA-256:
+  `675247acf8660a8a0cab68dcb15634075a35f9ffa40842d9b3054f8a392d7fcf`.
+- The app image checksum and validation hash are valid.
+- The generated config enables Thread and Aliro over NFC. It disables
+  the Wi-Fi station. The factory image has no portal or Wi-Fi
+  credential markers.
+- Release publication and the Pages deployment are the next steps.
 
 ---
 

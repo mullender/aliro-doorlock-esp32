@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# prepare_release.sh — produce a merged 4 MB factory binary and its
+# Produce a merged 4 MB factory binary and its
 # SHA-256 sidecar from an idf.py build tree.
 #
 # Usage:
@@ -24,6 +24,11 @@ set -euo pipefail
 BUILD_DIR="${1:?usage: prepare_release.sh <BUILD_DIR> [<TAG>]}"
 TAG="${2:-aliro-c6-v0.0.1-devkit}"
 
+if [[ ! "$TAG" =~ ^aliro-c6-[A-Za-z0-9._-]+$ ]]; then
+  echo "error: invalid Aliro release tag: $TAG" >&2
+  exit 2
+fi
+
 if [[ ! -f "$BUILD_DIR/flasher_args.json" ]]; then
   echo "error: $BUILD_DIR/flasher_args.json not found. Was 'idf.py build' run?" >&2
   exit 2
@@ -39,11 +44,11 @@ mkdir -p "$OUT_DIR"
 
 # esptool.py can either come from the ESP-IDF's exported venv or from
 # the system. We prefer the exported one for version parity.
-ESPTOOL=""
+ESPTOOL=()
 if command -v esptool.py >/dev/null 2>&1; then
-  ESPTOOL=$(command -v esptool.py)
-elif [[ -n "${IDF_PATH:-}" && -x "$IDF_PATH/components/esptool_py/esptool/esptool.py" ]]; then
-  ESPTOOL="python3 $IDF_PATH/components/esptool_py/esptool/esptool.py"
+  ESPTOOL=("$(command -v esptool.py)")
+elif [[ -n "${IDF_PATH:-}" && -f "$IDF_PATH/components/esptool_py/esptool/esptool.py" ]]; then
+  ESPTOOL=(python3 "$IDF_PATH/components/esptool_py/esptool/esptool.py")
 else
   echo "error: esptool.py not on PATH and IDF_PATH not set" >&2
   exit 2
@@ -61,6 +66,10 @@ for off, path in pairs:
     print(f"{off} {path}")
 PY
 )
+if [[ -z "$PARTS" ]]; then
+  echo "error: flasher_args.json has no flash files" >&2
+  exit 2
+fi
 
 echo "=== parts to merge ==="
 echo "$PARTS"
@@ -68,14 +77,27 @@ echo "$PARTS"
 # Build the argv list.
 MERGE_ARGS=()
 while read -r OFF FILE; do
+  if [[ ! -f "$BUILD_DIR/$FILE" ]]; then
+    echo "error: flash part not found: $BUILD_DIR/$FILE" >&2
+    exit 2
+  fi
   MERGE_ARGS+=("$OFF" "$BUILD_DIR/$FILE")
 done <<< "$PARTS"
 
-CHIP="$(python3 -c "import json; print(json.load(open('$BUILD_DIR/flasher_args.json')).get('extra_esptool_args', {}).get('chip', 'esp32c6'))")"
+CHIP="$(python3 - "$BUILD_DIR/flasher_args.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    data = json.load(source)
+print(data.get("extra_esptool_args", {}).get("chip", "esp32c6"))
+PY
+)"
+if [[ "$CHIP" != "esp32c6" ]]; then
+  echo "error: release image is for $CHIP, expected esp32c6" >&2
+  exit 2
+fi
 
 echo "=== merge_bin --> $OUT_BIN ==="
-# shellcheck disable=SC2086
-$ESPTOOL --chip "$CHIP" merge_bin \
+"${ESPTOOL[@]}" --chip "$CHIP" merge_bin \
   --flash_mode dio \
   --flash_freq 80m \
   --flash_size 4MB \
@@ -93,7 +115,7 @@ SHA=$(shasum -a 256 "$OUT_BIN" | awk '{print $1}')
 echo "${SHA}  $(basename "$OUT_BIN")" > "$OUT_SHA"
 
 {
-  echo "# ${TAG} — factory image manifest"
+  echo "# ${TAG} factory image manifest"
   echo "chip:  $CHIP"
   echo "size:  ${SIZE} bytes"
   echo "sha256: ${SHA}"
@@ -108,7 +130,7 @@ echo "${SHA}  $(basename "$OUT_BIN")" > "$OUT_SHA"
 } > "$OUT_MANIFEST"
 
 echo
-echo "Release artefacts:"
+echo "Release artifacts:"
 echo "  $OUT_BIN         ($SIZE bytes)"
 echo "  $OUT_SHA         sha256 = ${SHA}"
 echo "  $OUT_MANIFEST    (part-by-part audit)"
