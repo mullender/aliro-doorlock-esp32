@@ -3,6 +3,60 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
+## 2026-08-05 — First release build prep (on `feat/first-release`)
+
+Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.
+
+### Findings
+
+- **Shared esp-matter tree is dirty and git-lfs missing.** Snapshotted
+  the target commit (`85c76a1`) via `git archive | tar -x` into a
+  temp directory instead of a fresh clone or worktree. The archive
+  writes an empty `connectedhomeip/connectedhomeip/` placeholder;
+  we replaced it with a symlink into the shared checkout's populated
+  submodule so we don't have to re-clone the 14 GB tree. Shared tree
+  untouched.
+- **ESP-IDF v5.5.4 confirmed** from
+  `components/esp_common/include/esp_idf_version.h` (MAJOR=5,
+  MINOR=5, PATCH=4). Skipped the `idf.py --version` call after a
+  hang.
+- **`CONFIG_ESP_MATTER_NVS_USE_COMPACT_ATTR_STORAGE` is unknown to
+  esp-matter `85c76a1`.** `idf.py` drops it as an unrecognised
+  symbol at set-target time. Removed from the overlay. Documented
+  in `firmware/RELEASE.md` so a future esp-matter bump can revisit.
+- **esp-matter `export.sh` reads `ESP_MATTER_PATH` without a
+  default.** With `set -u` (nounset) in the build script, the
+  source of that file trips on unbound-variable. `build_release.sh`
+  now sets `ESP_MATTER_PATH=$ESP_MATTER_SRC` before sourcing.
+- **Existing merged binaries under `artifacts/`** (from earlier
+  ad-hoc builds against a dirty tree) must NOT be published. The
+  `.gitignore` addition for `artifacts/` means they never make it
+  into the branch.
+
+### Decisions
+
+- **Feature branch:** `feat/first-release`, off `origin/main`.
+- **Release overlay contents:** exactly five verified BSP symbols —
+  `BSP_BUTTONS_NUM=1`, `BSP_BUTTON_1_TYPE_GPIO=y`,
+  `BSP_BUTTON_1_GPIO=9`, `BSP_BUTTON_1_LEVEL=0`, `BSP_LEDS_NUM=0`.
+  Nothing else. The base `sdkconfig.esp32c6.aliro` supplies every
+  other setting.
+- **Artefacts are gitignored.** The binary and its SHA-256 live at
+  `artifacts/aliro-c6-v0.0.1-devkit/` locally and are uploaded to
+  the GitHub Release; not tracked.
+- **Snapshot approach** (`git archive` + connectedhomeip symlink)
+  documented in `firmware/RELEASE.md` as the reproducible path.
+
+### Blocked
+
+- Build execution runs on the user's main shell (sandbox blocks
+  it here). Artefact facts (size, SHA-256, part manifest) will be
+  integrated back into `RELEASE.md` after the build completes.
+- Push, release publication, and hardware flashing are explicitly
+  out of scope for this session per the task instructions.
+
+---
+
 ## 2026-08-05 — GitHub push (completed)
 
 Both local repos are now on GitHub. The submodule reference resolves.

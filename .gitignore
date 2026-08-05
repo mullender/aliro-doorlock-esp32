@@ -26,6 +26,10 @@ installer/vendor/dist/
 .env.*
 lab_notes/*.local.md
 
+# Release artefacts — produced by scripts/prepare_release.sh, uploaded to
+# a GitHub Release rather than tracked in git.
+artifacts/
+
 # Python
 __pycache__/
 *.pyc

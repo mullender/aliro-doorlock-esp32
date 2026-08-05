@@ -4,9 +4,21 @@ Aliro firmware overlay for ESP32 boards.
 
 ## Today (pre-Phase-5)
 
-Empty. The MVP builds `esp-matter/examples/door_lock` unmodified with the
-`sdkconfig.esp32c6.aliro` config. See
-`../docs/run_aliro_door_lock_on_nanoc6_plan.md`.
+The MVP builds `esp-matter/examples/door_lock` against a pinned
+esp-matter commit and ESP-IDF version, with a small NanoC6 release
+overlay (`overlay/sdkconfig.release.nanoc6`) layered on top of the
+stock `sdkconfig.esp32c6.aliro`.
+
+- `overlay/sdkconfig.release.nanoc6` — the delta.
+- `RELEASE.md` — pins, overlay symbols, reproducibility notes,
+  artefact contract.
+- `../scripts/build_release.sh` — layered build against a clean
+  esp-matter snapshot.
+- `../scripts/prepare_release.sh` — merge to a 4 MB factory bin +
+  sha256.
+
+See also `../docs/run_aliro_door_lock_on_nanoc6_plan.md` for the
+manual bring-up flow.
 
 ## Phase 5 (unique device credentials)
 
