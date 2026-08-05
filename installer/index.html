@@ -239,6 +239,7 @@
 <script type="module">
 import { validateMTPayload, validateManualCode, validatePair } from "./js/matter-payload.js";
 import { renderMTasSVG } from "./js/qr-render.js";
+import { parseMatterOnboardingCodes } from "./js/boot-parser.js";
 
 const pairingEl = document.getElementById("pairing");
 const qrEl = document.getElementById("qr");
@@ -306,6 +307,35 @@ tabs.forEach(t => t.addEventListener("click", () => {
     p.setAttribute("aria-hidden", p.id === t.getAttribute("aria-controls") ? "false" : "true"));
 }));
 
+// Wire the post-install callback added by the vendored esp-web-tools fork.
+// Runs on every successful flash. Contract: read the boot log, extract the
+// two Matter setup lines, hand them to showPairing. MUST release the serial
+// reader before resolving, or ESP Web Tools' downstream initialisation fails.
+const installBtn = document.getElementById("install-button");
+if (installBtn) {
+  installBtn.onPostFlash = async (port) => {
+    flashMsgEl.textContent = "Reading pairing codes from device...";
+    try {
+      const result = await parseMatterOnboardingCodes(port, {
+        timeoutMs: 15000,
+        logger: (msg, level) =>
+          (level === "error" ? console.error : console.log)(`[boot-parser] ${msg}`),
+      });
+      if (!result.ok) {
+        flashMsgEl.textContent = result.error;
+        console.warn("[boot-parser] full log follows:\n" + result.log);
+        return;
+      }
+      flashMsgEl.textContent = "";
+      showPairing(result.mt, result.manualCode);
+    } catch (err) {
+      flashMsgEl.textContent = "Reader error: " + err.message;
+    }
+    // parseMatterOnboardingCodes releases the reader in its finally block;
+    // ESP Web Tools' Improv init can safely take the port after this resolves.
+  };
+}
+
 // Dev mode: ?dev=1 shows the shared example payload without flashing.
 // Useful for reviewing the UI and testing pairing flow with a bench device
 // that already runs stock esp-matter.
@@ -316,10 +346,30 @@ if (params.get("dev") === "1") {
 }
 </script>
 
-<!-- ESP Web Tools install button — placeholder until Phase 4a vendors the fork -->
-<!-- TODO Phase 4a: replace with ./vendor/dist/install-button.js once the -->
-<!-- callback fork is submoduled and built into _site/vendor/dist/. -->
-<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<!-- ESP Web Tools install button.
+     Loaded from ./vendor/dist/install-button.js in the deployed site
+     (built from the vendored fork). Locally, before scripts/setup_vendor.sh
+     has been run, falls back to the CDN copy of 10.4.0 — the fallback does
+     NOT expose onPostFlash so the pairing panel will not appear
+     automatically; use ?dev=1 to review the UI. -->
+<script type="module">
+  // Try the vendored build first; fall back to CDN if it 404s.
+  const tryLocal = document.createElement("script");
+  tryLocal.type = "module";
+  tryLocal.src = "./vendor/dist/install-button.js";
+  tryLocal.onerror = () => {
+    console.warn(
+      "vendor/dist/install-button.js not found; falling back to unpkg 10.4.0. " +
+      "The onPostFlash callback will NOT be available in this fallback. " +
+      "Run scripts/setup_vendor.sh to bootstrap the vendored fork."
+    );
+    const fallback = document.createElement("script");
+    fallback.type = "module";
+    fallback.src = "https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module";
+    document.body.appendChild(fallback);
+  };
+  document.body.appendChild(tryLocal);
+</script>
 
 </body>
 </html>
