@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aliro door-lock installer</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --line: #ccc; --accent: #0a5; --warn-bg: #fff3cd; --warn-fg: #533f03; --warn-border: #ffcc00; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #111; --fg: #eee; --muted: #999; --line: #444; --warn-bg: #3a2d00; --warn-fg: #ffe69c; --warn-border: #ffcc00; }
+    }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    main { max-width: 48rem; margin: 2rem auto; padding: 1rem 1.5rem; line-height: 1.55; }
+    h1 { font-size: 1.6rem; margin: 0 0 0.5rem 0; }
+    h2 { font-size: 1.15rem; margin: 1.6rem 0 0.4rem 0; }
+    p { margin: 0.6rem 0; }
+    ol, ul { padding-left: 1.4rem; }
+    code, .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95em; }
+    .warn { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-border); border-left: 4px solid var(--warn-border); padding: 0.9rem 1rem; margin: 1rem 0; border-radius: 4px; }
+    .warn strong { display: block; margin-bottom: 0.3rem; }
+    .install-row { margin: 1.5rem 0; text-align: center; }
+    .browser-note { color: var(--muted); font-size: 0.9em; text-align: center; margin-top: 0.3rem; }
+    footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); font-size: 0.85em; color: var(--muted); }
+
+    /* Pairing panel (hidden until a successful flash + parse) */
+    .pairing { display: none; margin: 1.5rem 0; padding: 1rem 1.5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+    .pairing.visible { display: block; }
+    .pairing-grid { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 1.5rem; align-items: start; }
+    @media (max-width: 640px) {
+      .pairing-grid { grid-template-columns: 1fr; }
+    }
+    .qr-box { background: #fff; padding: 0.75rem; border-radius: 4px; border: 1px solid var(--line); text-align: center; }
+    .qr-box svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+    .qr-caption { margin-top: 0.6rem; font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75em; color: #000; word-break: break-all; }
+    .manual-code { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.4em; letter-spacing: 0.1em; background: rgba(128,128,128,0.1); padding: 0.5rem 0.75rem; border-radius: 4px; display: inline-block; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+    .actions button, .actions a.button { font: inherit; padding: 0.4rem 0.85rem; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 4px; cursor: pointer; text-decoration: none; }
+    .actions button:hover, .actions a.button:hover { background: rgba(128,128,128,0.1); }
+    .flash-msg { color: var(--muted); font-size: 0.85em; min-height: 1em; margin-left: 0.4rem; }
+
+    /* Platform selector */
+    .platform-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); margin: 1rem 0 0.75rem 0; flex-wrap: wrap; }
+    .platform-tabs button { font: inherit; padding: 0.5rem 0.85rem; background: transparent; color: var(--muted); border: none; border-bottom: 2px solid transparent; cursor: pointer; }
+    .platform-tabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+    .platform-panel { display: none; }
+    .platform-panel[aria-hidden="false"] { display: block; }
+
+    /* Dev mode banner */
+    .dev-banner { background: rgba(255, 200, 0, 0.15); border-left: 4px solid #fc0; padding: 0.6rem 1rem; margin: 1rem 0; font-size: 0.9em; }
+
+    /* Details/summary for the help section */
+    details { margin: 0.75rem 0; padding: 0.5rem 0.75rem; background: rgba(128,128,128,0.05); border-radius: 4px; }
+    details summary { cursor: pointer; font-weight: 600; }
+
+    /* Print: hide install row, keep pairing */
+    @media print {
+      body { background: white; color: black; }
+      .install-row, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
+      .pairing { display: block !important; border: none; padding: 0; }
+      .qr-box { border: none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+
+<h1>Aliro door-lock installer</h1>
+<p>
+  Flash the <strong>Aliro door-lock reader</strong> firmware to an
+  <strong>M5Stack NanoC6</strong> (or any compatible ESP32-C6 board) over
+  USB, then commission it into Apple Home, Google Home, or Home Assistant
+  as a Matter door-lock over Thread.
+</p>
+
+<div class="warn" role="alert">
+  <strong>Factory install erases the entire flash.</strong>
+  Any existing Matter fabric membership, Thread credentials, and Aliro
+  reader configuration on this board will be lost. This is intentional
+  for first-time setup. For an over-the-air update of an already
+  commissioned device, use the OTA flow — not this installer.
+</div>
+
+<h2>Before you start</h2>
+<ul>
+  <li>A USB-C data-capable cable and an M5 NanoC6 with the Unit NFC
+    (ST25R3916) attached over Grove.</li>
+  <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
+    Safari and Firefox do not support Web Serial.</li>
+  <li>A Thread border router on your LAN (Home Assistant + SkyConnect /
+    ZBT-1 / ZBT-2, Apple HomePod, or Google Nest Hub 2nd gen).</li>
+  <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
+</ul>
+
+<div class="install-row">
+  <esp-web-install-button
+    manifest="./manifest.json"
+    id="install-button">
+    <button slot="unsupported">
+      Web Serial is not available in this browser. Use Chrome or Edge on
+      desktop.
+    </button>
+    <button slot="not-allowed">
+      Web Serial requires HTTPS (this page must be served securely).
+    </button>
+  </esp-web-install-button>
+  <div class="browser-note">
+    Chrome or Edge on desktop only. This page never sends your device's
+    setup data to a remote service.
+  </div>
+</div>
+
+<div class="dev-banner" id="dev-banner" hidden>
+  Dev mode: showing the shared esp-matter example payload. Not a real
+  device — the QR below will not commission any hardware you own unless
+  you also flashed a stock esp-matter build. Turn dev mode off by
+  removing <code>?dev=1</code> from the URL.
+</div>
+
+<!-- Pairing panel: hidden until Phase 4's serial parser sets pairing state -->
+<section class="pairing" id="pairing" aria-hidden="true">
+  <h2>Scan to add the device</h2>
+  <p>Open Apple Home, Google Home, or the Home Assistant Companion app
+    on your phone, choose <em>Add device</em>, and scan this QR code:</p>
+  <div class="pairing-grid">
+    <div class="qr-box">
+      <div id="qr"></div>
+      <div class="qr-caption" id="qr-caption"></div>
+    </div>
+    <div>
+      <p>Cannot scan? Enter the manual pairing code:</p>
+      <div class="manual-code" id="manual-code">—</div>
+      <div class="actions">
+        <button type="button" id="copy-mt">Copy MT: string</button>
+        <button type="button" id="copy-manual">Copy manual code</button>
+        <button type="button" id="download-svg">Download QR (SVG)</button>
+        <button type="button" id="print-qr">Print pairing sheet</button>
+        <span class="flash-msg" id="flash-msg" role="status" aria-live="polite"></span>
+      </div>
+
+      <!-- Platform-specific instructions -->
+      <div class="platform-tabs" role="tablist" aria-label="Phone app">
+        <button role="tab" aria-selected="true" aria-controls="p-apple" id="t-apple">Apple Home</button>
+        <button role="tab" aria-selected="false" aria-controls="p-google" id="t-google">Google Home</button>
+        <button role="tab" aria-selected="false" aria-controls="p-ha" id="t-ha">Home Assistant</button>
+      </div>
+
+      <div class="platform-panel" id="p-apple" aria-hidden="false" role="tabpanel" aria-labelledby="t-apple">
+        <ol>
+          <li>Open the <strong>Home</strong> app on an iPhone with iOS 17+.</li>
+          <li>Tap <strong>+</strong> in the top-right, then <em>Add Accessory</em>.</li>
+          <li>Point the phone camera at the QR code above.</li>
+          <li>When prompted, accept the "uncertified accessory" warning.
+              The firmware uses Matter test attestation, not a
+              CSA-certified device identity.</li>
+          <li>Choose a room and give the lock a name.</li>
+        </ol>
+        <details>
+          <summary>Apple Home refuses the QR</summary>
+          <p>iOS 17.x sometimes rejects a valid Matter test attestation
+             when the paired Thread border router has not published its
+             credentials. Confirm your HomePod or Apple TV is signed in
+             to the same iCloud account as the phone and try again after
+             a minute. If it still fails, use Home Assistant Companion
+             instead.</p>
+        </details>
+      </div>
+
+      <div class="platform-panel" id="p-google" aria-hidden="true" role="tabpanel" aria-labelledby="t-google">
+        <ol>
+          <li>Open the <strong>Google Home</strong> app on Android with
+              current Play Services.</li>
+          <li>Tap <strong>+</strong> then <em>Set up device → New device</em>.</li>
+          <li>Choose your home and let Google Home scan for Matter-enabled
+              devices, or scan the QR above directly.</li>
+          <li>Google Home may show an "uncertified device" warning
+              because the firmware uses Matter test attestation. Some
+              release channels of Google Home refuse test attestation
+              entirely.</li>
+        </ol>
+        <details>
+          <summary>Google Home refuses the QR</summary>
+          <p>Google Home's acceptance of test-attestation VIDs is
+             inconsistent between release channels. If it fails here,
+             try Apple Home or Home Assistant Companion. Track the exact
+             error text for a lab-notes entry.</p>
+        </details>
+      </div>
+
+      <div class="platform-panel" id="p-ha" aria-hidden="true" role="tabpanel" aria-labelledby="t-ha">
+        <ol>
+          <li>Ensure the <strong>Matter</strong> and <strong>Thread</strong>
+              integrations are enabled in Home Assistant and a border
+              router is active.</li>
+          <li>Open the <strong>Home Assistant Companion</strong> app on
+              your phone. The web UI cannot start commissioning.</li>
+          <li>Settings → Devices &amp; Services → Add Integration →
+              <em>Matter (BETA)</em>.</li>
+          <li>Scan the QR code above with the phone.</li>
+        </ol>
+        <details>
+          <summary>Aliro-specific credential management</summary>
+          <p>Home Assistant does not yet expose Aliro reader
+             configuration (<code>SetAliroReaderConfig</code> and friends)
+             in its UI. To exercise the Aliro delegate on this device,
+             use <code>matter-server</code> or the Matter shell directly
+             after commissioning. This is expected to improve as Home
+             Assistant's Aliro epic lands.</p>
+        </details>
+      </div>
+
+      <details>
+        <summary>Something went wrong — factory reset</summary>
+        <p>To reset the device and start commissioning again:</p>
+        <ol>
+          <li>Unplug USB.</li>
+          <li>Hold the M5 NanoC6 reset button as documented for the
+              bootloader entry sequence.</li>
+          <li>Reconnect USB and re-run this installer.</li>
+        </ol>
+        <p>A full-chip erase removes any Aliro reader configuration and
+           credential-issuer keys the device held. For a mid-commissioning
+           retry that preserves those, restart the phone app instead of
+           re-flashing.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<footer>
+  aliro-doorlock-esp32 — Aliro door-lock reader firmware and browser
+  flasher. Source at
+  <a href="https://github.com/mullender/aliro-doorlock-esp32">github.com/mullender/aliro-doorlock-esp32</a>.
+  This page never sends your device's setup data to a remote service.
+</footer>
+
+</main>
+
+<script src="./vendor/qrcode.js"></script>
+<script type="module">
+import { validateMTPayload, validateManualCode, validatePair } from "./js/matter-payload.js";
+import { renderMTasSVG } from "./js/qr-render.js";
+
+const pairingEl = document.getElementById("pairing");
+const qrEl = document.getElementById("qr");
+const qrCaptionEl = document.getElementById("qr-caption");
+const manualEl = document.getElementById("manual-code");
+const flashMsgEl = document.getElementById("flash-msg");
+const devBannerEl = document.getElementById("dev-banner");
+
+let currentMT = null;
+let currentManual = null;
+
+/**
+ * Show the pairing panel with a validated (MT:, manual code) pair.
+ * Called by Phase 4's serial log parser once the boot log lines are read.
+ */
+function showPairing(mt, manualCode) {
+  const validation = validatePair(mt, manualCode);
+  if (!validation.valid) {
+    flashMsgEl.textContent = "Refused to display: " + validation.error;
+    return;
+  }
+  currentMT = mt;
+  currentManual = manualCode;
+  const svg = renderMTasSVG(mt, { size: 300 });
+  qrEl.innerHTML = svg;
+  qrCaptionEl.textContent = mt;
+  manualEl.textContent = manualCode.replace(/(\d{4})(\d{4})(\d{3})/, "$1-$2-$3");
+  pairingEl.classList.add("visible");
+  pairingEl.setAttribute("aria-hidden", "false");
+  pairingEl.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Expose for Phase 4 integration (the ESP Web Tools callback calls
+// window.__aliroShowPairing(mt, manualCode) after parsing the boot log).
+window.__aliroShowPairing = showPairing;
+
+// Copy actions
+document.getElementById("copy-mt").addEventListener("click", async () => {
+  if (!currentMT) return;
+  try { await navigator.clipboard.writeText(currentMT); flashMsgEl.textContent = "MT: copied"; }
+  catch (e) { flashMsgEl.textContent = "Copy failed: " + e.message; }
+});
+document.getElementById("copy-manual").addEventListener("click", async () => {
+  if (!currentManual) return;
+  try { await navigator.clipboard.writeText(currentManual); flashMsgEl.textContent = "Manual code copied"; }
+  catch (e) { flashMsgEl.textContent = "Copy failed: " + e.message; }
+});
+document.getElementById("download-svg").addEventListener("click", () => {
+  if (!currentMT) return;
+  const svg = renderMTasSVG(currentMT, { size: 512 });
+  const blob = new Blob([svg], { type: "image/svg+xml" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "aliro-pairing-qr.svg";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+document.getElementById("print-qr").addEventListener("click", () => window.print());
+
+// Tab switching
+const tabs = document.querySelectorAll('.platform-tabs [role="tab"]');
+tabs.forEach(t => t.addEventListener("click", () => {
+  tabs.forEach(x => x.setAttribute("aria-selected", x === t ? "true" : "false"));
+  document.querySelectorAll(".platform-panel").forEach(p =>
+    p.setAttribute("aria-hidden", p.id === t.getAttribute("aria-controls") ? "false" : "true"));
+}));
+
+// Dev mode: ?dev=1 shows the shared example payload without flashing.
+// Useful for reviewing the UI and testing pairing flow with a bench device
+// that already runs stock esp-matter.
+const params = new URLSearchParams(location.search);
+if (params.get("dev") === "1") {
+  devBannerEl.hidden = false;
+  showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
+}
+</script>
+
+<!-- ESP Web Tools install button — placeholder until Phase 4a vendors the fork -->
+<!-- TODO Phase 4a: replace with ./vendor/dist/install-button.js once the -->
+<!-- callback fork is submoduled and built into _site/vendor/dist/. -->
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+
+</body>
+</html>
