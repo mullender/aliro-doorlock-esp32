@@ -101,6 +101,8 @@ serves them from Pages.
 
 The build completed on 2026-08-05 with esptool.py 4.12.0.
 
+Installer: <https://mullender.github.io/aliro-doorlock-esp32/>
+
 - App image: 1,606,208 bytes
 - Factory image: 4,194,304 bytes
 - Factory SHA-256:
@@ -110,6 +112,8 @@ The build completed on 2026-08-05 with esptool.py 4.12.0.
 - Aliro over NFC: enabled
 - Wi-Fi station: disabled
 - Portal and Wi-Fi credential markers: not found
+- Pages manifest: ESP32-C6, factory image at offset `0`
+- Public binary SHA-256: matches the release artifact
 
 ## Reproducibility notes
 

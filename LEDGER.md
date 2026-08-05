@@ -55,7 +55,13 @@ Prepares the first installable release: `aliro-c6-v0.0.1-devkit`.
 - The generated config enables Thread and Aliro over NFC. It disables
   the Wi-Fi station. The factory image has no portal or Wi-Fi
   credential markers.
-- Release publication and the Pages deployment are the next steps.
+- GitHub prerelease `aliro-c6-v0.0.1-devkit` now contains the factory
+  binary, SHA-256 file, and part manifest.
+- The `github-pages` environment now allows tags that match
+  `aliro-c6-*`. Workflow run `31031424301` passed after this rule was
+  added.
+- The live installer selects ESP32-C6 and offset `0`. The public 4 MB
+  binary matches the release SHA-256.
 
 ---
 
