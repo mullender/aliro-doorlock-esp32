@@ -1,0 +1,33 @@
+# Build outputs
+build/
+_site/
+dist/
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Node / JS
+node_modules/
+package-lock.json.local
+installer/vendor/dist/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local secrets / notes
+.env
+.env.*
+lab_notes/*.local.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
