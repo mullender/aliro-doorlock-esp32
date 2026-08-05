@@ -106,7 +106,7 @@ connectedhomeip checkout before it starts the build.
 export ESP_MATTER_SRC=/absolute/path/to/clean/esp-matter/snapshot
 export ESP_MATTER_REVISION=85c76a1788c5b70b4b0811734af8616dda15e7ac
 scripts/build_release.sh                       # build only
-scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
+scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
 ```
 
 `build_release.sh`:
@@ -127,10 +127,18 @@ scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 `prepare_release.sh`:
 
 1. Reads the part list from `build/flasher_args.json`.
-2. Invokes `esptool.py merge_bin --flash_size 4MB --fill-flash-size 4MB`.
-3. Verifies the merged image is exactly 4 194 304 bytes.
-4. Writes the merged image, its SHA-256 sidecar, and a per-part
-   `manifest.txt` under `artifacts/<tag>/`.
+2. Verifies that the partition-table SHA-256 is
+   `22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421`.
+3. Copies `build/door_lock.bin` byte-for-byte to the app-only release
+   asset and rejects an app larger than the `0x1e0000`-byte OTA slot.
+4. Invokes `esptool.py merge_bin --flash_size 4MB --fill-flash-size 4MB`.
+5. Verifies that the merged image is exactly 4 194 304 bytes.
+6. Verifies that the factory partition-table slice has the approved
+   SHA-256 and that its app slice is identical to the app asset.
+7. Writes both images, their SHA-256 sidecars, and a per-part
+   `manifest.txt` to a staging directory.
+8. Replaces `artifacts/<tag>/` only after all checks pass. A failed
+   package run keeps the prior complete artifact set.
 
 ## Artifacts
 
@@ -138,19 +146,45 @@ scripts/prepare_release.sh <build-dir> [<tag>] # merge + sha256
 artifacts/aliro-c6-v0.0.3-devkit/
   aliro-c6-v0.0.3-devkit-factory.bin          4 MiB, padded 0xFF
   aliro-c6-v0.0.3-devkit-factory.bin.sha256   sha256 sidecar
+  aliro-c6-v0.0.3-devkit-app.bin              app-only update image
+  aliro-c6-v0.0.3-devkit-app.bin.sha256       sha256 sidecar
   manifest.txt                                per-part audit
 ```
 
-Git ignores `artifacts/`. The binary and sidecar are uploaded to a
+Git ignores `artifacts/`. Both binaries and sidecars are uploaded to a
 GitHub Release matching the tag; the installer's
 `.github/workflows/deploy-installer.yml` picks them up from there and
 serves them from Pages.
+
+The Pages site publishes two manifests:
+
+- `manifest.json` is the destructive factory install. It writes the
+  4 MiB factory image at offset `0` and erases stored data.
+- `manifest-update.json` is the preserving update. It writes only the
+  app image at `0x20000` and `0x200000`. It does not write NVS,
+  `nvs_keys`, `otadata`, secure-certificate data, factory data, PHY
+  data, or coredump data.
+
+Before a preserving update writes data, the installer reads `0xc00`
+bytes at `0xc000` from the connected device. It rejects the update if
+that partition-table SHA-256 does not match the approved layout. It
+also rejects every erase request for an app-only manifest. After each
+write, it reads the written range back and compares every byte before
+it reports success.
+
+The preserving layout ID is `esp32c6-door-lock-4mb-v1`. Its partition
+table SHA-256 is
+`22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421`.
+The update writes both OTA slots because the browser manifest does not
+know which slot `otadata` selects.
 
 ### Verified build for `aliro-c6-v0.0.3-devkit`
 
 The clean build and packaging passed on 2026-08-05.
 
 - `door_lock.bin`: `0x1871c0` bytes (1,601,984 bytes)
+- App-only SHA-256:
+  `ef81cf3615821b37a9207cfcb90c311e9588466f53df03dc0bfca020beba74f2`
 - Total image size report: 1,601,862 bytes
 - Smallest app partition: `0x1e0000` bytes, with `0x58e40` bytes
   free (19%)

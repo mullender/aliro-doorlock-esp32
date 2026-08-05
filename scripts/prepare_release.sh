@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Produce a merged 4 MB factory binary and its
-# SHA-256 sidecar from an idf.py build tree.
+# Produce factory and app-only release binaries and their SHA-256
+# sidecars from an idf.py build tree.
 #
 # Usage:
 #   scripts/prepare_release.sh <BUILD_DIR> [<TAG>]
@@ -13,6 +13,8 @@
 # Outputs (relative to the repo root):
 #   artifacts/<TAG>/<TAG>-factory.bin
 #   artifacts/<TAG>/<TAG>-factory.bin.sha256
+#   artifacts/<TAG>/<TAG>-app.bin
+#   artifacts/<TAG>/<TAG>-app.bin.sha256
 #   artifacts/<TAG>/manifest.txt   (part offsets and hashes for audit)
 #
 # The merged binary is produced with `esptool.py merge_bin` using the
@@ -35,12 +37,68 @@ if [[ ! -f "$BUILD_DIR/flasher_args.json" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ARTIFACTS_DIR="$REPO_ROOT/artifacts"
 OUT_DIR="$REPO_ROOT/artifacts/$TAG"
-OUT_BIN="$OUT_DIR/${TAG}-factory.bin"
-OUT_SHA="$OUT_BIN.sha256"
-OUT_MANIFEST="$OUT_DIR/manifest.txt"
+mkdir -p "$ARTIFACTS_DIR"
+STAGE_DIR=$(mktemp -d "$ARTIFACTS_DIR/.${TAG}.stage.XXXXXX")
+BACKUP_DIR=""
 
-mkdir -p "$OUT_DIR"
+cleanup() {
+  if [[ -n "${STAGE_DIR:-}" && -d "$STAGE_DIR" &&
+        "$(dirname "$STAGE_DIR")" == "$ARTIFACTS_DIR" ]]; then
+    rm -R -- "$STAGE_DIR"
+  fi
+  if [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" &&
+        ! -e "$OUT_DIR" && "$(dirname "$BACKUP_DIR")" == "$ARTIFACTS_DIR" ]]; then
+    mv "$BACKUP_DIR" "$OUT_DIR"
+  fi
+}
+trap cleanup EXIT
+
+OUT_BIN="$STAGE_DIR/${TAG}-factory.bin"
+OUT_SHA="$OUT_BIN.sha256"
+OUT_APP="$STAGE_DIR/${TAG}-app.bin"
+OUT_APP_SHA="$OUT_APP.sha256"
+OUT_MANIFEST="$STAGE_DIR/manifest.txt"
+APP_SOURCE="$BUILD_DIR/door_lock.bin"
+PARTITION_SOURCE="$BUILD_DIR/partition_table/partition-table.bin"
+MAX_APP_SIZE=$((0x1E0000))
+EXPECTED_PARTITION_SHA="22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421"
+
+if [[ ! -f "$APP_SOURCE" ]]; then
+  echo "error: app image not found: $APP_SOURCE" >&2
+  exit 2
+fi
+if [[ ! -f "$PARTITION_SOURCE" ]]; then
+  echo "error: partition table not found: $PARTITION_SOURCE" >&2
+  exit 2
+fi
+
+PARTITION_SHA=$(shasum -a 256 "$PARTITION_SOURCE" | awk '{print $1}')
+if [[ "$PARTITION_SHA" != "$EXPECTED_PARTITION_SHA" ]]; then
+  echo "error: partition table is not the approved preserving-update layout" >&2
+  echo "       expected $EXPECTED_PARTITION_SHA" >&2
+  echo "       found    $PARTITION_SHA" >&2
+  exit 3
+fi
+
+APP_SIZE=$(stat -f%z "$APP_SOURCE" 2>/dev/null || stat -c%s "$APP_SOURCE")
+if [[ "$APP_SIZE" -eq 0 || "$APP_SIZE" -gt "$MAX_APP_SIZE" ]]; then
+  printf 'error: app image is %d bytes; OTA slot limit is %d bytes (0x1E0000)\n' \
+    "$APP_SIZE" "$MAX_APP_SIZE" >&2
+  exit 3
+fi
+
+# Keep the app asset byte-for-byte identical to the image produced by
+# ESP-IDF. This file is written to both OTA slots by the preserving
+# Web Serial update flow.
+cp "$APP_SOURCE" "$OUT_APP"
+if ! cmp -s "$APP_SOURCE" "$OUT_APP"; then
+  echo "error: copied app asset differs from $APP_SOURCE" >&2
+  exit 3
+fi
+APP_SHA=$(shasum -a 256 "$OUT_APP" | awk '{print $1}')
+echo "${APP_SHA}  $(basename "$OUT_APP")" > "$OUT_APP_SHA"
 
 # esptool.py can either come from the ESP-IDF's exported venv or from
 # the system. We prefer the exported one for version parity.
@@ -114,6 +172,17 @@ fi
 SHA=$(shasum -a 256 "$OUT_BIN" | awk '{print $1}')
 echo "${SHA}  $(basename "$OUT_BIN")" > "$OUT_SHA"
 
+FACTORY_PARTITION_SHA=$(dd if="$OUT_BIN" bs=1 skip=$((0xC000)) count=$((0xC00)) 2>/dev/null | shasum -a 256 | awk '{print $1}')
+if [[ "$FACTORY_PARTITION_SHA" != "$EXPECTED_PARTITION_SHA" ]]; then
+  echo "error: merged factory partition table does not match the approved layout" >&2
+  exit 3
+fi
+FACTORY_APP_SHA=$(dd if="$OUT_BIN" bs=1 skip=$((0x20000)) count="$APP_SIZE" 2>/dev/null | shasum -a 256 | awk '{print $1}')
+if [[ "$FACTORY_APP_SHA" != "$APP_SHA" ]]; then
+  echo "error: app asset does not match the merged factory image at offset 0x20000" >&2
+  exit 3
+fi
+
 {
   echo "# ${TAG} factory image manifest"
   echo "chip:  $CHIP"
@@ -127,10 +196,37 @@ echo "${SHA}  $(basename "$OUT_BIN")" > "$OUT_SHA"
     PSHA=$(shasum -a 256 "$FULL" | awk '{print $1}')
     echo "${OFF} ${FILE} ${PSIZE} ${PSHA}"
   done <<< "$PARTS"
+  echo
+  echo "# release assets (name, size, sha256)"
+  echo "$(basename "$OUT_BIN") ${SIZE} ${SHA}"
+  echo "$(basename "$OUT_APP") ${APP_SIZE} ${APP_SHA}"
+  echo
+  echo "# preserving update layout"
+  echo "partition-table-sha256: ${PARTITION_SHA}"
+  echo "ota-slot-size: 0x1e0000"
+  echo "update-offsets: 0x20000 0x200000"
 } > "$OUT_MANIFEST"
+
+BACKUP_DIR="$ARTIFACTS_DIR/.${TAG}.backup.$$"
+if [[ -e "$OUT_DIR" ]]; then
+  mv "$OUT_DIR" "$BACKUP_DIR"
+fi
+if mv "$STAGE_DIR" "$OUT_DIR"; then
+  STAGE_DIR=""
+  if [[ -d "$BACKUP_DIR" && "$(dirname "$BACKUP_DIR")" == "$ARTIFACTS_DIR" ]]; then
+    rm -R -- "$BACKUP_DIR"
+  fi
+else
+  if [[ -d "$BACKUP_DIR" ]]; then
+    mv "$BACKUP_DIR" "$OUT_DIR"
+  fi
+  exit 3
+fi
 
 echo
 echo "Release artifacts:"
-echo "  $OUT_BIN         ($SIZE bytes)"
-echo "  $OUT_SHA         sha256 = ${SHA}"
-echo "  $OUT_MANIFEST    (part-by-part audit)"
+echo "  $OUT_DIR/$(basename "$OUT_BIN")         ($SIZE bytes)"
+echo "  $OUT_DIR/$(basename "$OUT_SHA")         sha256 = ${SHA}"
+echo "  $OUT_DIR/$(basename "$OUT_APP")         ($APP_SIZE bytes)"
+echo "  $OUT_DIR/$(basename "$OUT_APP_SHA")     sha256 = ${APP_SHA}"
+echo "  $OUT_DIR/$(basename "$OUT_MANIFEST")    (part-by-part audit)"

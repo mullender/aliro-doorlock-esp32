@@ -23,8 +23,9 @@ stock `sdkconfig.esp32c6.aliro`.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot.
-- `../scripts/prepare_release.sh` creates a 4 MB factory binary and its
-  SHA-256 file.
+- `../scripts/prepare_release.sh` creates a 4 MB factory binary and an
+  app-only preserving-update binary, with SHA-256 files for both. It
+  stages and cross-checks the complete set before it publishes it.
 
 See also `../docs/run_aliro_door_lock_on_nanoc6_plan.md` for the
 manual bring-up flow.

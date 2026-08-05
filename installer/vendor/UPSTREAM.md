@@ -4,45 +4,36 @@
 
 Git submodule pointing at `mullender/esp-web-tools`, branch
 `homekey-post-install-hook`. Base is the upstream `10.4.0` release tag,
-plus one patch that adds an awaited `onPostFlash` callback.
+plus focused install-lifecycle and safety patches.
 
 - **Upstream repository:** `https://github.com/esphome/esp-web-tools`
-- **Fork:** `https://github.com/mullender/esp-web-tools` (needs to be
-  created on GitHub before the submodule reference resolves)
+- **Fork:** `https://github.com/mullender/esp-web-tools`
 - **Fork branch:** `homekey-post-install-hook`
 - **Upstream base:** tag `10.4.0`
-- **Patch summary:** `feat: add awaited onPostFlash callback` — the
-  single commit on the fork branch on top of the vendored 10.4.0.
+- **Patch summary:** awaited `onPostFlash`, typed terminal results,
+  declarative erase policy, preflight flash checks, app-only erase
+  rejection, connection locking, and readback verification.
 
-## Local fork bootstrap
+## Submodule state
 
-The fork exists on disk at
-`/Users/mullender/Development/esp-web-tools-fork` (created during the
-autonomous scaffold session on 2026-08-04/05). Both commits are in
-local git; nothing has been pushed to GitHub yet.
+The fork repository and the `homekey-post-install-hook` branch exist. This
+repository pins the submodule to commit
+`0a59644e8cd4ed98249902773b81cbc377354b17`. The deploy workflow builds that
+commit and serves it from the same origin as the installer.
 
-To finish the bootstrap:
+The terminal order is fixed: verified flash, reopened serial port,
+awaited `onPostFlash`, then one `install-result`. A rejected callback
+produces `post_flash_failed` and does not produce success.
 
-1. Create `mullender/esp-web-tools` (empty) on GitHub.
-2. From `~/Development/esp-web-tools-fork`:
-   ```
-   git remote add origin https://github.com/mullender/esp-web-tools.git
-   git push -u origin main homekey-post-install-hook
-   ```
-3. From `~/Development/aliro-doorlock-esp32`:
-   ```
-   git submodule add -b homekey-post-install-hook \
-     https://github.com/mullender/esp-web-tools.git \
-     installer/vendor/esp-web-tools
-   git commit -m "vendor: add esp-web-tools fork submodule"
-   ```
-
-`scripts/setup_vendor.sh` walks through these steps.
+The fork also supports a generic `flash_checks` manifest array. Each
+entry has `offset`, `size`, and `sha256`. All checks must pass before
+the first erase or write.
 
 ## Upstream PR
 
 - **Issue:** to be filed on `esphome/esp-web-tools` after Phase 4b lands.
-  Frame as a generic serial-callback hook, not a Matter feature.
+  Frame the callback, terminal result, policy, and flash-check APIs as
+  generic installer safety features, not Matter features.
 - **PR:** to follow the issue, using the fork branch verbatim.
 - **State:** not filed yet.
 

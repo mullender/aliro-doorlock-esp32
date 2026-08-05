@@ -1,11 +1,11 @@
 # Build and publish the aliro-doorlock-esp32 installer to GitHub Pages.
 #
-# The installer is a small ESP Web Tools page. Its factory binary comes
-# from a GitHub Release on this repo (tags matching "aliro-c6-*").
+# The installer is a small ESP Web Tools page. Its factory and app-only
+# binaries come from a GitHub Release on this repo (tags matching "aliro-c6-*").
 # Direct browser fetches of release assets do not carry CORS headers
 # (release-assets.githubusercontent.com sends no
 # Access-Control-Allow-Origin), so this workflow downloads the verified
-# binary and serves it same-origin from Pages.
+# binaries and serves them from the same Pages origin.
 #
 # Also: this repo vendors a fork of esp-web-tools under
 # installer/vendor/esp-web-tools (git submodule). The workflow builds
@@ -15,8 +15,8 @@
 # Triggers:
 #   - release: published (tag prefix aliro-c6-*)
 #   - workflow_dispatch (manual, optional tag input)
-#   - push to installer/**, .github/workflows/**, or scripts/** so a
-#     patch to the vendored library or the flasher UI republishes
+#   - push to installer/** or .github/workflows/deploy-installer.yml so a
+#     patch to the vendored library, flasher UI, or workflow republishes
 #     without waiting on a new firmware release.
 #
 # This workflow is a sibling of the one in mullender/HomeKey-ESP32.
@@ -90,7 +90,11 @@ jobs:
         working-directory: installer/vendor/esp-web-tools
         run: |
           npm ci --loglevel=error --no-progress
+          npm test
           bash script/build
+
+      - name: Test installer integration
+        run: node --test installer/tests/node-tests.mjs
 
       - name: Set up Python (for release download and verification)
         uses: actions/setup-python@v5
@@ -116,7 +120,7 @@ jobs:
           # leading underscores that Jekyll would filter out silently.
           touch _site/.nojekyll
 
-      - name: Discover releases and download the target factory binary
+      - name: Discover the target firmware release
         id: firmware
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,7 +132,7 @@ jobs:
 
           # Enumerate aliro-c6-* releases (newest first per API ordering).
           # If there are none yet (repo just created, no firmware released),
-          # write a stub manifest that the installer UI will render as
+          # write placeholder manifests that the installer UI will render as
           # "no firmware available" gracefully and continue with the site.
           python3 - <<'PY'
           import json, os, sys, urllib.request
@@ -160,19 +164,42 @@ jobs:
               print("::warning::No releases match 'aliro-c6-*'. Publishing site "
                     "without a firmware. The install button will be non-functional "
                     "until a release exists.")
-              # Write a placeholder manifest so the page still renders.
-              manifest = {
+              # Write placeholder manifests so the page still renders.
+              factory_manifest = {
                   "name": "Aliro door-lock reader (no firmware yet)",
                   "version": "unreleased",
-                  "new_install_prompt_erase": True,
+                  "new_install_prompt_erase": False,
                   "new_install_improv_wait_time": 0,
                   "builds": [],
               }
               with open("_site/manifest.json", "w") as f:
-                  json.dump(manifest, f, indent=2)
+                  json.dump(factory_manifest, f, indent=2)
+              update_manifest = {
+                  "name": "Aliro door-lock reader update (no firmware yet)",
+                  "version": "unreleased",
+                  "new_install_prompt_erase": True,
+                  "new_install_improv_wait_time": 0,
+                  "flash_checks": [{
+                      "offset": 0xC000,
+                      "size": 0xC00,
+                      "sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
+                  }],
+                  "builds": [],
+              }
+              with open("_site/manifest-update.json", "w") as f:
+                  json.dump(update_manifest, f, indent=2)
               with open("_site/releases.json", "w") as f:
-                  json.dump({"latest_tag": None, "releases": []}, f, indent=2)
-              # Signal downstream steps that there is no binary to fetch.
+                  json.dump({
+                      "latest_tag": None,
+                      "partition_layout": {
+                          "id": "esp32c6-door-lock-4mb-v1",
+                          "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
+                          "ota_slot_size": 0x1E0000,
+                          "ota_offsets": [0x20000, 0x200000],
+                      },
+                      "releases": [],
+                  }, f, indent=2)
+              # Signal downstream steps that there are no binaries to fetch.
               open("no_binary.flag", "w").close()
               sys.exit(0)
 
@@ -196,6 +223,12 @@ jobs:
               json.dump({
                   "latest_tag": latest["tag_name"],
                   "notes": "Only 'latest_tag' is flashable from this Pages site.",
+                  "partition_layout": {
+                      "id": "esp32c6-door-lock-4mb-v1",
+                      "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
+                      "ota_slot_size": 0x1E0000,
+                      "ota_offsets": [0x20000, 0x200000],
+                  },
                   "releases": [{
                       "tag": r["tag_name"],
                       "commit": r["target_commitish"],
@@ -213,7 +246,7 @@ jobs:
               json.dump(latest, f)
           PY
 
-      - name: Download and verify factory binary
+      - name: Download and verify factory and update binaries
         if: hashFiles('no_binary.flag') == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -228,19 +261,21 @@ jobs:
           tag   = latest["tag_name"]
 
           assets = latest["assets"]
-          bins   = [a for a in assets if a["name"].endswith("-factory.bin")]
-          shas   = [a for a in assets if a["name"].endswith(".sha256")]
-          if len(bins) != 1:
-              print(f"::error::Expected exactly one *-factory.bin asset on {tag}, got {len(bins)}")
-              sys.exit(1)
-          if len(shas) != 1:
-              print(f"::error::Expected exactly one *.sha256 sidecar asset on {tag}, got {len(shas)}")
-              sys.exit(1)
-          bin_asset = bins[0]
-          sha_asset = shas[0]
-          if sha_asset["name"] != bin_asset["name"] + ".sha256":
-              print(f"::error::sha256 sidecar '{sha_asset['name']}' does not correspond to binary '{bin_asset['name']}'")
-              sys.exit(1)
+          expected_names = {
+              "factory": f"{tag}-factory.bin",
+              "factory_sha": f"{tag}-factory.bin.sha256",
+              "app": f"{tag}-app.bin",
+              "app_sha": f"{tag}-app.bin.sha256",
+          }
+
+          def require_asset(name):
+              matches = [asset for asset in assets if asset["name"] == name]
+              if len(matches) != 1:
+                  print(f"::error::Expected exactly one release asset named '{name}' on {tag}, got {len(matches)}")
+                  sys.exit(1)
+              return matches[0]
+
+          selected = {key: require_asset(name) for key, name in expected_names.items()}
 
           def download(asset_id):
               req = urllib.request.Request(
@@ -249,43 +284,89 @@ jobs:
                            "Accept": "application/octet-stream"})
               return urllib.request.urlopen(req, timeout=120).read()
 
-          bin_bytes = download(bin_asset["id"])
-          sha_bytes = download(sha_asset["id"]).decode().strip()
+          def verify_pair(binary_key, sidecar_key):
+              binary_asset = selected[binary_key]
+              sidecar_asset = selected[sidecar_key]
+              binary = download(binary_asset["id"])
+              sidecar = download(sidecar_asset["id"]).decode().strip().split()
+              if len(sidecar) < 2 or sidecar[1] != binary_asset["name"]:
+                  print(f"::error::Invalid SHA-256 sidecar for {binary_asset['name']}")
+                  sys.exit(1)
+              expected = sidecar[0].lower()
+              actual = hashlib.sha256(binary).hexdigest().lower()
+              if expected != actual:
+                  print(f"::error::SHA-256 mismatch on {binary_asset['name']}: expected {expected}, got {actual}")
+                  sys.exit(1)
+              if len(binary) != binary_asset["size"]:
+                  print(f"::error::Size mismatch on {binary_asset['name']}: expected {binary_asset['size']}, got {len(binary)}")
+                  sys.exit(1)
+              with open(f"_site/{binary_asset['name']}", "wb") as output:
+                  output.write(binary)
+              with open(f"_site/{sidecar_asset['name']}", "w") as output:
+                  output.write(f"{actual}  {binary_asset['name']}\n")
+              return binary_asset["name"], binary, actual
 
-          expected = sha_bytes.split()[0].lower()
-          actual   = hashlib.sha256(bin_bytes).hexdigest().lower()
-          if expected != actual:
-              print(f"::error::SHA-256 mismatch on {bin_asset['name']}: expected {expected}, got {actual}")
+          factory_name, factory_bytes, factory_sha = verify_pair("factory", "factory_sha")
+          app_name, app_bytes, app_sha = verify_pair("app", "app_sha")
+          factory_size = len(factory_bytes)
+          app_size = len(app_bytes)
+          if factory_size != 4 * 1024 * 1024:
+              print(f"::error::Factory image is {factory_size} bytes; expected 4194304")
               sys.exit(1)
-          if len(bin_bytes) != bin_asset["size"]:
-              print(f"::error::Size mismatch on {bin_asset['name']}: expected {bin_asset['size']}, got {len(bin_bytes)}")
+          if app_size == 0 or app_size > 0x1E0000:
+              print(f"::error::App image is {app_size} bytes; OTA slot limit is 0x1E0000")
+              sys.exit(1)
+          partition_bytes = factory_bytes[0xC000:0xCC00]
+          partition_sha = hashlib.sha256(partition_bytes).hexdigest()
+          expected_partition_sha = "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421"
+          if len(partition_bytes) != 0xC00 or partition_sha != expected_partition_sha:
+              print(f"::error::Factory partition-table SHA-256 is {partition_sha}; expected {expected_partition_sha}")
+              sys.exit(1)
+          if factory_bytes[0x20000:0x20000 + app_size] != app_bytes:
+              print("::error::App asset does not match the factory image at offset 0x20000")
               sys.exit(1)
 
-          out_name = bin_asset["name"]
-          with open(f"_site/{out_name}", "wb") as f:
-              f.write(bin_bytes)
-          with open(f"_site/{out_name}.sha256", "w") as f:
-              f.write(f"{actual}  {out_name}\n")
-
-          # ESP Web Tools manifest for ESP32-C6.
+          # ESP Web Tools manifests for ESP32-C6.
           # improv is false because the Aliro C6 build is Matter-over-Thread —
           # commissioning runs over BLE from a phone app, not over Improv
           # Wi-Fi. new_install_improv_wait_time=0 short-circuits the library's
           # Improv wait state.
-          manifest = {
+          factory_manifest = {
               "name": "Aliro door-lock reader (M5 NanoC6)",
               "version": tag,
-              "new_install_prompt_erase": True,
+              "new_install_prompt_erase": False,
               "new_install_improv_wait_time": 0,
               "builds": [{
                   "chipFamily": "ESP32-C6",
-                  "parts": [{"path": out_name, "offset": 0}],
+                  "parts": [{"path": factory_name, "offset": 0}],
               }],
           }
           with open("_site/manifest.json", "w") as f:
-              json.dump(manifest, f, indent=2)
+              json.dump(factory_manifest, f, indent=2)
 
-          print(f"Prepared _site with {out_name} ({len(bin_bytes)} bytes, sha256={actual})")
+          update_manifest = {
+              "name": "Aliro door-lock reader update (keep setup)",
+              "version": tag,
+              "new_install_prompt_erase": True,
+              "new_install_improv_wait_time": 0,
+              "flash_checks": [{
+                  "offset": 0xC000,
+                  "size": 0xC00,
+                  "sha256": expected_partition_sha,
+              }],
+              "builds": [{
+                  "chipFamily": "ESP32-C6",
+                  "parts": [
+                      {"path": app_name, "offset": 0x20000},
+                      {"path": app_name, "offset": 0x200000},
+                  ],
+              }],
+          }
+          with open("_site/manifest-update.json", "w") as f:
+              json.dump(update_manifest, f, indent=2)
+
+          print(f"Prepared factory image {factory_name} ({factory_size} bytes, sha256={factory_sha})")
+          print(f"Prepared app image {app_name} ({app_size} bytes, sha256={app_sha})")
           PY
 
       - name: Dump _site contents for the run log
@@ -294,6 +375,8 @@ jobs:
           find _site -maxdepth 3 -print
           echo "==== manifest.json ===="
           cat _site/manifest.json || true
+          echo "==== manifest-update.json ===="
+          cat _site/manifest-update.json || true
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
