@@ -10,13 +10,19 @@ Empty. The MVP builds `esp-matter/examples/door_lock` unmodified with the
 
 ## Phase 5 (unique device credentials)
 
-Will hold either:
+See `DESIGN.md` for the full design. Summary:
 
-- A downstream fork of `esp-matter/examples/door_lock` with a first-boot
-  passcode generator and SPAKE2+ verifier derivation, or
-- An overlay directory that references a pinned `esp-matter` checkout and
-  injects the same code as a small component.
+- Overlay component (`aliro_setup/`) that hooks into `Server::Init()`
+  before it reads factory data. Generates a valid Matter passcode and
+  12-bit discriminator on first boot, derives the SPAKE2+ verifier
+  and salt, persists everything to NVS.
+- Every subsequent boot reads the stored values and lets the Matter
+  SDK's `PrintOnboardingCodes()` emit the per-device MT: string
+  and manual pairing code through the same log lines the flasher
+  parser already reads.
+- No change to the flasher parser or the serial contract.
+- Reset policy: regenerating (new values after factory reset).
 
-The interface with the flasher does not change between the two options.
-The stock `PrintOnboardingCodes()` boot output continues to carry the
-per-device values; only the values change.
+Do not begin implementation until Phase 1 hardware proof has
+established the pin, chip, IDF version, and esp-matter commit that
+Phase 5 must target.
