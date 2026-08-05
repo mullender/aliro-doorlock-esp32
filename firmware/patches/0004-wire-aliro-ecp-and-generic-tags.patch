@@ -1,0 +1,40 @@
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 0000000..0000000 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -368,5 +368,6 @@ CHIP_ERROR AliroDoorLockDelegate::SetAliroReaderConfig(const ByteSpan  &signing
+     ReturnErrorOnFailure(ESP32Utils::MapError(esp_aliro_reader_create(&m_aliro_reader, &reader_config)));
+     ReturnErrorOnFailure(ESP32Utils::MapError(esp_aliro_reader_enable(m_aliro_reader)));
++    ReturnErrorOnFailure(ESP32Utils::MapError(m5nfc_set_ecp_identifier(groupIdentifier.data(), 8)));
+     ReturnErrorOnFailure(ESP32Config::WriteConfigValueBin(kAliroGroupId, groupIdentifier.data(), groupIdentifier.size()));
+     ReturnErrorOnFailure(ESP32Config::WriteConfigValueBin(kAliroVerificationKey, verificationKey.data(), verificationKey.size()));
+     ReturnErrorOnFailure(ESP32Config::WriteConfigValueBin(kAliroSigningKey, signingKey.data(), signingKey.size()));
+@@ -385,5 +386,6 @@ CHIP_ERROR AliroDoorLockDelegate::ClearAliroReaderConfig()
+         ReturnErrorOnFailure(ESP32Utils::MapError(esp_aliro_reader_delete(&m_aliro_reader)));
+         m_aliro_reader = 0;
+     }
++    ReturnErrorOnFailure(ESP32Utils::MapError(m5nfc_set_ecp_identifier(nullptr, 0)));
+     return CHIP_NO_ERROR;
+ }
+@@ -406,8 +408,14 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+     AliroDoorLockDelegate *doorLockDelegate = (AliroDoorLockDelegate *)delegate;
+     while (true) {
+         m5nfc_update();
+-        if (!m5nfc_activate()) {
++        m5nfc_activation_result_t activation = m5nfc_activate();
++        if (activation == M5NFC_ACTIVATION_NONE) {
+             vTaskDelay(pdMS_TO_TICKS(100));
++            continue;
++        }
++        if (activation == M5NFC_ACTIVATION_NON_ISO_DEP) {
++            ShowStatusLed(StatusLedResult::kOtherTag);
++            m5nfc_deactivate();
+             continue;
+         }
+         int64_t session_start_us = 0;
+@@ -530,3 +538,5 @@ esp_err_t AliroDoorLockDelegate::Init()
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_create(&m_aliro_reader, &reader_config), "Aliro", "Failed to create reader");
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_enable(m_aliro_reader), "Aliro", "Failed to enable reader");
++    ESP_RETURN_ON_ERROR(m5nfc_set_ecp_identifier(reader_config.group_identifier, 8), "Aliro",
++                        "Failed to configure Aliro ECP identifier");
+     return start_nfc_task();

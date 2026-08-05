@@ -1,0 +1,391 @@
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 9a5ed51..0000000 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -9,6 +9,12 @@
++#include <driver/gpio.h>
+ #include <esp_aliro.h>
+ #include <esp_aliro_types.h>
+ #include <esp_aliro_utils.h>
+ #include <esp_check.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/queue.h>
++#include <freertos/semphr.h>
++#include <freertos/task.h>
++#include <led_strip.h>
+ #include <m5nfc.h>
+ #include <nvs.h>
+@@ -38,7 +44,222 @@
+ const ESP32Config::Key kAliroGroupId = { ESP32Config::kConfigNamespace_ChipConfig, "aliro-grp-id"};
+ const ESP32Config::Key kAliroVerificationKey = { ESP32Config::kConfigNamespace_ChipConfig, "aliro-pub-key" };
+ const ESP32Config::Key kAliroSigningKey = { ESP32Config::kConfigNamespace_ChipConfig, "aliro-priv-key" };
++namespace {
++
++constexpr gpio_num_t kStatusLedPowerPin = GPIO_NUM_19;
++constexpr gpio_num_t kStatusLedDataPin = GPIO_NUM_20;
++constexpr uint32_t kStatusLedDurationMs = 1000;
++constexpr uint32_t kStatusLedTaskStackSize = 3072;
++constexpr UBaseType_t kStatusLedTaskPriority = 3;
++constexpr uint8_t kStatusLedBrightness = 255;
++constexpr uint8_t kSelectHeader[] = { 0x00, 0xA4, 0x04, 0x00, 0x09 };
++constexpr uint8_t kAliroExpeditedAid[] = { 0xA0, 0x00, 0x00, 0x09, 0x09, 0xAC, 0xCE, 0x55, 0x01 };
++constexpr uint8_t kFciTemplateTag = 0x6F;
++constexpr uint8_t kDedicatedFileNameTag = 0x84;
++
++enum class StatusLedResult {
++    kSuccess,
++    kFailure,
++    kOtherTag,
++};
++
++led_strip_handle_t g_status_led = nullptr;
++QueueHandle_t g_status_led_queue = nullptr;
++TaskHandle_t g_status_led_task = nullptr;
++SemaphoreHandle_t g_aliro_reader_mutex = nullptr;
++// The NFC task resets and reads these flags. Its synchronous exchange callback is their only writer.
++bool g_aliro_select_rejected = false;
++bool g_aliro_applet_selected = false;
++
++class ScopedSemaphoreLock {
++public:
++    explicit ScopedSemaphoreLock(SemaphoreHandle_t semaphore) : m_semaphore(semaphore)
++    {
++        m_locked = m_semaphore && xSemaphoreTake(m_semaphore, portMAX_DELAY) == pdTRUE;
++    }
++
++    ~ScopedSemaphoreLock()
++    {
++        if (m_locked) {
++            (void)xSemaphoreGive(m_semaphore);
++        }
++    }
++
++    ScopedSemaphoreLock(const ScopedSemaphoreLock &) = delete;
++    ScopedSemaphoreLock &operator=(const ScopedSemaphoreLock &) = delete;
++
++    bool IsLocked() const { return m_locked; }
++
++private:
++    SemaphoreHandle_t m_semaphore;
++    bool m_locked = false;
++};
++
++bool BytesEqual(const uint8_t *left, const uint8_t *right, size_t length)
++{
++    for (size_t index = 0; index < length; ++index) {
++        if (left[index] != right[index]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool IsAliroSelectCommand(const uint8_t *command, size_t command_len)
++{
++    const size_t prefix_len = sizeof(kSelectHeader) + sizeof(kAliroExpeditedAid);
++    return command && command_len >= prefix_len && BytesEqual(command, kSelectHeader, sizeof(kSelectHeader)) &&
++        BytesEqual(command + sizeof(kSelectHeader), kAliroExpeditedAid, sizeof(kAliroExpeditedAid));
++}
++
++bool IsSuccessfulAliroSelectResponse(const uint8_t *response, size_t response_len)
++{
++    constexpr size_t status_len = 2;
++    constexpr size_t fci_header_len = 2;
++    constexpr size_t aid_tlv_header_len = 2;
++    if (!response || response_len < status_len || response[response_len - 2] != 0x90 ||
++        response[response_len - 1] != 0x00) {
++        return false;
++    }
++    const size_t fci_len = response_len - status_len;
++    if (fci_len < fci_header_len + aid_tlv_header_len + sizeof(kAliroExpeditedAid) ||
++        response[0] != kFciTemplateTag || response[1] != fci_len - fci_header_len) {
++        return false;
++    }
++    const size_t aid_offset = fci_header_len + aid_tlv_header_len;
++    if (response[fci_header_len] != kDedicatedFileNameTag ||
++        response[fci_header_len + 1] != sizeof(kAliroExpeditedAid) ||
++        aid_offset + sizeof(kAliroExpeditedAid) > fci_len) {
++        return false;
++    }
++    return BytesEqual(response + aid_offset, kAliroExpeditedAid, sizeof(kAliroExpeditedAid));
++}
++
++esp_err_t SetStatusLedColor(StatusLedResult result)
++{
++    uint8_t red = 0;
++    uint8_t green = 0;
++    uint8_t blue = 0;
++    switch (result) {
++    case StatusLedResult::kSuccess:
++        green = kStatusLedBrightness;
++        break;
++    case StatusLedResult::kFailure:
++        red = kStatusLedBrightness;
++        break;
++    case StatusLedResult::kOtherTag:
++        blue = kStatusLedBrightness;
++        break;
++    }
++    ESP_RETURN_ON_ERROR(led_strip_set_pixel(g_status_led, 0, red, green, blue), "Aliro",
++                        "Failed to set NanoC6 RGB LED");
++    return led_strip_refresh(g_status_led);
++}
++
++void StatusLedTask(void *)
++{
++    esp_err_t err = led_strip_clear(g_status_led);
++    if (err != ESP_OK) {
++        ESP_LOGW("Aliro", "Failed to clear NanoC6 RGB LED: %s", esp_err_to_name(err));
++    }
++
++    StatusLedResult result;
++    while (true) {
++        if (xQueueReceive(g_status_led_queue, &result, portMAX_DELAY) != pdTRUE) {
++            continue;
++        }
++        while (true) {
++            err = SetStatusLedColor(result);
++            if (err != ESP_OK) {
++                ESP_LOGW("Aliro", "Failed to update NanoC6 RGB LED: %s", esp_err_to_name(err));
++            }
++
++            StatusLedResult next_result;
++            if (xQueueReceive(g_status_led_queue, &next_result, pdMS_TO_TICKS(kStatusLedDurationMs)) == pdTRUE) {
++                result = next_result;
++                continue;
++            }
++            err = led_strip_clear(g_status_led);
++            if (err != ESP_OK) {
++                ESP_LOGW("Aliro", "Failed to clear NanoC6 RGB LED: %s", esp_err_to_name(err));
++            }
++            break;
++        }
++    }
++}
++
++void CleanupStatusLed()
++{
++    if (g_status_led_queue) {
++        vQueueDelete(g_status_led_queue);
++        g_status_led_queue = nullptr;
++    }
++    if (g_status_led) {
++        (void)led_strip_del(g_status_led);
++        g_status_led = nullptr;
++    }
++    (void)gpio_set_level(kStatusLedPowerPin, 0);
++}
+-
++
++esp_err_t InitStatusLed()
++{
++    gpio_config_t power_config = {};
++    power_config.pin_bit_mask = 1ULL << kStatusLedPowerPin;
++    power_config.mode = GPIO_MODE_OUTPUT;
++    power_config.pull_up_en = GPIO_PULLUP_DISABLE;
++    power_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
++    power_config.intr_type = GPIO_INTR_DISABLE;
++    esp_err_t err = gpio_config(&power_config);
++    if (err != ESP_OK) {
++        return err;
++    }
++    err = gpio_set_level(kStatusLedPowerPin, 1);
++    if (err != ESP_OK) {
++        return err;
++    }
++
++    led_strip_config_t strip_config = {};
++    strip_config.strip_gpio_num = kStatusLedDataPin;
++    strip_config.max_leds = 1;
++    strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB;
++    strip_config.led_model = LED_MODEL_WS2812;
++    strip_config.flags.invert_out = false;
++    led_strip_rmt_config_t rmt_config = {};
++    rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
++    rmt_config.resolution_hz = 10 * 1000 * 1000;
++    rmt_config.mem_block_symbols = 0;
++    rmt_config.flags.with_dma = false;
++    err = led_strip_new_rmt_device(&strip_config, &rmt_config, &g_status_led);
++    if (err != ESP_OK) {
++        (void)gpio_set_level(kStatusLedPowerPin, 0);
++        return err;
++    }
++
++    g_status_led_queue = xQueueCreate(1, sizeof(StatusLedResult));
++    if (!g_status_led_queue) {
++        CleanupStatusLed();
++        return ESP_ERR_NO_MEM;
++    }
++    if (xTaskCreate(StatusLedTask, "aliro_led", kStatusLedTaskStackSize, nullptr, kStatusLedTaskPriority,
++                    &g_status_led_task) != pdPASS) {
++        CleanupStatusLed();
++        return ESP_ERR_NO_MEM;
++    }
++    ESP_LOGI("Aliro", "NanoC6 RGB status LED initialized on GPIO %d (power GPIO %d)", kStatusLedDataPin,
++             kStatusLedPowerPin);
++    return ESP_OK;
++}
++
++void ShowStatusLed(StatusLedResult result)
++{
++    if (!g_status_led_queue) {
++        return;
++    }
++    (void)xQueueOverwrite(g_status_led_queue, &result);
++}
++
++} // namespace
++
+ CHIP_ERROR AliroDoorLockDelegate::GetAliroReaderVerificationKey(MutableByteSpan  &verificationKey)
+ {
+     if (!m_aliro_reader) {
+@@ -114,6 +335,8 @@
+ CHIP_ERROR AliroDoorLockDelegate::SetAliroReaderConfig(const ByteSpan  &signingKey, const ByteSpan  &verificationKey,
+                                                        const ByteSpan  &groupIdentifier, const chip::Optional<ByteSpan>  &groupResolvingKey)
+ {
++    ScopedSemaphoreLock reader_lock(g_aliro_reader_mutex);
++    VerifyOrReturnError(reader_lock.IsLocked(), CHIP_ERROR_INCORRECT_STATE);
+     if (m_aliro_reader) {
+         return CHIP_ERROR_INCORRECT_STATE;
+     }
+@@ -152,6 +375,8 @@
+-
++
+ CHIP_ERROR AliroDoorLockDelegate::ClearAliroReaderConfig()
+ {
++    ScopedSemaphoreLock reader_lock(g_aliro_reader_mutex);
++    VerifyOrReturnError(reader_lock.IsLocked(), CHIP_ERROR_INCORRECT_STATE);
+     if (m_aliro_reader) {
+         ReturnErrorOnFailure(ESP32Config::ClearConfigValue(kAliroGroupId));
+         ReturnErrorOnFailure(ESP32Config::ClearConfigValue(kAliroVerificationKey));
+@@ -166,7 +391,14 @@
+ esp_err_t AliroDoorLockDelegate::NfcMessageExchange(const uint8_t *command, size_t command_len, uint8_t *response,
+                                                     size_t *response_len)
+ {
+-    return m5nfc_message_exchange(command, command_len, response, response_len);
++    const bool is_aliro_select = IsAliroSelectCommand(command, command_len);
++    esp_err_t err = m5nfc_message_exchange(command, command_len, response, response_len);
++    if (is_aliro_select) {
++        g_aliro_applet_selected =
++            err == ESP_OK && response_len && IsSuccessfulAliroSelectResponse(response, *response_len);
++        g_aliro_select_rejected = err == ESP_OK && !g_aliro_applet_selected;
++    }
++    return err;
+ }
+-
++
+ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+@@ -178,34 +410,46 @@
+             vTaskDelay(pdMS_TO_TICKS(100));
+             continue;
+         }
+-        if (!doorLockDelegate->m_aliro_reader) {
+-            m5nfc_deactivate();
+-            continue;
++        int64_t session_start_us = 0;
++        esp_err_t err = ESP_FAIL;
++        {
++            ScopedSemaphoreLock reader_lock(g_aliro_reader_mutex);
++            if (!reader_lock.IsLocked() || !doorLockDelegate->m_aliro_reader) {
++                m5nfc_deactivate();
++                continue;
++            }
++            g_aliro_select_rejected = false;
++            g_aliro_applet_selected = false;
++            session_start_us = esp_timer_get_time();
++            esp_aliro_session_config_t session_cfg = {
++                .aid_type = ESP_ALIRO_NFC_AID_EXPEDITED_PHASE,
++                .auth_policy = ESP_ALIRO_AUTH_POLICY_USER_DEVICE_SETTING_SECURE_ACTION,
++            };
++            esp_aliro_session_handle_t session = 0;
++            err = esp_aliro_session_create(doorLockDelegate->m_aliro_reader, &session, &session_cfg);
++            if (err == ESP_OK) {
++                err = esp_aliro_session_run_expedited(session, NfcMessageExchange);
++            }
++            if (err == ESP_OK) {
++                err = esp_aliro_session_run_exchange(session, NfcMessageExchange, ESP_ALIRO_CRYPTO_ENGINE_EXPEDITED);
++            }
++            if (session) {
++                (void)esp_aliro_session_delete(&session);
++            }
+         }
+-        const int64_t session_start_us = esp_timer_get_time();
+-        esp_aliro_session_config_t session_cfg = {
+-            .aid_type = ESP_ALIRO_NFC_AID_EXPEDITED_PHASE,
+-            .auth_policy = ESP_ALIRO_AUTH_POLICY_USER_DEVICE_SETTING_SECURE_ACTION,
+-        };
+-        esp_aliro_session_handle_t session = 0;
+-        esp_err_t err = esp_aliro_session_create(doorLockDelegate->m_aliro_reader, &session, &session_cfg);
+-        if (err == ESP_OK) {
+-            err = esp_aliro_session_run_expedited(session, NfcMessageExchange);
+-        }
+-        if (err == ESP_OK) {
+-            err = esp_aliro_session_run_exchange(session, NfcMessageExchange, ESP_ALIRO_CRYPTO_ENGINE_EXPEDITED);
+-        }
+-        if (session) {
+-            (void)esp_aliro_session_delete(&session);
+-        }
+         const int64_t session_time_ms = (esp_timer_get_time() - session_start_us) / 1000;
+         if (err == ESP_OK) {
++            ShowStatusLed(StatusLedResult::kSuccess);
+             ESP_LOGI("Aliro", "Aliro NFC transaction completed successfully in %lld ms", (long long)session_time_ms);
+             // UnLock the door lock
+             (void) DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+                 BoltLockMgr().Unlock(door_lock_endpoint_id, OperationSourceEnum::kAliro);
+             });
++        } else if (g_aliro_select_rejected) {
++            ShowStatusLed(StatusLedResult::kOtherTag);
++            ESP_LOGI("Aliro", "NFC tag rejected the Aliro application select; showing non-Aliro feedback");
+         } else {
++            ShowStatusLed(StatusLedResult::kFailure);
+             ESP_LOGW("Aliro", "Aliro NFC transaction failed after %lld ms: %s", (long long)session_time_ms,
+                      esp_err_to_name(err));
+         }
+@@ -219,9 +463,27 @@
+         return ESP_ERR_INVALID_STATE;
+     }
+-
++
++    auto start_nfc_task = [this]() -> esp_err_t {
++        g_aliro_reader_mutex = xSemaphoreCreateMutex();
++        if (!g_aliro_reader_mutex) {
++            return ESP_ERR_NO_MEM;
++        }
++        if (xTaskCreate(NfcDetectTask, "nfc_detect", NFC_DETECT_TASK_STACK_SIZE, this, NFC_DETECT_TASK_PRIORITY,
++                        &m_nfc_detect_task_handle) != pdPASS) {
++            vSemaphoreDelete(g_aliro_reader_mutex);
++            g_aliro_reader_mutex = nullptr;
++            return ESP_ERR_NO_MEM;
++        }
++        return ESP_OK;
++    };
++
++    esp_err_t led_err = InitStatusLed();
++    if (led_err != ESP_OK) {
++        ESP_LOGW("Aliro", "NanoC6 RGB status LED is unavailable: %s", esp_err_to_name(led_err));
++    }
++
+     ESP_RETURN_ON_ERROR(m5nfc_init(), "Aliro", "NFC reader initialization failed");
+-
+-    xTaskCreate(NfcDetectTask, "nfc_detect", NFC_DETECT_TASK_STACK_SIZE, this, NFC_DETECT_TASK_PRIORITY, &m_nfc_detect_task_handle);
++
+     esp_aliro_config_t aliro_config = {
+         .storage_partition_name = nullptr,
+         .fast_transaction_storage_size = 10,
+@@ -237,7 +499,7 @@
+     CHIP_ERROR err = ESP32Config::ReadConfigValueBin(kAliroGroupId, reader_config.group_identifier, group_id_len, group_id_len);
+     if (err == CHIP_DEVICE_ERROR_CONFIG_NOT_FOUND) {
+         ESP_LOGI("Aliro", "Aliro Reader is not configured");
+-        return ESP_OK;
++        return start_nfc_task();
+     }
+     ESP_RETURN_ON_FALSE(err == CHIP_NO_ERROR, ESP_FAIL, "Aliro", "Failed to get reader group id");
+     ESP_RETURN_ON_FALSE(group_id_len == sizeof(reader_config.group_identifier), ESP_ERR_INVALID_SIZE, "Aliro",
+@@ -267,5 +529,5 @@
+-
++
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_create(&m_aliro_reader, &reader_config), "Aliro", "Failed to create reader");
+     ESP_RETURN_ON_ERROR(esp_aliro_reader_enable(m_aliro_reader), "Aliro", "Failed to enable reader");
+-    return ESP_OK;
++    return start_nfc_task();
+ }

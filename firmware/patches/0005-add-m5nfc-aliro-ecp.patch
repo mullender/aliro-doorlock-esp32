@@ -1,0 +1,131 @@
+diff --git a/examples/door_lock/managed_components/m5nfc/m5nfc.h b/examples/door_lock/managed_components/m5nfc/m5nfc.h
+index f2ae32d..0000000 100644
+--- a/examples/door_lock/managed_components/m5nfc/m5nfc.h
++++ b/examples/door_lock/managed_components/m5nfc/m5nfc.h
+@@ -19,6 +19,13 @@ extern "C" {
++typedef enum {
++    M5NFC_ACTIVATION_NONE = 0,
++    M5NFC_ACTIVATION_NON_ISO_DEP,
++    M5NFC_ACTIVATION_ISO_DEP,
++} m5nfc_activation_result_t;
++
+ esp_err_t m5nfc_init(void);
++esp_err_t m5nfc_set_ecp_identifier(const uint8_t *identifier, size_t identifier_len);
+ void m5nfc_update(void);
+-bool m5nfc_activate(void);
++m5nfc_activation_result_t m5nfc_activate(void);
+ void m5nfc_deactivate(void);
+-
++
+ esp_err_t m5nfc_message_exchange(const uint8_t *command, size_t command_len, uint8_t *response, size_t *response_len);
+diff --git a/examples/door_lock/managed_components/m5nfc/m5nfc.cpp b/examples/door_lock/managed_components/m5nfc/m5nfc.cpp
+index a8f2340..0000000 100644
+--- a/examples/door_lock/managed_components/m5nfc/m5nfc.cpp
++++ b/examples/door_lock/managed_components/m5nfc/m5nfc.cpp
+@@ -9,6 +9,8 @@
+ #include <driver/i2c_master.h>
+ #include <esp_check.h>
+ #include <esp_err.h>
+ #include <esp_log.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
+-
++
+ #include <M5UnitUnified.hpp>
+@@ -19,3 +22,4 @@
+ #include <algorithm>
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -34,3 +37,32 @@ i2c_master_bus_handle_t g_i2c_bus{};
+ i2c_master_bus_handle_t g_i2c_bus{};
+-
++
++constexpr size_t kEcpIdentifierSize = 8;
++constexpr uint32_t kEcpResponseTimeoutMs = 12;
++constexpr uint32_t kEcpSettleTimeMs = 5;
++std::array<uint8_t, 16> g_aliro_ecp_frame = {
++    0x6A, 0x02, 0xCB, 0x02, 0x06, 0x20, 0x42, 0x20,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++bool g_aliro_ecp_enabled = false;
++portMUX_TYPE g_aliro_ecp_lock = portMUX_INITIALIZER_UNLOCKED;
++
++bool send_aliro_ecp()
++{
++    std::array<uint8_t, 16> frame = {};
++    bool enabled = false;
++    portENTER_CRITICAL(&g_aliro_ecp_lock);
++    frame = g_aliro_ecp_frame;
++    enabled = g_aliro_ecp_enabled;
++    portEXIT_CRITICAL(&g_aliro_ecp_lock);
++    if (!enabled) {
++        return false;
++    }
++
++    uint8_t response = 0;
++    uint16_t response_len = sizeof(response);
++    // NFCLayerA appends CRC-A. Aliro ECP supplies the 16 bytes before that CRC.
++    (void)g_nfca.transceive(&response, response_len, frame.data(), frame.size(), kEcpResponseTimeoutMs);
++    return true;
++}
++
+ void log_i2c_scan()
+@@ -80,3 +112,22 @@ esp_err_t exchange_single_apdu(const uint8_t *command, size_t command_len, uint
+ } // namespace
+-
++
++esp_err_t m5nfc_set_ecp_identifier(const uint8_t *identifier, size_t identifier_len)
++{
++    const bool clear = identifier == nullptr && identifier_len == 0;
++    if (!clear && (!identifier || identifier_len != kEcpIdentifierSize)) {
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    portENTER_CRITICAL(&g_aliro_ecp_lock);
++    if (clear) {
++        std::fill(g_aliro_ecp_frame.begin() + 8, g_aliro_ecp_frame.end(), 0);
++        g_aliro_ecp_enabled = false;
++    } else {
++        std::copy_n(identifier, kEcpIdentifierSize, g_aliro_ecp_frame.begin() + 8);
++        g_aliro_ecp_enabled = true;
++    }
++    portEXIT_CRITICAL(&g_aliro_ecp_lock);
++    return ESP_OK;
++}
++
+ esp_err_t m5nfc_init(void)
+@@ -125,13 +176,22 @@ void m5nfc_update(void)
+-bool m5nfc_activate(void)
++m5nfc_activation_result_t m5nfc_activate(void)
+ {
+     auto nfca_config = g_nfca.config();
+     nfca_config.fsdi = kIsoDepFsdi;
+     nfca_config.cid = 0;
+     g_nfca.config(nfca_config);
+-
++
++    if (send_aliro_ecp()) {
++        vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(kEcpSettleTimeMs)));
++    }
++
+     m5::nfc::a::PICC picc = {};
+-    if (!g_nfca.request(picc.atqa) || !g_nfca.select(picc) || !picc.isISO14443_4()) {
+-        return false;
++    if (!g_nfca.request(picc.atqa) || !g_nfca.select(picc)) {
++        return M5NFC_ACTIVATION_NONE;
++    }
++    if (!picc.isISO14443_4()) {
++        ESP_LOGI(kTag, "NFC-A tag selected without ISO-DEP ATQA=%04x SAK=%02x UID=%s", picc.atqa, picc.sak,
++                 picc.uidAsString().c_str());
++        return M5NFC_ACTIVATION_NON_ISO_DEP;
+     }
+-
++
+     apply_aliro_iso_dep_policy();
+@@ -142,4 +202,4 @@ bool m5nfc_activate(void)
+     ESP_LOGI(kTag, "NFC-A ISO-DEP activated ATQA=%04x SAK=%02x UID=%s", picc.atqa, picc.sak,
+              picc.uidAsString().c_str());
+-    return true;
++    return M5NFC_ACTIVATION_ISO_DEP;
+ }
