@@ -3,6 +3,64 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
+## 2026-08-05 — GitHub push (completed)
+
+Both local repos are now on GitHub. The submodule reference resolves.
+
+### Findings
+
+- **Fork was pre-populated.** `mullender/esp-web-tools` was created as
+  a GitHub fork of `esphome/esp-web-tools`, not an empty repo. Its
+  `main` already tracked upstream HEAD (SHA `4b1ef27`, 544 commits
+  past the `10.4.0` tag). Local `main` was reset to `origin/main` to
+  avoid overwriting upstream progress.
+- **Feature branch rebased onto real tag `10.4.0`.** Original branch
+  parented the callback commit on a fresh orphan "vendor 10.4.0"
+  commit whose tree matched the tag but not its history. Verified
+  tree equality (`b796448c...` both sides), then rebased with
+  `git rebase --onto refs/tags/10.4.0 91547f2 homekey-post-install-hook`.
+  Callback commit's SHA changed (`3953774` → `cc9ac93`) but its diff
+  and message are identical. Branch now sits directly on `10.4.0`,
+  clean history for an upstream PR.
+- **Tag `10.4.0` was NOT pushed to the fork.** GitHub forks don't
+  inherit tags by default; pushing one selectively creates
+  asymmetry. The branch references the tag SHA and `git fetch
+  upstream --tags` reveals it — that is enough.
+- **Aliro remote was empty.** All eight branches pushed cleanly
+  (`main` + 7 phase branches).
+- **Submodule attached and pinned** to `cc9ac93` via
+  `scripts/setup_vendor.sh`. Bootstrap ran `npm ci` + `script/build`
+  successfully; `dist/` is gitignored inside the submodule so only
+  the SHA reference is committed.
+
+### Decisions
+
+- **Fork's `main` mirrors upstream `main`, unchanged.** The feature
+  work lives entirely on `homekey-post-install-hook`.
+- **Tag not pushed to fork.** Cleaner absence than partial parity.
+  If we later want the fork's UI to compare branch↔tag, push at
+  that point.
+
+### Remaining blockers
+
+- **The push to `main` may have triggered the deploy workflow.**
+  `gh` CLI is sandboxed here, so I could not check run status.
+  Look at
+  <https://github.com/mullender/aliro-doorlock-esp32/actions>
+  in the morning. Expected result: the workflow runs, publishes an
+  empty-manifest site (no `aliro-c6-*` releases yet), and the Pages
+  URL renders `installer/index.html` with the ESP Web Tools "no
+  builds" state. If the workflow fails, `installer/vendor/UPSTREAM.md`
+  and `MORNING_REVIEW.md`'s "Known landmines" section list the
+  likely causes.
+- **GitHub Pages must be enabled in the repo settings.** The
+  workflow deploys to Pages but Pages itself is not on by default
+  for a new repo. Settings → Pages → Source: "GitHub Actions".
+- **Upstream esp-web-tools issue/PR text** still needs drafting.
+  A clean branch on `10.4.0` makes this straightforward now.
+
+---
+
 ## 2026-08-05 — Autonomous grind session (completed)
 
 Full session: repo scaffolding through Phase 5 design. See
