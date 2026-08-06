@@ -66,9 +66,10 @@ The page offers two separate ESP Web Tools buttons:
 The pinned ESP Web Tools fork enforces each declared erase policy. An
 app-only manifest cannot erase the device. Before a preserving update writes
 data, the fork reads and hashes the connected device's partition table. The
-hash must match the approved layout. After each install, the fork reads back
-all written ranges and compares them with the source data before it reports
-success.
+hash must match the approved layout. During each install, esptool-js checks
+each write block and its acknowledgement. The installer then resets the
+device. For a factory install, the captured boot log and QR code confirm the
+complete install flow.
 
 ## What the installer does NOT do
 

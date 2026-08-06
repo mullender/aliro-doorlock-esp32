@@ -12,16 +12,16 @@ plus focused install-lifecycle and safety patches.
 - **Upstream base:** tag `10.4.0`
 - **Patch summary:** awaited `onPostFlash`, typed terminal results,
   declarative erase policy, preflight flash checks, app-only erase
-  rejection, connection locking, and readback verification.
+  rejection, and connection locking.
 
 ## Submodule state
 
 The fork repository and the `homekey-post-install-hook` branch exist. This
 repository pins the submodule to commit
-`0a59644e8cd4ed98249902773b81cbc377354b17`. The deploy workflow builds that
+`21e9cdcbd7a43244a016b56550ae2b2b1015986a`. The deploy workflow builds that
 commit and serves it from the same origin as the installer.
 
-The terminal order is fixed: verified flash, reopened serial port,
+The terminal order is fixed: completed flash, reopened serial port,
 awaited `onPostFlash`, then one `install-result`. A rejected callback
 produces `post_flash_failed` and does not produce success.
 
