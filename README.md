@@ -95,7 +95,7 @@ live in this repository so each release uses one reviewed contract.
 ## Current status
 
 The current prerelease is
-[`aliro-c6-v0.0.4-devkit`](https://github.com/mullender/aliro-doorlock-esp32/releases/tag/aliro-c6-v0.0.4-devkit).
+[`aliro-c6-v0.0.5-devkit`](https://github.com/mullender/aliro-doorlock-esp32/releases/tag/aliro-c6-v0.0.5-devkit).
 The browser installer and Apple Home Key flow work on the M5Stack NanoC6 and
 the ST25R3916 unit. This is still a devkit release, not a certified retail
 lock.

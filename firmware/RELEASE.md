@@ -12,7 +12,7 @@ the pinned sources below.
 | esp-matter commit | `85c76a1788c5b70b4b0811734af8616dda15e7ac` |
 | connectedhomeip commit | `efefc94fee39d8d1fbbc3c27b9d7fc9025095887` |
 | ESP-IDF version | `5.5.4` (tag `v5.5.4`) |
-| Release tag | `aliro-c6-v0.0.4-devkit` |
+| Release tag | `aliro-c6-v0.0.5-devkit` |
 | Merged image size | 4 MiB (4 194 304 bytes), padded with `0xFF` |
 
 The build never modifies the shared `~/Development/esp-matter` checkout.
@@ -124,7 +124,7 @@ The firmware emits one status line when serial input starts, after `GET`,
 and after a successful `SET`:
 
 ```
-ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000
+ALIRO/1 STATUS firmware=0.0.5-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000
 ```
 
 The firmware returns `ALIRO/1 ERROR code=<code>` for a rejected command.
@@ -208,11 +208,11 @@ scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
 ## Artifacts
 
 ```
-artifacts/aliro-c6-v0.0.4-devkit/
-  aliro-c6-v0.0.4-devkit-factory.bin          4 MiB, padded 0xFF
-  aliro-c6-v0.0.4-devkit-factory.bin.sha256   sha256 sidecar
-  aliro-c6-v0.0.4-devkit-app.bin              app-only update image
-  aliro-c6-v0.0.4-devkit-app.bin.sha256       sha256 sidecar
+artifacts/aliro-c6-v0.0.5-devkit/
+  aliro-c6-v0.0.5-devkit-factory.bin          4 MiB, padded 0xFF
+  aliro-c6-v0.0.5-devkit-factory.bin.sha256   sha256 sidecar
+  aliro-c6-v0.0.5-devkit-app.bin              app-only update image
+  aliro-c6-v0.0.5-devkit-app.bin.sha256       sha256 sidecar
   manifest.txt                                per-part audit
 ```
 

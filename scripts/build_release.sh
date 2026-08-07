@@ -20,7 +20,7 @@
 #                    unless --source-check is set.
 #
 # Optional environment:
-#   TAG              release tag; default aliro-c6-v0.0.4-devkit
+#   TAG              release tag; default aliro-c6-v0.0.5-devkit
 #   ESP_MATTER_REVISION
 #                    required when ESP_MATTER_SRC is a git archive
 #
@@ -49,7 +49,7 @@ if [[ "$SOURCE_CHECK_ONLY" == "0" ]]; then
   : "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
 fi
 
-TAG="${TAG:-aliro-c6-v0.0.4-devkit}"
+TAG="${TAG:-aliro-c6-v0.0.5-devkit}"
 PINNED_ESP_MATTER="85c76a1788c5b70b4b0811734af8616dda15e7ac"
 PINNED_CONNECTEDHOMEIP="efefc94fee39d8d1fbbc3c27b9d7fc9025095887"
 
@@ -344,8 +344,8 @@ validate_aliro_settings() {
   )
 
   for required_text in \
-      'set(PROJECT_VER "0.0.4-devkit")' \
-      'set(PROJECT_VER_NUMBER 4)' \
+      'set(PROJECT_VER "0.0.5-devkit")' \
+      'set(PROJECT_VER_NUMBER 5)' \
       'set(PROJECT_VER "${CLI_PROJECT_VER}")' \
       'set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")'; do
     if ! grep -Fq "$required_text" "$cmake_source"; then

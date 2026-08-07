@@ -8,7 +8,7 @@
 # Arguments:
 #   BUILD_DIR   absolute path to an idf.py build/ directory that
 #               contains flasher_args.json (produced by `idf.py build`)
-#   TAG         release tag; default aliro-c6-v0.0.4-devkit
+#   TAG         release tag; default aliro-c6-v0.0.5-devkit
 #
 # Outputs (relative to the repo root):
 #   artifacts/<TAG>/<TAG>-factory.bin
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 BUILD_DIR="${1:?usage: prepare_release.sh <BUILD_DIR> [<TAG>]}"
-TAG="${2:-aliro-c6-v0.0.4-devkit}"
+TAG="${2:-aliro-c6-v0.0.5-devkit}"
 
 if [[ ! "$TAG" =~ ^aliro-c6-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
   echo "error: invalid Aliro release tag: $TAG" >&2
