@@ -46,6 +46,9 @@
 <h2>Live serial monitor</h2>
 <div id="serial-monitor"></div>
 
+<h2>Device settings</h2>
+<div id="device-settings"></div>
+
 <h2>QR preview (positive vectors)</h2>
 <div id="qr-previews"></div>
 
@@ -57,6 +60,7 @@ import { BASE38_VECTORS, INVALID_BASE38_VECTORS, VECTORS, NEGATIVE_VECTORS } fro
 import { runBootParserTests } from "./boot-parser-tests.js";
 import { runSetupFlowTests } from "./setup-flow-tests.js";
 import { runSerialMonitorTests } from "./serial-monitor-tests.js";
+import { runDeviceSettingsTests } from "./device-settings-tests.js";
 
 let pass = 0, fail = 0;
 
@@ -160,6 +164,11 @@ const smEl = document.getElementById("serial-monitor");
 const sm = await runSerialMonitorTests(smEl);
 pass += sm.pass;
 fail += sm.fail;
+
+const dsEl = document.getElementById("device-settings");
+const ds = await runDeviceSettingsTests(dsEl);
+pass += ds.pass;
+fail += ds.fail;
 
 // Final summary
 const s = document.getElementById("summary");

@@ -14,6 +14,8 @@ installer/
     matter-payload.js validators for MT: strings and manual pairing codes
     qr-render.js      SVG QR renderer wrapping vendor/qrcode.js
     boot-parser.js    (Phase 4b) parses CHIP:SVR: lines from serial
+    device-protocol.js parses Aliro status and builds GET and SET requests
+    device-settings.js controls the settings and firmware version UI
     install-controller.js fixes erase policy and handles install results
     serial-monitor.js owns the live Web Serial monitor and port cleanup
     setup-flow.js     controls pairing, update, error, and cancel UI state
@@ -23,6 +25,7 @@ installer/
     UPSTREAM.md       (Phase 4) tracks the upstream esp-web-tools PR
   tests/
     index.html        open in a browser to run every check
+    device-settings-tests.js tests the settings UI in a browser
     serial-monitor-tests.js tests monitor lifecycle and live code parsing
     test-vectors.js   known Matter setup payloads (positive + negative)
 ```
@@ -115,6 +118,20 @@ hash must match the approved layout. During each install, esptool-js checks
 each write block and its acknowledgement. The installer then resets the
 device. For a factory install, the captured boot log and QR code confirm the
 complete install flow.
+
+## Device settings protocol
+
+The live monitor reads lines that start with `ALIRO/1`. It sends
+`ALIRO/1 GET` after a connection and sends one partial `ALIRO/1 SET` line when
+the user applies changed settings. The settings panel stays hidden until the
+monitor receives a complete, valid `ALIRO/1 STATUS` line for protocol 1.
+Auto-lock accepts 0 through 3,600 seconds. Zero disables auto-lock. Each LED
+duration accepts 0 through 10,000 milliseconds.
+
+The page gets the latest release version from `manifest-update.json`. It
+normalizes the release tag before it compares the version with the installed
+devkit version. The normal update action stays available when the version is
+older or cannot be compared.
 
 ## What the installer does NOT do
 

@@ -19,6 +19,13 @@ import {
 import { createSetupFlow } from "../js/setup-flow.js";
 import { configureInstallButtons } from "../js/install-controller.js";
 import { createSerialMonitor } from "../js/serial-monitor.js";
+import { createDeviceSettings } from "../js/device-settings.js";
+import {
+  buildGetRequest,
+  buildSetRequest,
+  compareDevkitVersions,
+  parseAliroProtocolLine,
+} from "../js/device-protocol.js";
 import { LOG_FIXTURES } from "./boot-log-fixtures.js";
 import {
   BASE38_VECTORS,
@@ -65,6 +72,7 @@ function fakeElement() {
 class FakeControl extends EventTarget {
   constructor() {
     super();
+    this.attributes = new Map();
     this.disabled = false;
     this.textContent = "";
     this.scrollTop = 0;
@@ -74,6 +82,9 @@ class FakeControl extends EventTarget {
   click() {
     return this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
   }
+
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
 }
 
 class FakeInstallButton extends EventTarget {
@@ -100,6 +111,7 @@ function fakeMonitorElements() {
     copy: new FakeControl(),
     clear: new FakeControl(),
     disconnect: new FakeControl(),
+    connected: Object.assign(new FakeControl(), { hidden: true }),
     status: new FakeControl(),
     log: new FakeControl(),
   };
@@ -107,11 +119,17 @@ function fakeMonitorElements() {
 
 function fakeSerialPort({ openError } = {}) {
   let streamController;
+  const writes = [];
   const readable = new ReadableStream({
     start(controller) { streamController = controller; },
   });
+  const writable = new WritableStream({
+    write(value) { writes.push(new TextDecoder().decode(value)); },
+  });
   return {
     readable,
+    writable,
+    writes,
     streamController,
     openCalls: [],
     closeCalls: 0,
@@ -124,6 +142,53 @@ function fakeSerialPort({ openError } = {}) {
     async setSignals(value) { this.signalCalls.push(value); },
   };
 }
+
+function fakeSettingsElements() {
+  const control = () => new FakeControl();
+  return {
+    panel: Object.assign(control(), { hidden: true }),
+    form: control(),
+    autoLock: Object.assign(control(), { checked: false }),
+    delay: Object.assign(control(), { value: "" }),
+    successRgb: Object.assign(control(), { value: "" }),
+    successMs: Object.assign(control(), { value: "" }),
+    failureRgb: Object.assign(control(), { value: "" }),
+    failureMs: Object.assign(control(), { value: "" }),
+    otherRgb: Object.assign(control(), { value: "" }),
+    otherMs: Object.assign(control(), { value: "" }),
+    apply: control(),
+    result: control(),
+    installed: control(),
+    latest: control(),
+    current: Object.assign(control(), { hidden: true }),
+    updateReason: control(),
+    updateAction: Object.assign(control(), { hidden: false }),
+  };
+}
+
+class FakeProtocolMonitor extends EventTarget {
+  constructor() {
+    super();
+    this.writes = [];
+  }
+
+  async writeLine(line) {
+    this.writes.push(line);
+    return true;
+  }
+}
+
+const VALID_STATUS = {
+  firmware: "0.0.4-devkit",
+  protocol: 1,
+  auto_relock_seconds: 10,
+  success_rgb: "#00ff00",
+  success_ms: 750,
+  failure_rgb: "#ff0000",
+  failure_ms: 900,
+  other_rgb: "#0000ff",
+  other_ms: 500,
+};
 
 class FakeSerial extends EventTarget {
   constructor(results, authorizedPorts = []) {
@@ -764,6 +829,171 @@ test("preserved update hides pairing data and emits no secrets", () => {
   });
 });
 
+test("Aliro protocol parses complete status and error lines", () => {
+  const line = "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500";
+  assert.deepEqual(parseAliroProtocolLine(line), { type: "status", status: VALID_STATUS });
+  assert.deepEqual(parseAliroProtocolLine("ALIRO/1 ERROR code=invalid_value"), {
+    type: "error",
+    code: "invalid_value",
+  });
+  assert.equal(parseAliroProtocolLine(`log: ${line}`), null);
+  assert.equal(parseAliroProtocolLine(line.replace(" protocol=1", "")).type, "invalid-status");
+  assert.equal(parseAliroProtocolLine(line.replace(" protocol=1", " protocol=2")).type,
+    "invalid-status");
+  assert.equal(parseAliroProtocolLine(
+    line.replace("auto_relock_seconds=10", "auto_relock_seconds=3601"),
+  ).type, "invalid-status");
+  assert.equal(parseAliroProtocolLine(
+    line.replace("success_ms=750", "success_ms=10001"),
+  ).type, "invalid-status");
+  assert.equal(parseAliroProtocolLine(`${line} future_field=1  `).type, "status");
+});
+
+test("Aliro protocol builds safe GET and partial SET requests", () => {
+  assert.equal(buildGetRequest(), "ALIRO/1 GET");
+  assert.equal(buildSetRequest({
+    auto_relock_seconds: 0,
+    success_rgb: "#12AbEF",
+    success_ms: 250,
+  }), "ALIRO/1 SET auto_relock_seconds=0 success_rgb=12abef success_ms=250");
+  assert.throws(() => buildSetRequest({ success_rgb: "red" }), /six-digit RGB/);
+  assert.throws(() => buildSetRequest({ success_ms: -1 }), /whole number|from 0/);
+  assert.throws(() => buildSetRequest({ auto_relock_seconds: 3601 }), /from 0 to 3600/);
+  assert.throws(() => buildSetRequest({ success_ms: 10001 }), /from 0 to 10000/);
+  assert.throws(() => buildSetRequest({ unknown: 1 }), /not supported/);
+});
+
+test("devkit versions compare after release-tag normalization", () => {
+  assert.equal(compareDevkitVersions("0.0.4-devkit", "aliro-c6-v0.0.4-devkit"), 0);
+  assert.equal(compareDevkitVersions("0.0.3-devkit", "v0.0.4-devkit"), -1);
+  assert.equal(compareDevkitVersions("0.1.0-devkit", "0.0.4-devkit"), 1);
+  assert.equal(compareDevkitVersions("unreleased", "0.0.4-devkit"), null);
+});
+
+test("device settings stay hidden until a valid status and confirm one SET line", async () => {
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({
+    elements,
+    serialMonitor,
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ version: "aliro-c6-v0.0.4-devkit" }),
+    }),
+  });
+  await nextTask();
+
+  assert.equal(elements.panel.hidden, true);
+  serialMonitor.dispatchEvent(new CustomEvent("serial-connected"));
+  await nextTask();
+  assert.deepEqual(serialMonitor.writes, ["ALIRO/1 GET"]);
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", { detail: VALID_STATUS }));
+  assert.equal(elements.panel.hidden, false);
+  assert.equal(elements.installed.textContent, "0.0.4-devkit");
+  assert.equal(elements.latest.textContent, "0.0.4-devkit");
+  assert.equal(elements.current.hidden, false);
+  assert.equal(elements.updateAction.hidden, true);
+
+  elements.autoLock.checked = false;
+  elements.autoLock.dispatchEvent(new Event("change"));
+  elements.form.dispatchEvent(new Event("submit", { cancelable: true }));
+  await nextTask();
+  assert.equal(serialMonitor.writes[1], "ALIRO/1 SET auto_relock_seconds=0");
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: { ...VALID_STATUS, auto_relock_seconds: 0 },
+  }));
+  assert.equal(elements.result.textContent, "Settings saved.");
+  assert.match(elements.result.className, /success/);
+  settings.destroy();
+});
+
+test("older or unknown latest firmware keeps the update action visible", async () => {
+  const cases = [
+    {
+      installed: "0.0.3-devkit",
+      manifest: { version: "0.0.4-devkit" },
+      reason: /available/,
+    },
+    {
+      installed: "0.0.4-devkit",
+      manifest: { version: "unreleased" },
+      reason: /could not be compared/,
+    },
+  ];
+  for (const testCase of cases) {
+    const elements = fakeSettingsElements();
+    const serialMonitor = new FakeProtocolMonitor();
+    const settings = createDeviceSettings({
+      elements,
+      serialMonitor,
+      fetchImpl: async () => ({ json: async () => testCase.manifest }),
+    });
+    await nextTask();
+    serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+      detail: { ...VALID_STATUS, firmware: testCase.installed },
+    }));
+    assert.equal(elements.updateAction.hidden, false, testCase.installed);
+    assert.match(elements.updateReason.textContent, testCase.reason, testCase.installed);
+    settings.destroy();
+  }
+});
+
+test("newer installed firmware hides the downgrade action", async () => {
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({
+    elements,
+    serialMonitor,
+    fetchImpl: async () => ({ json: async () => ({ version: "0.0.4-devkit" }) }),
+  });
+  await nextTask();
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: { ...VALID_STATUS, firmware: "0.0.5-devkit" },
+  }));
+  assert.equal(elements.updateAction.hidden, true);
+  assert.match(elements.current.textContent, /newer than the latest release/);
+  settings.destroy();
+});
+
+test("settings writes wait for confirmation and recover from errors", async () => {
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({
+    elements,
+    serialMonitor,
+    confirmationTimeoutMs: 5,
+    fetchImpl: async () => ({ json: async () => ({ version: "0.0.4-devkit" }) }),
+  });
+  await nextTask();
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", { detail: VALID_STATUS }));
+  elements.successMs.value = "751";
+  elements.form.dispatchEvent(new Event("submit", { cancelable: true }));
+  await nextTask();
+
+  assert.equal(elements.apply.disabled, true);
+  assert.equal(elements.form.getAttribute("aria-busy"), "true");
+  assert.match(elements.result.textContent, /Waiting for the device/);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(elements.apply.disabled, false);
+  assert.equal(elements.form.getAttribute("aria-busy"), "false");
+  assert.match(elements.result.textContent, /did not confirm/);
+
+  elements.form.dispatchEvent(new Event("submit", { cancelable: true }));
+  await nextTask();
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-error", {
+    detail: { type: "error", code: "storage" },
+  }));
+  assert.equal(elements.apply.disabled, false);
+  assert.equal(elements.result.textContent, "Settings were not saved: storage.");
+
+  serialMonitor.dispatchEvent(new CustomEvent("serial-disconnected"));
+  assert.equal(elements.panel.hidden, true);
+  assert.equal(elements.apply.disabled, true);
+  settings.destroy();
+});
+
 test("live serial monitor shows logs and sends valid codes through setup flow", async () => {
   const serialPort = fakeSerialPort();
   const serial = new FakeSerial([serialPort]);
@@ -808,6 +1038,44 @@ test("live serial monitor shows logs and sends valid codes through setup flow", 
   assert.equal(monitor.isActive(), false);
   assert.equal(monitorElements.status.textContent,
     "Serial monitor disconnected for install. Click the install button again to continue.");
+});
+
+test("serial monitor emits protocol events and serializes safe line writes", async () => {
+  const serialPort = fakeSerialPort();
+  const elements = fakeMonitorElements();
+  const monitor = createSerialMonitor({
+    elements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([serialPort]),
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+  let status;
+  monitor.addEventListener("aliro-status", (event) => { status = event.detail; });
+
+  assert.equal(await monitor.connect(), true);
+  assert.equal(elements.connected.hidden, false);
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00ff00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500\n",
+  ));
+  await nextTask();
+  await Promise.all([
+    monitor.writeLine("ALIRO/1 GET"),
+    monitor.writeLine("ALIRO/1 SET success_ms=800"),
+  ]);
+
+  assert.deepEqual(status, VALID_STATUS);
+  assert.deepEqual(serialPort.writes, [
+    "ALIRO/1 GET\n",
+    "ALIRO/1 SET success_ms=800\n",
+  ]);
+  assert.equal(serialPort.readable.locked, true);
+  assert.equal(serialPort.writable.locked, false);
+  await assert.rejects(monitor.writeLine("ALIRO/1 GET\nALIRO/1 SET success_ms=0"), /unsafe/);
+  await monitor.destroy();
+  assert.equal(elements.connected.hidden, true);
 });
 
 test("serial monitor starts its read loop before the automatic reset", async () => {
@@ -1221,6 +1489,12 @@ test("installer page includes all live monitor controls", () => {
     "serial-disconnect",
     "serial-status",
     "serial-log",
+    "serial-connected",
+    "device-settings",
+    "settings-apply",
+    "installed-version",
+    "latest-version",
+    "firmware-current",
   ]) {
     assert.match(html, new RegExp(`id=["']${id}["']`));
   }
@@ -1230,7 +1504,14 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /<h2>Already commissioned<\/h2>/);
   assert.match(html, /<summary>Technical details<\/summary>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
-  assert.match(html, /use Factory install\s+if the device was deleted from that controller/);
+  assert.match(html, /If no controllers remain,\s+follow the <a href="#decommission-heading">full reset guidance<\/a>/);
+  assert.match(html, /Do not erase the lock while other services use it/);
+  assert.match(html, /Remove it from every Matter service and let each removal finish/);
+  assert.match(html, /Factory install cannot notify a Matter service/);
+  assert.match(html, /id="auto-lock-seconds"[^>]*max="3600"/);
+  for (const id of ["success-ms", "failure-ms", "other-ms"]) {
+    assert.match(html, new RegExp(`id="${id}"[^>]*max="10000"`));
+  }
 });
 
 test("installer page keeps connection at the top and logs at the bottom", () => {
@@ -1238,6 +1519,7 @@ test("installer page keeps connection at the top and logs at the bottom", () => 
   const connection = html.indexOf('id="connection-heading"');
   const connectButton = html.indexOf('id="serial-connect"');
   const serialStatus = html.indexOf('id="serial-status"');
+  const settings = html.indexOf('id="device-settings"');
   const prerequisites = html.indexOf("<h2>Before you start</h2>");
   const update = html.indexOf('id="update-heading"');
   const factory = html.indexOf('id="factory-heading"');
@@ -1249,7 +1531,8 @@ test("installer page keeps connection at the top and logs at the bottom", () => 
   assert.ok(connection >= 0);
   assert.ok(connection < connectButton);
   assert.ok(connectButton < serialStatus);
-  assert.ok(serialStatus < prerequisites);
+  assert.ok(serialStatus < settings);
+  assert.ok(settings < prerequisites);
   assert.ok(prerequisites < update);
   assert.ok(update < factory);
   assert.ok(factory < logs);
