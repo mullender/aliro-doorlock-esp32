@@ -408,6 +408,10 @@ validate_aliro_tap_toggle() {
       return 2
     fi
   done
+  if grep -Fq 'DoorLock::DoorLockServer::' "$delegate_source"; then
+    echo "error: DoorLockServer must use its global namespace" >&2
+    return 2
+  fi
   if [[ "$(grep -Fc 'BoltLockMgr().Unlock(' "$delegate_source")" -ne 2 ||
         "$(grep -Fc 'BoltLockMgr().Lock(' "$delegate_source")" -ne 1 ]]; then
     echo "error: Aliro taps must have one lock path and two unlock paths" >&2
