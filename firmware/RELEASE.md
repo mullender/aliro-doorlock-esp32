@@ -232,12 +232,19 @@ table SHA-256 is
 The update writes both OTA slots because the browser manifest does not
 know which slot `otadata` selects.
 
-### Current source state: `aliro-c6-v0.0.4-devkit`
+### Verified build: `aliro-c6-v0.0.4-devkit`
 
-Version 0.0.4 adds the serial settings protocol. The parser test and the
-source patch checks are the fast acceptance checks for this change. A
-full firmware build and NanoC6 hardware test are still required before
-release.
+The clean build and packaging passed on 2026-08-07. A NanoC6 hardware
+test is still required.
+
+- `door_lock.bin`: 1,607,584 bytes
+- Smallest app partition: `0x1e0000` bytes, with 358,496 bytes free
+  (18%)
+- App-only SHA-256:
+  `15cc3dd5e3244287d062b2ba2771d06b25257cfa4e3007a6062ac8a2a6d20dee`
+- Factory image: 4,194,304 bytes
+- Factory SHA-256:
+  `93df8a20e7e8de93a01e6c0e409304f67f2654d862fcff12494387f36a992995`
 
 ### Previous verified build: `aliro-c6-v0.0.3-devkit`
 
