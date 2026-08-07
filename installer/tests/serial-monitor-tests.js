@@ -1,0 +1,129 @@
+import { createSerialMonitor } from "../js/serial-monitor.js";
+
+function report(container, label, ok) {
+  const element = document.createElement("section");
+  element.className = ok ? "ok" : "fail";
+  element.innerHTML = `<strong>${ok ? "PASS" : "FAIL"}</strong> — ${label}`;
+  container.appendChild(element);
+  return ok;
+}
+
+function monitorElements() {
+  const root = document.createElement("div");
+  root.innerHTML = `
+    <button id="connect"></button><button id="reset"></button>
+    <button id="clear"></button><button id="disconnect"></button>
+    <div id="status"></div><pre id="log"></pre>`;
+  return {
+    connect: root.querySelector("#connect"),
+    reset: root.querySelector("#reset"),
+    clear: root.querySelector("#clear"),
+    disconnect: root.querySelector("#disconnect"),
+    status: root.querySelector("#status"),
+    log: root.querySelector("#log"),
+  };
+}
+
+function serialPort() {
+  let streamController;
+  const readable = new ReadableStream({
+    start(controller) { streamController = controller; },
+  });
+  return {
+    readable,
+    streamController,
+    closeCount: 0,
+    signals: [],
+    async open() {},
+    async close() { this.closeCount += 1; },
+    async setSignals(value) { this.signals.push(value); },
+  };
+}
+
+class FakeSerial extends EventTarget {
+  constructor(ports) {
+    super();
+    this.ports = [...ports];
+  }
+
+  async requestPort() {
+    const result = this.ports.shift();
+    if (result instanceof Error) throw result;
+    return result;
+  }
+}
+
+const nextTask = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+export async function runSerialMonitorTests(container) {
+  let pass = 0;
+  let fail = 0;
+  const count = (ok) => ok ? pass++ : fail++;
+
+  {
+    const port = serialPort();
+    const elements = monitorElements();
+    let found;
+    const monitor = createSerialMonitor({
+      elements,
+      setupFlow: {
+        showPairing(mt, manualCode, options) {
+          found = { mt, manualCode, options };
+          return true;
+        },
+      },
+      serial: new FakeSerial([port]),
+      secureContext: true,
+      resetPulseMs: 0,
+    });
+    const connected = await monitor.connect();
+    port.streamController.enqueue(new TextEncoder().encode(
+      "I (1110) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+      "I (1110) chip[SVR]: Manual pairing code: [34970112332]\n",
+    ));
+    await nextTask();
+    const released = await monitor.releaseForInstall();
+    const ok = connected && released && found?.manualCode === "34970112332" &&
+      found?.options.statusMessage === "Live serial setup codes are ready." &&
+      /SetupQRCode/.test(elements.log.textContent) && !port.readable.locked &&
+      port.closeCount === 1;
+    count(report(container, "live logs find setup codes and release before install", ok));
+  }
+
+  {
+    const first = serialPort();
+    const second = serialPort();
+    const monitor = createSerialMonitor({
+      elements: monitorElements(),
+      setupFlow: { showPairing: () => true },
+      serial: new FakeSerial([first, second]),
+      secureContext: true,
+    });
+    await monitor.connect();
+    await monitor.disconnect();
+    const reconnected = await monitor.connect();
+    await monitor.destroy();
+    const ok = reconnected && first.closeCount === 1 && second.closeCount === 1 &&
+      !first.readable.locked && !second.readable.locked;
+    count(report(container, "disconnect and reconnect clean up each reader", ok));
+  }
+
+  {
+    const denied = new Error("Permission denied");
+    denied.name = "NotAllowedError";
+    const elements = monitorElements();
+    const monitor = createSerialMonitor({
+      elements,
+      setupFlow: { showPairing: () => true },
+      serial: new FakeSerial([denied]),
+      secureContext: true,
+    });
+    const connected = await monitor.connect();
+    count(report(container, "permission errors leave the monitor ready to retry",
+      !connected && /permission/i.test(elements.status.textContent) &&
+      !elements.connect.disabled));
+    await monitor.destroy();
+  }
+
+  return { pass, fail };
+}

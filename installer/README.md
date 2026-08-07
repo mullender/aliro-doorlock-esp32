@@ -15,6 +15,7 @@ installer/
     qr-render.js      SVG QR renderer wrapping vendor/qrcode.js
     boot-parser.js    (Phase 4b) parses CHIP:SVR: lines from serial
     install-controller.js fixes erase policy and handles install results
+    serial-monitor.js owns the live Web Serial monitor and port cleanup
     setup-flow.js     controls pairing, update, error, and cancel UI state
   vendor/
     qrcode.js         MIT-licensed QR generator (kazuhikoarase 2.0.4)
@@ -22,6 +23,7 @@ installer/
     UPSTREAM.md       (Phase 4) tracks the upstream esp-web-tools PR
   tests/
     index.html        open in a browser to run every check
+    serial-monitor-tests.js tests monitor lifecycle and live code parsing
     test-vectors.js   known Matter setup payloads (positive + negative)
 ```
 
@@ -38,6 +40,45 @@ python3 -m http.server 8765
 ```
 
 Then open `http://localhost:8765/installer/tests/`.
+
+Run the non-browser integration tests with:
+
+```sh
+node --test installer/tests/node-tests.mjs
+```
+
+## Live serial monitor
+
+The installer has a local Web Serial monitor. If the site has permission for
+exactly one serial port, the monitor connects to it automatically. Otherwise,
+select **Connect device**, then select the device USB port. The monitor opens
+the port at 115200 baud and shows the live log in the page. The page does not
+upload or persist the log. The page never opens the port picker automatically.
+
+The monitor has these controls:
+
+- **Connect device** asks for serial-port permission and starts one reader.
+- **Reset device** sends the ESP reset signal and keeps the reader active.
+- **Clear** removes the displayed log. It does not change the device.
+- **Disconnect** stops the reader, releases its lock, and closes the port.
+
+The monitor reads `SetupQRCode` and manual pairing-code lines. When both codes
+are valid and match, it uses the normal setup flow to show the QR panel. The
+same validation applies to post-install codes and live monitor codes.
+
+Only one reader can own a serial stream. If another reader owns the stream,
+close it and then select **Disconnect**. You can then connect again. A device
+disconnect also stops the monitor and enables a new connection.
+
+The flasher and monitor cannot own the port at the same time. If the monitor
+is active, the first click on an install button stops the reader and closes
+the port. The page then asks you to click the install button again. The second
+click keeps the browser permission gesture that Web Serial requires and opens
+the installer port picker.
+
+Web Serial needs Chrome or Edge on desktop and a secure page. Use HTTPS or
+localhost. If access is denied, allow serial access for the site and select
+**Connect device** again.
 
 ## Vendored dependencies
 
@@ -80,10 +121,12 @@ complete install flow.
 - Persistence of setup data. Values live in memory for the duration of
   the page session; nothing is sent to any remote service.
 
-## Current serial recovery limit
+## Serial recovery limit
 
 Release `aliro-c6-v0.0.3-devkit` does not enable the CHIP shell. The
-installer can reset the device once to capture a new boot log, but it cannot
+post-install parser can reset the device once to capture a new boot log, but
+it cannot
 use `matter onboardingcodes` to reprint missed codes. The parser supports
 that command for a later firmware release. The current installer does not
-send the command.
+send the command. The live monitor can also reset the device and read the new
+boot log.

@@ -18,6 +18,7 @@ import {
 } from "../js/boot-parser.js";
 import { createSetupFlow } from "../js/setup-flow.js";
 import { configureInstallButtons } from "../js/install-controller.js";
+import { createSerialMonitor } from "../js/serial-monitor.js";
 import { LOG_FIXTURES } from "./boot-log-fixtures.js";
 import {
   BASE38_VECTORS,
@@ -61,6 +62,20 @@ function fakeElement() {
   };
 }
 
+class FakeControl extends EventTarget {
+  constructor() {
+    super();
+    this.disabled = false;
+    this.textContent = "";
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+  }
+
+  click() {
+    return this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
+  }
+}
+
 class FakeInstallButton extends EventTarget {
   constructor(eraseFirst) {
     super();
@@ -68,7 +83,8 @@ class FakeInstallButton extends EventTarget {
       ["erase-first", String(eraseFirst)],
       ["inert", ""],
     ]);
-    this.activator = { disabled: true };
+    this.activator = new FakeControl();
+    this.activator.disabled = true;
     this.inert = true;
   }
 
@@ -76,6 +92,76 @@ class FakeInstallButton extends EventTarget {
   removeAttribute(name) { this.attributes.delete(name); }
   querySelector(selector) { return selector === '[slot="activate"]' ? this.activator : null; }
 }
+
+function fakeMonitorElements() {
+  return {
+    connect: new FakeControl(),
+    reset: new FakeControl(),
+    clear: new FakeControl(),
+    disconnect: new FakeControl(),
+    status: new FakeControl(),
+    log: new FakeControl(),
+  };
+}
+
+function fakeSerialPort({ openError } = {}) {
+  let streamController;
+  const readable = new ReadableStream({
+    start(controller) { streamController = controller; },
+  });
+  return {
+    readable,
+    streamController,
+    openCalls: [],
+    closeCalls: 0,
+    signalCalls: [],
+    async open(options) {
+      this.openCalls.push(options);
+      if (openError) throw openError;
+    },
+    async close() { this.closeCalls += 1; },
+    async setSignals(value) { this.signalCalls.push(value); },
+  };
+}
+
+class FakeSerial extends EventTarget {
+  constructor(results, authorizedPorts = []) {
+    super();
+    this.results = [...results];
+    this.authorizedPorts = [...authorizedPorts];
+    this.requestCount = 0;
+    this.getPortsCount = 0;
+    this.disconnectListeners = new Set();
+  }
+
+  addEventListener(type, listener, options) {
+    if (type === "disconnect") this.disconnectListeners.add(listener);
+    else super.addEventListener(type, listener, options);
+  }
+
+  removeEventListener(type, listener, options) {
+    if (type === "disconnect") this.disconnectListeners.delete(listener);
+    else super.removeEventListener(type, listener, options);
+  }
+
+  emitDisconnect(event) {
+    for (const listener of this.disconnectListeners) listener.call(this, event);
+  }
+
+  async getPorts() {
+    this.getPortsCount += 1;
+    return [...this.authorizedPorts];
+  }
+
+  async requestPort() {
+    this.requestCount += 1;
+    const result = this.results.shift();
+    if (result instanceof Error) throw result;
+    return result;
+  }
+}
+
+const nextTask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function matchingPairForPIN(passcode) {
   const discriminator = 3840;
@@ -510,4 +596,315 @@ test("preserved update hides pairing data and emits no secrets", () => {
     chipFamily: "ESP32-C6",
     version: "test",
   });
+});
+
+test("live serial monitor shows logs and sends valid codes through setup flow", async () => {
+  const serialPort = fakeSerialPort();
+  const serial = new FakeSerial([serialPort]);
+  const monitorElements = fakeMonitorElements();
+  const { flow, elements } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial,
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+
+  assert.equal(await monitor.connect(), true);
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "I (1110) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I (1110) chip[SVR]: Manual pairing code: [34970112332]\n",
+  ));
+  await nextTask();
+
+  assert.match(monitorElements.log.textContent, /SetupQRCode/);
+  assert.equal(flow.getCurrent().mt, "MT:Y.K9042C00KA0648G00");
+  assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
+  assert.equal(elements.status.textContent, "Live serial setup codes are ready.");
+  assert.equal(monitorElements.status.textContent,
+    "Connected. Matter setup codes found.");
+
+  monitor.clear();
+  assert.equal(monitorElements.log.textContent, "");
+  const resetResult = monitor.reset();
+  const releaseResult = monitor.releaseForInstall();
+  assert.equal(await resetResult, true);
+  assert.equal(await releaseResult, true);
+  assert.deepEqual(serialPort.signalCalls, [
+    { dataTerminalReady: false, requestToSend: true },
+    { dataTerminalReady: false, requestToSend: false },
+  ]);
+  assert.equal(serialPort.closeCalls, 1);
+  assert.equal(serialPort.readable.locked, false);
+  assert.equal(monitor.isActive(), false);
+  assert.equal(monitorElements.status.textContent,
+    "Serial monitor disconnected for install. Click the install button again to continue.");
+});
+
+test("clear allows the same setup-code pair to be shown again", async () => {
+  const serialPort = fakeSerialPort();
+  const serial = new FakeSerial([serialPort]);
+  let showCount = 0;
+  const monitor = createSerialMonitor({
+    elements: fakeMonitorElements(),
+    setupFlow: {
+      showPairing() {
+        showCount += 1;
+        return true;
+      },
+    },
+    serial,
+    secureContext: true,
+  });
+  await monitor.connect();
+
+  const pair = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  serialPort.streamController.enqueue(pair);
+  await nextTask();
+  monitor.clear();
+  serialPort.streamController.enqueue(pair);
+  await nextTask();
+
+  assert.equal(showCount, 2);
+  await monitor.destroy();
+});
+
+test("physical disconnect events accept event.port and event.target", async () => {
+  for (const eventShape of ["port", "target"]) {
+    const serialPort = fakeSerialPort();
+    const serial = new FakeSerial([serialPort]);
+    const elements = fakeMonitorElements();
+    const monitor = createSerialMonitor({
+      elements,
+      setupFlow: { showPairing: () => true },
+      serial,
+      secureContext: true,
+    });
+    await monitor.connect();
+
+    serial.emitDisconnect({ [eventShape]: serialPort });
+    await nextTask();
+
+    assert.equal(serialPort.readable.locked, false, eventShape);
+    assert.equal(serialPort.closeCalls, 1, eventShape);
+    assert.equal(monitor.isActive(), false, eventShape);
+    assert.equal(elements.status.textContent, "Device disconnected. You can reconnect.");
+    await monitor.destroy();
+  }
+});
+
+test("one authorized port connects automatically without a picker", async () => {
+  const serialPort = fakeSerialPort();
+  const serial = new FakeSerial([], [serialPort]);
+  const monitor = createSerialMonitor({
+    elements: fakeMonitorElements(),
+    setupFlow: { showPairing: () => true },
+    serial,
+    secureContext: true,
+  });
+
+  await nextTask();
+
+  assert.equal(serial.getPortsCount, 1);
+  assert.equal(serial.requestCount, 0);
+  assert.deepEqual(serialPort.openCalls, [{ baudRate: 115200, bufferSize: 8192 }]);
+  assert.equal(monitor.getState().connected, true);
+  await monitor.destroy();
+});
+
+test("install release waits for authorized auto-connect and closes its port", async () => {
+  const serialPort = fakeSerialPort();
+  let resolveAuthorizedPorts;
+  const serial = new FakeSerial([], []);
+  serial.getPorts = async () => new Promise((resolve) => {
+    resolveAuthorizedPorts = resolve;
+  });
+  const monitor = createSerialMonitor({
+    elements: fakeMonitorElements(),
+    setupFlow: { showPairing: () => true },
+    serial,
+    secureContext: true,
+  });
+
+  assert.equal(monitor.isActive(), true);
+  const released = monitor.releaseForInstall();
+  resolveAuthorizedPorts([serialPort]);
+
+  assert.equal(await released, true);
+  assert.equal(serialPort.openCalls.length, 1);
+  assert.equal(serialPort.closeCalls, 1);
+  assert.equal(serialPort.readable.locked, false);
+  assert.equal(monitor.isActive(), false);
+});
+
+test("zero or multiple authorized ports never open a picker automatically", async () => {
+  for (const authorizedCount of [0, 2]) {
+    const selectedPort = fakeSerialPort();
+    const authorizedPorts = Array.from({ length: authorizedCount }, () => fakeSerialPort());
+    const elements = fakeMonitorElements();
+    const serial = new FakeSerial([selectedPort], authorizedPorts);
+    const monitor = createSerialMonitor({
+      elements,
+      setupFlow: { showPairing: () => true },
+      serial,
+      secureContext: true,
+    });
+
+    await nextTask();
+    assert.equal(serial.requestCount, 0, authorizedCount);
+    assert.equal(selectedPort.openCalls.length, 0, authorizedCount);
+    for (const authorizedPort of authorizedPorts) {
+      assert.equal(authorizedPort.openCalls.length, 0, authorizedCount);
+    }
+
+    elements.connect.click();
+    await nextTask();
+    assert.equal(serial.requestCount, 1, authorizedCount);
+    assert.equal(selectedPort.openCalls.length, 1, authorizedCount);
+    await monitor.destroy();
+  }
+});
+
+test("serial monitor reconnects and cleans up the active reader", async () => {
+  const firstPort = fakeSerialPort();
+  const secondPort = fakeSerialPort();
+  const serial = new FakeSerial([firstPort, secondPort]);
+  const elements = fakeMonitorElements();
+  const monitor = createSerialMonitor({
+    elements,
+    setupFlow: { showPairing: () => true },
+    serial,
+    secureContext: true,
+  });
+
+  assert.equal(await monitor.connect(), true);
+  assert.equal(await monitor.disconnect(), true);
+  assert.equal(firstPort.readable.locked, false);
+  assert.equal(await monitor.connect(), true);
+  assert.equal(serial.requestCount, 2);
+  assert.equal(monitor.getState().connected, true);
+
+  await monitor.destroy();
+  assert.equal(secondPort.readable.locked, false);
+  assert.equal(secondPort.closeCalls, 1);
+  assert.equal(elements.connect.disabled, true);
+});
+
+test("live serial parsing recovers from a bad pair and split input", async () => {
+  const serialPort = fakeSerialPort();
+  const monitorElements = fakeMonitorElements();
+  const { flow } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial: new FakeSerial([serialPort]),
+    secureContext: true,
+  });
+  await monitor.connect();
+
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [00054912336]\n" +
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00K",
+  ));
+  await nextTask();
+  assert.equal(flow.getCurrent().mt, null);
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "A0648G00]\nI chip[SVR]: Manual pairing code: [34970112332]\n",
+  ));
+  await nextTask();
+
+  assert.equal(flow.getCurrent().mt, "MT:Y.K9042C00KA0648G00");
+  assert.equal(flow.getCurrent().manualCode, "34970112332");
+  await monitor.destroy();
+});
+
+test("serial monitor reports permission and concurrent-reader failures", async () => {
+  const denied = new Error("permission denied");
+  denied.name = "NotAllowedError";
+  const deniedElements = fakeMonitorElements();
+  const deniedMonitor = createSerialMonitor({
+    elements: deniedElements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([denied]),
+    secureContext: true,
+  });
+  assert.equal(await deniedMonitor.connect(), false);
+  assert.match(deniedElements.status.textContent, /permission/i);
+
+  const busyPort = fakeSerialPort();
+  const otherReader = busyPort.readable.getReader();
+  const busyElements = fakeMonitorElements();
+  const busyMonitor = createSerialMonitor({
+    elements: busyElements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([busyPort]),
+    secureContext: true,
+  });
+  assert.equal(await busyMonitor.connect(), false);
+  assert.match(busyElements.status.textContent, /active reader/i);
+  assert.equal(busyPort.closeCalls, 0);
+  otherReader.releaseLock();
+  assert.equal(await busyMonitor.disconnect(), true);
+  assert.equal(busyPort.closeCalls, 1);
+
+  await deniedMonitor.destroy();
+  await busyMonitor.destroy();
+});
+
+test("an install click releases the monitor before the installer can continue", async () => {
+  const factoryButton = new FakeInstallButton(true);
+  const updateButton = new FakeInstallButton(false);
+  let active = true;
+  let releaseCount = 0;
+  const serialMonitor = {
+    isActive: () => active,
+    async releaseForInstall() {
+      releaseCount += 1;
+      await nextTask();
+      active = false;
+      return true;
+    },
+  };
+  const setupFlow = {
+    handleInstallResult() {},
+    begin: () => new AbortController().signal,
+    finish() {},
+    finishPreservedUpdate() {},
+  };
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow,
+    serialMonitor,
+  });
+
+  assert.equal(factoryButton.activator.click(), false);
+  assert.equal(factoryButton.activator.disabled, true);
+  await nextTask();
+  await nextTask();
+  assert.equal(releaseCount, 1);
+  assert.equal(factoryButton.activator.disabled, false);
+  assert.equal(factoryButton.activator.click(), true);
+  assert.equal(releaseCount, 1);
+});
+
+test("installer page includes all live monitor controls", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  for (const id of [
+    "serial-connect",
+    "serial-reset",
+    "serial-clear",
+    "serial-disconnect",
+    "serial-status",
+    "serial-log",
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+  }
+  assert.match(html, /id="serial-connect">Connect device<\/button>/);
+  assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
 });
