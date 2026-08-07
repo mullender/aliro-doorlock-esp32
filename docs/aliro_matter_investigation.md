@@ -1,7 +1,7 @@
 # Aliro + Matter on ESP32-C6: Investigation
 
-**Status:** working document — open investigation, facts added as verified.
-**Last updated:** 2026-07-31
+**Status:** working document. Verified facts and open questions are kept separate.
+**Last updated:** 2026-08-07
 
 ## Original Question
 
@@ -217,6 +217,98 @@ Also noted: Z-Wave "is not yet supported by Aliro."
 ```
 The first Aliro-referencing PR in connectedhomeip was #31144 (January, per kormax).
 
+Facts 26, 27, and 29 through 31 come from a physical NanoC6 test on
+2026-08-07. Fact 28 comes from the firmware source and release manifests.
+Fact 30 also matches the release source. The raw serial log is not in this
+repository.
+
+### 26. The NanoC6 release works on the target hardware
+
+The `aliro-c6-v0.0.4-devkit` release was installed on an M5Stack NanoC6 with an
+M5Stack Unit NFC. The device booted, exposed the Matter setup data over native
+USB, and joined Apple Home as a Matter-over-Thread door lock. This result also
+confirms that Apple Home accepts the release's Matter test attestation for this
+development use.
+
+### 27. Apple Home provisions a working Home Key
+
+Apple Home configured the Aliro reader and added a Home Key to Apple Wallet. A
+tap selected the Aliro credential without opening Wallet and completed the NFC
+transaction. The lock reported the operation through the Matter Door Lock
+cluster.
+
+### 28. The source and keep-setup manifests preserve NVS by design
+
+The firmware source stores settings in NVS. The keep-setup manifests write
+only the OTA app partitions. The installer first validates the partition
+layout and rejects erase requests for this path. These controls leave NVS
+untouched by design. A factory install erases NVS by design.
+
+A keep-setup update on the paired NanoC6 has not been verified on hardware.
+Retention of the two Matter fabrics, Thread credentials, Aliro data, settings,
+and the existing Home Key after that update is not yet verified.
+
+### 29. The browser factory installer works on the NanoC6
+
+The public browser installer completed a factory install and displayed the
+pairing data read from the NanoC6 USB log. The installer settings panel read
+and wrote the `ALIRO/1` device settings. A paired keep-setup update was not
+part of this hardware test.
+
+### 30. Release 0.0.4 implements tap-to-unlock, not tap-to-toggle
+
+After each valid Aliro transaction, the release calls the Matter unlock action.
+A locked device becomes unlocked. If auto-relock is enabled, the Matter timer
+locks it again after the configured delay. A tap while the device is already
+unlocked does not lock it. Tap-to-lock or tap-to-toggle is not part of the
+verified release.
+
+### 31. The boot log lists two Apple fabric records
+
+The NanoC6 boot log listed two stored Matter fabrics after Apple Home
+commissioning and Home Key setup. Vendor ID `0x1349` identifies Apple Home.
+Vendor ID `0x1384` identifies Apple Keychain.
+
+This observation does not prove that two independent Aliro credential issuers
+can use the lock at the same time. It also does not verify Apple and Google
+multi-admin operation.
+
+### 32. An AtomS3 Lite Wi-Fi variant has compatible dependencies
+
+These facts support an assessment. They do not verify an S3 release:
+
+- The AtomS3 Lite uses an ESP32-S3 with 8 MB flash. It has no IEEE 802.15.4
+  radio, so Matter must use Wi-Fi instead of Thread.
+- The AtomS3 Lite and Unit NFC hardware already work together with SDA on GPIO
+  2 and SCL on GPIO 1. Its browser install, Wi-Fi provisioning, Home Key taps,
+  and RGB LED on GPIO 35 were verified in the separate HomeKey-ESP32 work.
+- The pinned `esp-matter` door-lock project has an ESP32-S3 target. Its `m5nfc`
+  dependency includes ESP32-S3, and `esp_aliro_lib` publishes an ESP32-S3
+  archive.
+- No Aliro Matter-over-Wi-Fi image for the AtomS3 Lite has been built or tested
+  in this project.
+
+---
+
+## Proposed Behavior (not verified)
+
+For a later release, a valid Aliro tap would use this rule:
+
+| Initial state | Auto-lock setting | Proposed result |
+|---|---|---|
+| Locked | Off (`0` seconds) | Unlock the lock. |
+| Locked | On (more than `0` seconds) | Unlock the lock. The timer locks it after the set delay. |
+| Unlocked | Off (`0` seconds) | Lock the lock. |
+| Unlocked | On (more than `0` seconds) | Do not change the state or restart the timer. An active timer can lock it later. |
+
+Release 0.0.4 does not implement this rule. The proposed change needs a new
+firmware build and a hardware test.
+
+The hardware test must test all four rows. It must also test repeated valid
+taps when auto-lock is off, the timer delay when auto-lock is on, an invalid
+Aliro tap, and a non-Aliro tag. Invalid taps and non-Aliro tags must not change
+the lock state.
+
 ---
 
 ## Architecture (relevant paths)
@@ -261,7 +353,7 @@ St25r3916Reader.cpp (793 lines, ours)   M5Unit-NFC (27k lines, MIT, vendor)
 All source, auditable                   Aliro crypto is a binary blob
 No ISO-DEP chaining                     ISO-DEP chaining both directions
 WiFi credentials via captive portal     BLE commissioning
-Verified working on hardware            Not yet built or run here
+Verified working on hardware            NanoC6 + Unit NFC verified on hardware
 ```
 
 ---
@@ -280,6 +372,7 @@ Verified working on hardware            Not yet built or run here
 | 2026-07-17/20 | m5nfc component shared and gated (ed818ee1, 5189bd8d) | Refinement |
 | ~2026-07-30 | `esp_aliro_lib` v1.1.0 published | esp-matter still pins ^1.0.1 |
 | 2026-07-31 | This investigation | — |
+| 2026-08-07 | NanoC6 release verified with Apple Home | Matter-over-Thread, Home Key, two Apple fabric records, factory installer, and unlock tap confirmed |
 
 ---
 
@@ -297,6 +390,9 @@ Verified working on hardware            Not yet built or run here
 | 8 | "Home Assistant can already manage Aliro credentials" | Facts 23, 24 — HA's lock credential actions are PIN-oriented; Aliro is Epic 2 "evaluate", unstarted. |
 | 9 | "Adopting M5Unit-NFC in HomeKey-ESP32 is a drop-in swap" | Fact 11 — hard dependency on M5UnitUnified pinned to a moving `main` branch; 37/63 files framework-coupled. |
 | 10 | "The reader must be certified to be useful at home" | Not excluded — see UNVERIFIED items in the analysis document. Certification affects *distribution*, and possibly some Apple features (fact: iOS strings warn an uncertified accessory may lose Approach to Unlock / Tap to Unlock). |
+| 11 | "The NanoC6 example has not been built or run" | Facts 26, 27, and 29 record the verified release, Matter commissioning, Home Key, and factory installer. |
+| 12 | "A valid tap toggles the lock state" | Fact 30 and the release source show an unlock action only. Auto-relock can lock later, but a tap does not lock. |
+| 13 | "The two observed fabrics prove Apple and Google multi-admin" | Fact 31 records two Apple fabrics. No Google fabric was identified. |
 
 ---
 
@@ -304,10 +400,14 @@ Verified working on hardware            Not yet built or run here
 
 Tracked in the analysis document with verification steps:
 
-- Can a self-built device with test attestation certificates be commissioned into Apple Home?
-  Into Google Home? Into HA?
+- Can this test-attestation device add a non-Apple fabric from Google Home or
+  Home Assistant without replacing the Apple Aliro configuration?
 - Which ecosystems can provision an Aliro credential to a **Google Wallet** or **Samsung Wallet**
   user for a *residential* lock (as opposed to Kastle-style commercial deployments)?
 - Does Google Home support Aliro credential management today?
-- Does the `sdkconfig.esp32c6.aliro` build actually fit and run on the NanoC6?
 - Does Espressif's reader implement Android Polling Loop Annotations (fact 18), or only ECP?
+- Does a keep-setup update on the paired NanoC6 retain both fabrics, Thread and
+  Aliro data, settings, and the existing Home Key?
+- Can a separate AtomS3 Lite image build, fit, commission over Matter-over-Wi-Fi,
+  and preserve its state through an app-only update?
+- Does the proposed auto-lock-off tap rule pass a new build and a hardware test?

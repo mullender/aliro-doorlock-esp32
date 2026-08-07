@@ -1,7 +1,7 @@
 # Aliro + Matter on ESP32-C6: Analysis
 
-**Status:** working document — hypotheses and recommendations, revised as facts land.
-**Date:** 2026-07-31
+**Status:** working document. Verified facts and proposals are marked separately.
+**Date:** 2026-08-07
 **Companion:** `aliro_matter_investigation.md` (evidence ledger — facts referenced as F<n>)
 
 > Structural note: the deep-investigation template names this file `*_root_cause_analysis.md`.
@@ -15,11 +15,15 @@
 
 **All four questions resolve favourably, but on different timescales.**
 
-The reference implementation targets the exact hardware already on the desk, down to the I2C
-pins (F1, F2). Matter-over-Thread and BLE commissioning are configured and working in
-Espressif's own config (F3, F4). Android is *not* the blocker it first appeared — Aliro is
-shipping in Google Wallet and Samsung Wallet today (F15). Home Assistant can already be the sole
-controller (F22) but cannot yet manage Aliro credentials (F23, F24).
+The NanoC6 path now works on hardware. The browser installer installs the
+firmware. Apple Home commissions the device over Matter-over-Thread and adds a
+Home Key to Apple Wallet. A valid tap unlocks the Matter lock (F26-F30). The
+device reports two Apple fabric records (F31). The firmware source and
+keep-setup manifests preserve NVS by design (F28). A keep-setup update on the
+paired device, including retention of its Home Key, is not yet verified on
+hardware. Aliro credentials are available in Google Wallet and Samsung Wallet
+(F15). Home Assistant can be the only Matter controller (F22), but it cannot
+manage Aliro credentials (F23, F24).
 
 The real constraints are different from the ones expected:
 
@@ -32,8 +36,15 @@ The real constraints are different from the ones expected:
 3. **Maturity.** The reference code is six weeks old (F25) and `M5Unit-NFC` is v0.1.0 with a
    dependency pinned to a moving branch (F11).
 
-**On the M5 library question: no — don't swap the HomeKey driver.** Recommendation and reasoning
-in its own section below.
+Release 0.0.4 is tap-to-unlock. It does not toggle the lock state (F30). The
+requested rule for a later release is conditional. A valid tap always unlocks
+a locked lock. If the lock is unlocked and auto-lock is off, a valid tap locks
+it. If the lock is unlocked and auto-lock is on, a valid tap does not change
+the state or restart the auto-lock timer. An active timer can lock it later.
+This rule is a proposal. It needs a new build and a hardware test.
+
+**On the M5 library question: do not swap the HomeKey driver.** The reasons are
+in a separate section below.
 
 ---
 
@@ -52,7 +63,8 @@ This directly answers the reminder item raised earlier ("provisioning WiFi crede
 HomeKit, scan barcode transfer"). Matter's answer is better than the HomeKit equivalent: it is
 standardised, works from both iOS and Android, and on Thread removes the credential entirely.
 
-**Verification status: VERIFIED by configuration, UNVERIFIED end-to-end** (not yet built/run).
+**Verification status: VERIFIED end to end with Apple Home on the NanoC6**
+(F26, F27). Google Home and Home Assistant commissioning are not verified.
 
 ---
 
@@ -84,10 +96,16 @@ schedules and offline sharing (F19). These are not actually in conflict:
 - **Across ecosystems** — an iPhone owner sharing a key to a friend's Google Wallet — is what
   CSA defers to a future phase.
 
-**Hypothesis (UNVERIFIED):** the practical path to an Android friend's key is not cross-ecosystem
-sharing but **Matter multi-admin**. Commission the lock into both Apple Home and Google Home;
-each fabric provisions its own Aliro endpoint keys into its own wallet. The delegate supports 8
-issuer keys and 8 endpoint keys (F12), which is consistent with multiple administrators.
+**Hypothesis (UNVERIFIED):** Matter multi-admin can supply an Android user with
+a key. Commission the lock into Apple Home and Google Home. Each service can
+then provision an Aliro endpoint key to its wallet. The delegate supports 8
+issuer keys and 8 endpoint keys (F12), which is consistent with multiple
+administrators.
+
+The NanoC6 boot log lists two Apple fabric records: Apple Home and Apple
+Keychain (F31). This fact does not verify the hypothesis. No Google Home or
+Home Assistant fabric was identified in the test, and the test did not show
+two independent Aliro issuers.
 
 **What would break this:** `SetAliroReaderConfig` sets a *single* reader config — one signing
 key, one group identifier (F12). If the second fabric overwrites the first's reader config rather
@@ -139,6 +157,63 @@ suggests Aliro credential support is a plausible 2026 addition, and #17 explicit
 be first — but it is a roadmap item, not a capability.
 
 **Verification status: VERIFIED for control, VERIFIED-ABSENT for Aliro credentials.**
+
+---
+
+## Proposal: separate Matter-over-Wi-Fi AtomS3 Lite build variant
+
+**Recommendation: run a separate test build. Do not replace or rename the
+NanoC6 variant.**
+
+The verified dependencies support this proposal, but no S3 Aliro image has
+been built or tested (F32).
+
+### Verified inputs
+
+- The AtomS3 Lite has an ESP32-S3 and 8 MB flash. It must use Wi-Fi for Matter
+  because the ESP32-S3 has no Thread radio.
+- The AtomS3 Lite and Unit NFC already work together on GPIO 2 and GPIO 1. The
+  separate HomeKey-ESP32 work verified its browser install, Wi-Fi setup, Home
+  Key taps, and GPIO 35 RGB LED.
+- The pinned door-lock project has an ESP32-S3 target. Both `m5nfc` and the
+  precompiled Aliro library include ESP32-S3 support.
+- Matter can commission a Wi-Fi device over BLE. The phone supplies the Wi-Fi
+  credentials during Matter commissioning. The S3 variant does not need a
+  Thread border router.
+
+### Proposed variant boundary
+
+Create an independent `aliro-s3-*` development variant with these properties:
+
+1. Use the same door-lock and Aliro source patches where they are portable.
+2. Add an AtomS3 Lite overlay that enables Matter over Wi-Fi, keeps BLE
+   commissioning, selects GPIO 2 and GPIO 1 for the Unit NFC, and uses GPIO 35
+   for the RGB LED.
+3. Give the S3 image its own release tag, build record, checksums, factory
+   manifest, preserving-update manifest, and partition-layout identifier.
+4. Add an explicit AtomS3 Lite choice to the Aliro installer. Keep the NanoC6
+   choice and Thread instructions unchanged.
+5. Describe Wi-Fi credentials as Matter commissioning data. Do not reuse the
+   HomeKey-ESP32 Improv flow in the Aliro variant.
+
+### Required tests before release
+
+- Build the pinned door-lock application for ESP32-S3 and record image and
+  partition sizes.
+- Verify native USB boot logs and installer reset behavior on the AtomS3 Lite.
+- Complete a factory install and Apple Home Matter-over-Wi-Fi commissioning.
+- Confirm that Apple Home provisions the Aliro reader and that the Home Key
+  unlock tap works.
+- Complete a preserving update and confirm that the Wi-Fi network, Matter
+  fabric, Aliro keys, and settings remain present.
+- Verify the RGB pin and the valid, invalid, and non-Aliro tap results.
+
+This board does not need a Thread border router. It does need Wi-Fi
+credentials. It also needs its own release artifacts and hardware tests. A
+separate variant keeps these differences separate from the NanoC6 build.
+
+**Verification status: PROPOSED.** The dependencies and board wiring are
+verified. The Matter-over-Wi-Fi Aliro build and its installer path are not.
 
 ---
 
@@ -200,11 +275,18 @@ in a large driver swap on the path being superseded is doubly unattractive.
 | Aliro credentials ship in Google and Samsung Wallets | VERIFIED (third-party RE) | F15 — kormax; independently corroborated by Play Services manifest + Android UWB module |
 | HA can control the lock with no Apple/Google hub | VERIFIED | F22 |
 | HA cannot manage Aliro credentials | VERIFIED (absent) | F23, F24 |
-| **Matter multi-admin lets Apple + Google each issue Aliro keys** | **UNVERIFIED** | Test: commission into two fabrics, check whether the second `SetAliroReaderConfig` clobbers the first |
-| **A test-DAC device can be commissioned into Apple Home** | **UNVERIFIED** | Only evidence is connectedhomeip issue #25743 (Mar 2023): Apple accepted test attestation, Google Home rejected a custom VID. Dated, single report, still open, no maintainer response |
+| NanoC6 firmware builds and runs on the target hardware | VERIFIED | F26 |
+| Apple Home accepts the test-attestation device and provisions Home Key | VERIFIED | F26, F27 |
+| Browser factory install works on NanoC6 | VERIFIED | F29 |
+| Firmware source and keep-setup manifests preserve NVS by design | VERIFIED | F28 |
+| A paired keep-setup update retains fabrics, Thread and Aliro data, settings, and the Home Key | UNVERIFIED | Run the update on the commissioned NanoC6, confirm that both fabric records remain, and test the existing Home Key |
+| A valid release 0.0.4 tap unlocks but does not toggle | VERIFIED | F30 |
+| The boot log lists Apple Home and Apple Keychain fabrics | VERIFIED | F31 |
+| **Matter multi-admin lets Apple + Google each issue Aliro keys** | **UNVERIFIED** | Add a non-Apple fabric and check whether its `SetAliroReaderConfig` call replaces the Apple configuration |
 | **Google Home issues Aliro credentials for residential locks** | **UNVERIFIED** | The one concrete Google Wallet + Aliro artefact is Kastle's *corporate badge* — commercial, not home |
 | **Android express tap works against this reader** | **UNVERIFIED** | F18 — Polling Loop Annotations vs ECP; needs a logic-analyser observation since the library is a blob |
-| **The example builds and runs on the NanoC6** | **UNVERIFIED** | Just build it |
+| **A valid tap locks an unlocked lock when auto-lock is off** | **PROPOSED** | The requested rule is not part of release 0.0.4; build and hardware tests are required |
+| **AtomS3 Lite can run this Aliro lock over Matter-over-Wi-Fi** | **PROPOSED** | F32 confirms compatible parts; build and hardware tests are still required |
 | Uncertified accessories lose some Apple features | PLAUSIBLE | iOS strings warn an uncertified accessory may lose Approach to Unlock / Tap to Unlock (kormax) |
 
 ---
@@ -215,8 +297,8 @@ The question asked whether the door_lock example could run Matter-over-Thread on
 Aliro, and whether that combination solves provisioning, Android support, and hub-free HA
 integration.
 
-- **Thread on NanoC6:** yes, and it is Espressif's default for the Aliro build (F3, F5).
-- **Provisioning:** solved, and more cleanly than the HomeKit equivalent originally imagined.
+- **Thread on NanoC6:** yes, and the release now works on hardware (F3, F5, F26).
+- **Provisioning:** solved and verified with Apple Home (F26, F27, F29).
 - **Android:** the standard and the phones are ready (F15); the *issuance* path for a residential
   lock is the open question, not the phone.
 - **HA without a HomeKit hub:** control yes, key issuance not yet (F22–F24).
@@ -232,28 +314,28 @@ the original framing.
 
 Ordered by information gained per unit of effort.
 
-1. **Build it.** `idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro" set-target esp32c6 build`
-   in `~/Development/esp-matter/examples/door_lock`. Costs nothing but time, and settles the
-   "does it fit and compile" question. Needs the ESP-IDF version esp-matter pins (check its CI,
-   as the HomeKey repo taught us — its `idf_component.yml` claim was wrong).
-2. **Flash the NanoC6 and commission into Apple Home.** Settles the test-DAC question and the
-   headline claim that a key auto-appears in Apple Wallet. The Unit NFC would need freeing from
-   the AtomS3.
-3. **Then commission into a second fabric** (HA, and Google Home if available) and re-read the
-   Aliro reader config. This is the multi-admin question — the one that decides whether the
-   Android goal is reachable at all.
-4. **If step 3 works, try a Google Wallet key** on an Android phone. This is the actual goal.
-5. **Watch OpenHomeFoundation #17 / core PR #161936.** HA Aliro credential support would remove
+1. **Add a non-Apple fabric** from Home Assistant or Google Home. Then read the
+   Aliro reader configuration. The two observed Apple fabrics do not answer
+   the multi-admin question.
+2. **If the non-Apple fabric works, try a Google Wallet key** on an Android
+   phone. This is the original Android goal.
+3. **Test the paired keep-setup update.** Confirm that both Apple fabric
+   records, Thread and Aliro data, settings, and the existing Home Key remain.
+4. **Run the AtomS3 Lite test build.** Keep it as a separate Matter-over-Wi-Fi
+   variant until all tests in the proposal pass.
+5. **Build and test the proposed tap rule as a new release.** Keep the verified
+   0.0.4 behavior in the evidence record.
+6. **Watch OpenHomeFoundation #17 / core PR #161936.** HA Aliro credential support would remove
    the last dependency on an Apple or Google hub.
-6. **Leave HomeKey-ESP32 alone.** Land the five PRs as they are. Revisit the ISO-DEP chaining
+7. **Leave HomeKey-ESP32 alone.** Land the five PRs as they are. Revisit the ISO-DEP chaining
    question only if an attestation-flow failure is actually observed.
 
 ## Things That Would Change This Analysis
 
 - If multi-admin `SetAliroReaderConfig` proves destructive, the Android goal needs a different
   mechanism entirely (or a Google-Home-only deployment, losing Apple).
-- If Apple Home rejects test DACs, the whole path needs either a real DAC or a
-  Google-Home/HA-only deployment.
 - If HA ships Aliro credential management, this becomes strictly better than HomeKey-ESP32 on
   every axis except source availability of the crypto.
+- If the S3 build does not fit its selected OTA layout, the Wi-Fi variant needs a
+  different partition design or must be dropped.
 - If Espressif open-sources `esp_aliro_lib`, the main objection disappears.

@@ -3,6 +3,76 @@
 Chronological record of findings, questions, and decisions. Newest at top.
 Each entry is dated. Findings that harden into decisions get promoted.
 
+## 2026-08-07: esp-web-tools upstream PR opened
+
+- Upstream PR
+  [esphome/esp-web-tools#733](https://github.com/esphome/esp-web-tools/pull/733),
+  **Add an awaited post-flash callback**, is open.
+- The PR adds the serial handoff that this installer needs after a successful
+  flash and before Improv starts. It includes contract documentation and tests.
+
+## 2026-08-07: NanoC6 hardware result and S3 Lite assessment
+
+### Verified NanoC6 findings
+
+- The public browser installer can factory-install
+  `aliro-c6-v0.0.4-devkit` on the NanoC6. Its native USB log supplies the
+  Matter QR payload and manual pairing code.
+- Apple Home commissions the device as a Matter-over-Thread door lock with
+  the development build's test attestation.
+- Apple Home configures the Aliro reader and provisions an Apple Home Key.
+  The iPhone selects the Home Key automatically at the Unit NFC reader. The
+  reader completes a valid Aliro transaction.
+- The NanoC6 boot log lists two stored Matter fabrics. Their vendor IDs are
+  `0x1349` for Apple Home and `0x1384` for Apple Keychain. This result does not
+  verify that Apple Home and Google Home can provision Aliro keys at the same
+  time.
+- The installer's settings panel reads and writes the `ALIRO/1` settings on
+  the NanoC6.
+- Release 0.0.4 is tap-to-unlock. A valid tap calls the Matter unlock action.
+  With auto-relock enabled, the Matter timer locks the device after the set
+  delay. A valid tap while the lock is already unlocked does not lock it.
+  Tap-to-toggle is not a verified release behavior.
+
+### Verified persistence design; hardware check pending
+
+- The firmware source stores settings in NVS. The keep-setup manifests write
+  only the OTA app partitions, and the installer rejects erase requests for
+  this path. These files preserve NVS by design.
+- A keep-setup update on the paired NanoC6 has not been verified on hardware.
+  Retention of the two fabrics, Thread credentials, Aliro data, settings, and
+  the existing Home Key after that update is not yet verified.
+
+### Verified inputs for an S3 Lite assessment
+
+- The AtomS3 Lite and Unit NFC are a verified hardware pair. The Unit NFC
+  uses SDA GPIO 2 and SCL GPIO 1. The AtomS3 Lite uses RGB GPIO 35.
+- The separate HomeKey-ESP32 work verified browser installation, Wi-Fi
+  setup, Home Key taps, and the RGB LED on this hardware.
+- The pinned `esp-matter` door-lock project has an ESP32-S3 target. Its
+  `m5nfc` dependency and the precompiled Aliro library include ESP32-S3.
+- ESP32-S3 has no IEEE 802.15.4 radio. An Aliro S3 build variant must use
+  Matter over Wi-Fi, with BLE for Matter commissioning.
+- This repository has not built or tested an AtomS3 Lite Aliro image.
+
+### Proposal, not a decision or verified result
+
+- For a later release, apply a valid tap as follows. Always unlock a locked
+  lock. If auto-lock is off, lock an unlocked lock. If auto-lock is on and the
+  lock is already unlocked, do not change the state and do not restart the
+  auto-lock timer. An active timer can lock it later. Release 0.0.4 does not
+  implement this rule.
+- Run a test build for a separate `aliro-s3-*` development variant. Keep the
+  verified NanoC6 Thread variant unchanged.
+- Give the S3 variant its own board overlay, release tags, artifacts,
+  manifests, partition-layout check, installer choice, and Wi-Fi setup text.
+- Reuse portable Aliro patches, but change the board-specific RGB and target
+  settings. Do not reuse the HomeKey-ESP32 Improv flow. Matter commissioning
+  must supply the Wi-Fi credentials.
+- Do not publish the variant until the build, factory install, Apple Home
+  Matter-over-Wi-Fi commissioning, Home Key tap, preserving update, and LED
+  behavior pass on AtomS3 Lite hardware.
+
 ## 2026-08-05: NanoC6 serial-output investigation
 
 ### Approved findings
