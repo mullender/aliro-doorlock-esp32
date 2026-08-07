@@ -43,6 +43,9 @@
     /* Pairing panel (hidden until a successful flash + parse) */
     .pairing { display: none; margin: 1.5rem 0; padding: 1rem 1.5rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
     .pairing.visible { display: block; }
+    .fabric-details { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 1rem 0 0; }
+    .fabric-details dt { font-weight: 600; }
+    .fabric-details dd { margin: 0; overflow-wrap: anywhere; }
     .pairing-grid { display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 1.5rem; align-items: start; }
     @media (max-width: 640px) {
       .pairing-grid { grid-template-columns: 1fr; }
@@ -90,111 +93,21 @@
   as a Matter door-lock over Thread.
 </p>
 
-<h2>Before you start</h2>
-<ul>
-  <li>A USB-C data-capable cable and an M5 NanoC6 with the Unit NFC
-    (ST25R3916) attached over Grove.</li>
-  <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
-    Safari and Firefox do not support Web Serial.</li>
-  <li>A Thread border router on your LAN (Home Assistant + SkyConnect /
-    ZBT-1 / ZBT-2, Apple HomePod, or Google Nest Hub 2nd gen).</li>
-  <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
-</ul>
-
-<section class="serial-card" aria-labelledby="serial-heading">
-  <h2 id="serial-heading">Live serial monitor</h2>
-  <p>
-    Connect to view local device logs before or after an install. If the log
-    contains valid Matter setup codes, this page shows the pairing QR panel.
-    Log data stays in this browser page.
-  </p>
-  <div class="serial-controls">
-    <button type="button" id="serial-connect">Connect device</button>
-    <button type="button" id="serial-reset" disabled>Reset device</button>
-    <button type="button" id="serial-clear">Clear</button>
-    <button type="button" id="serial-disconnect" disabled>Disconnect</button>
-  </div>
-  <div class="serial-status" id="serial-status" role="status" aria-live="polite"></div>
-  <pre class="serial-log mono" id="serial-log" tabindex="0" aria-label="Live serial log"></pre>
-</section>
-
-<section class="install-card update-card" aria-labelledby="update-heading">
-  <h2 id="update-heading">Update firmware — keep setup</h2>
-  <p>
-    Use this update only on a device that was previously installed from this
-    repository with the approved
-    <code>esp32c6-door-lock-4mb-v1</code> partition layout. If the device uses
-    a different layout, or if you are not certain, you must use Factory
-    install below.
-  </p>
-  <p>This update keeps Matter fabrics, Thread credentials, and Aliro reader
-    configuration.</p>
-  <div class="install-row">
-    <esp-web-install-button
-      manifest="./manifest-update.json"
-      id="update-button"
-      data-install-mode="update"
-      erase-first="false"
-      inert>
-      <button slot="activate" disabled>Update firmware — keep setup</button>
-      <button slot="unsupported">
-        Web Serial is not available in this browser. Use Chrome or Edge on
-        desktop.
-      </button>
-      <button slot="not-allowed">
-        Web Serial requires HTTPS (this page must be served securely).
-      </button>
-    </esp-web-install-button>
-  </div>
-</section>
-
-<div class="browser-note">
-  Chrome or Edge on desktop only. This page never sends your device's
-  setup data to a remote service.
-</div>
-
-<section class="install-card danger-card" aria-labelledby="factory-heading">
-  <h2 id="factory-heading">Factory install — erase everything</h2>
-  <p><strong>Use this for a first install or recovery.</strong> It erases the
-    entire flash. You will lose Matter fabrics, Thread credentials, and Aliro
-    reader configuration.</p>
-  <div class="install-row">
-    <esp-web-install-button
-      manifest="./manifest.json"
-      id="factory-button"
-      data-install-mode="factory"
-      erase-first="true"
-      inert>
-      <button slot="activate" disabled>Factory install — erase everything</button>
-      <button slot="unsupported">
-        Web Serial is not available in this browser. Use Chrome or Edge on
-        desktop.
-      </button>
-      <button slot="not-allowed">
-        Web Serial requires HTTPS (this page must be served securely).
-      </button>
-    </esp-web-install-button>
-  </div>
-</section>
-
-<div class="setup-result">
-  <div class="setup-status" id="setup-status" role="status" aria-live="polite">
-    Choose Update to keep setup on an approved layout. Choose Factory install
-    for a first install, recovery, or a different layout.
-  </div>
-  <button type="button" id="cancel-code-read" hidden>Cancel code read</button>
-  <button type="button" id="retry-install" hidden>Reload and retry</button>
-</div>
-
-<div class="dev-banner" id="dev-banner" hidden>
-  Dev mode: showing the shared esp-matter example payload. Not a real
-  device — the QR below will not commission any hardware you own unless
-  you also flashed a stock esp-matter build. Turn dev mode off by
-  removing <code>?dev=1</code> from the URL.
-</div>
-
 <!-- Pairing panel: hidden until Phase 4's serial parser sets pairing state -->
 <section class="pairing" id="pairing" aria-hidden="true">
+  <div id="pairing-commissioned" hidden>
+    <h2>Already commissioned</h2>
+    <p>The original QR cannot start pairing while BLE commissioning is closed.
+      Use the existing controller to open pairing mode, or use Factory install
+      if the device was deleted from that controller.</p>
+    <dl class="fabric-details" id="fabric-details" hidden>
+      <dt>Fabric index</dt><dd><code id="fabric-index"></code></dd>
+      <dt>FabricId</dt><dd><code id="fabric-id"></code></dd>
+      <dt>NodeId</dt><dd><code id="node-id"></code></dd>
+      <dt>VendorId</dt><dd><code id="vendor-id"></code></dd>
+    </dl>
+  </div>
+  <div id="pairing-codes">
   <h2>Scan to add the device</h2>
   <p>Open Apple Home, Google Home, or the Home Assistant Companion app
     on your phone, choose <em>Add device</em>, and scan this QR code:</p>
@@ -301,6 +214,110 @@
       </details>
     </div>
   </div>
+  </div>
+</section>
+
+<h2>Before you start</h2>
+<ul>
+  <li>A USB-C data-capable cable and an M5 NanoC6 with the Unit NFC
+    (ST25R3916) attached over Grove.</li>
+  <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
+    Safari and Firefox do not support Web Serial.</li>
+  <li>A Thread border router on your LAN (Home Assistant + SkyConnect /
+    ZBT-1 / ZBT-2, Apple HomePod, or Google Nest Hub 2nd gen).</li>
+  <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
+</ul>
+
+<section class="install-card update-card" aria-labelledby="update-heading">
+  <h2 id="update-heading">Update firmware — keep setup</h2>
+  <p>
+    Use this update only on a device that was previously installed from this
+    repository with the approved
+    <code>esp32c6-door-lock-4mb-v1</code> partition layout. If the device uses
+    a different layout, or if you are not certain, you must use Factory
+    install below.
+  </p>
+  <p>This update keeps Matter fabrics, Thread credentials, and Aliro reader
+    configuration.</p>
+  <div class="install-row">
+    <esp-web-install-button
+      manifest="./manifest-update.json"
+      id="update-button"
+      data-install-mode="update"
+      erase-first="false"
+      inert>
+      <button slot="activate" disabled>Update firmware — keep setup</button>
+      <button slot="unsupported">
+        Web Serial is not available in this browser. Use Chrome or Edge on
+        desktop.
+      </button>
+      <button slot="not-allowed">
+        Web Serial requires HTTPS (this page must be served securely).
+      </button>
+    </esp-web-install-button>
+  </div>
+</section>
+
+<div class="browser-note">
+  Chrome or Edge on desktop only. This page never sends your device's
+  setup data to a remote service.
+</div>
+
+<section class="install-card danger-card" aria-labelledby="factory-heading">
+  <h2 id="factory-heading">Factory install — erase everything</h2>
+  <p><strong>Use this for a first install or recovery.</strong> It erases the
+    entire flash. You will lose Matter fabrics, Thread credentials, and Aliro
+    reader configuration.</p>
+  <div class="install-row">
+    <esp-web-install-button
+      manifest="./manifest.json"
+      id="factory-button"
+      data-install-mode="factory"
+      erase-first="true"
+      inert>
+      <button slot="activate" disabled>Factory install — erase everything</button>
+      <button slot="unsupported">
+        Web Serial is not available in this browser. Use Chrome or Edge on
+        desktop.
+      </button>
+      <button slot="not-allowed">
+        Web Serial requires HTTPS (this page must be served securely).
+      </button>
+    </esp-web-install-button>
+  </div>
+</section>
+
+<div class="setup-result">
+  <div class="setup-status" id="setup-status" role="status" aria-live="polite">
+    Choose Update to keep setup on an approved layout. Choose Factory install
+    for a first install, recovery, or a different layout.
+  </div>
+  <button type="button" id="cancel-code-read" hidden>Cancel code read</button>
+  <button type="button" id="retry-install" hidden>Reload and retry</button>
+</div>
+
+<div class="dev-banner" id="dev-banner" hidden>
+  Dev mode: showing the shared esp-matter example payload. Not a real
+  device — the QR below will not commission any hardware you own unless
+  you also flashed a stock esp-matter build. Turn dev mode off by
+  removing <code>?dev=1</code> from the URL.
+</div>
+
+<section class="serial-card" aria-labelledby="serial-heading">
+  <h2 id="serial-heading">Live serial monitor</h2>
+  <p>
+    Connect to view local device logs before or after an install. If the log
+    contains valid Matter setup codes, this page shows the pairing QR panel.
+    Log data stays in this browser page.
+  </p>
+  <div class="serial-controls">
+    <button type="button" id="serial-connect">Connect device</button>
+    <button type="button" id="serial-reset" disabled>Reset device</button>
+    <button type="button" id="serial-clear">Clear</button>
+    <button type="button" id="serial-disconnect" disabled>Disconnect</button>
+  </div>
+  <div class="serial-status" id="serial-status" role="status" aria-live="polite"></div>
+  <pre class="serial-log mono" id="serial-log" tabindex="0" aria-label="Live serial log"></pre>
 </section>
 
 <footer>
@@ -333,6 +350,13 @@ const setupFlow = createSetupFlow({
     qr: qrEl,
     qrCaption: qrCaptionEl,
     manual: manualEl,
+    pairingCodes: document.getElementById("pairing-codes"),
+    commissioned: document.getElementById("pairing-commissioned"),
+    fabricDetails: document.getElementById("fabric-details"),
+    fabricIndex: document.getElementById("fabric-index"),
+    fabricId: document.getElementById("fabric-id"),
+    nodeId: document.getElementById("node-id"),
+    vendorId: document.getElementById("vendor-id"),
     status: document.getElementById("setup-status"),
     cancel: document.getElementById("cancel-code-read"),
     retry: document.getElementById("retry-install"),

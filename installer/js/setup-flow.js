@@ -23,6 +23,13 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     elements.qr.innerHTML = "";
     elements.qrCaption.textContent = "";
     elements.manual.textContent = "—";
+    elements.pairingCodes.hidden = false;
+    elements.commissioned.hidden = true;
+    elements.fabricDetails.hidden = true;
+    elements.fabricIndex.textContent = "";
+    elements.fabricId.textContent = "";
+    elements.nodeId.textContent = "";
+    elements.vendorId.textContent = "";
     elements.pairing.classList.remove("visible");
     elements.pairing.setAttribute("aria-hidden", "true");
   }
@@ -61,9 +68,34 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     return true;
   }
 
+  function showCommissioned(fabric = null, options = {}) {
+    hidePairing();
+    elements.pairingCodes.hidden = true;
+    elements.commissioned.hidden = false;
+    if (fabric) {
+      elements.fabricDetails.hidden = false;
+      elements.fabricIndex.textContent = fabric.fabricIndex;
+      elements.fabricId.textContent = fabric.fabricId;
+      elements.nodeId.textContent = fabric.nodeId;
+      elements.vendorId.textContent = fabric.vendorId;
+    }
+    elements.pairing.classList.add("visible");
+    elements.pairing.setAttribute("aria-hidden", "false");
+    elements.status.textContent = options.statusMessage ||
+      "This device is already commissioned.";
+    scrollPairing?.();
+    return true;
+  }
+
   function finish(result) {
     elements.cancel.hidden = true;
     abortController = null;
+    if (result?.ok && result.kind === "commissioned") {
+      elements.retry.hidden = true;
+      showCommissioned(result.fabric);
+      dispatch("install-commissioned", { installMode: currentInstallMode });
+      return true;
+    }
     if (result?.ok && showPairing(result.mt, result.manualCode)) {
       elements.retry.hidden = true;
       dispatch("install-complete", {
@@ -139,6 +171,7 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     cancel,
     getCurrent,
     showPairing,
+    showCommissioned,
     hidePairing,
     handleInstallResult,
     finishPreservedUpdate,

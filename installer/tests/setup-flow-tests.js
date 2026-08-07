@@ -13,6 +13,10 @@ function makeFlow() {
   const root = document.createElement("div");
   root.innerHTML = `
     <section id="pairing" class="visible" aria-hidden="false"></section>
+    <div id="pairing-codes"></div><div id="commissioned" hidden></div>
+    <dl id="fabric-details" hidden></dl>
+    <code id="fabric-index"></code><code id="fabric-id"></code>
+    <code id="node-id"></code><code id="vendor-id"></code>
     <div id="qr">old QR</div><div id="caption">old payload</div>
     <div id="manual">old code</div><div id="status"></div>
     <button id="cancel" hidden></button><button id="retry" hidden></button>`;
@@ -22,6 +26,13 @@ function makeFlow() {
     qr: root.querySelector("#qr"),
     qrCaption: root.querySelector("#caption"),
     manual: root.querySelector("#manual"),
+    pairingCodes: root.querySelector("#pairing-codes"),
+    commissioned: root.querySelector("#commissioned"),
+    fabricDetails: root.querySelector("#fabric-details"),
+    fabricIndex: root.querySelector("#fabric-index"),
+    fabricId: root.querySelector("#fabric-id"),
+    nodeId: root.querySelector("#node-id"),
+    vendorId: root.querySelector("#vendor-id"),
     status: root.querySelector("#status"),
     cancel: root.querySelector("#cancel"),
     retry: root.querySelector("#retry"),

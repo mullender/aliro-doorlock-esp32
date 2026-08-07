@@ -36,6 +36,7 @@ export function createSerialMonitor({
   let parseBuffer = "";
   let codeState = { mt: null, manualCode: null };
   let lastPair = null;
+  let lastCommissioned = null;
 
   function setStatus(message) {
     elements.status.textContent = message;
@@ -64,6 +65,17 @@ export function createSerialMonitor({
   }
 
   function handleCodeState() {
+    if (codeState.commissioned) {
+      const stateKey = JSON.stringify(codeState.fabric || {});
+      if (stateKey !== lastCommissioned) {
+        setupFlow.showCommissioned(codeState.fabric || null, {
+          statusMessage: "Live serial log shows that this device is already commissioned.",
+        });
+        lastCommissioned = stateKey;
+        setStatus("Connected. Device is already commissioned.");
+      }
+      return;
+    }
     if (!codeState.mt || !codeState.manualCode) return;
     const pairKey = `${codeState.mt}\n${codeState.manualCode}`;
     if (pairKey !== lastPair) {
@@ -77,7 +89,11 @@ export function createSerialMonitor({
         setStatus("Connected, but the live setup codes are invalid or do not match.");
       }
     }
-    codeState = { mt: null, manualCode: null };
+    codeState = {
+      mt: null,
+      manualCode: null,
+      ...(codeState.fabric ? { fabric: codeState.fabric } : {}),
+    };
   }
 
   function parseCompleteLines(text, flush = false) {
@@ -217,6 +233,7 @@ export function createSerialMonitor({
     parseBuffer = "";
     codeState = { mt: null, manualCode: null };
     lastPair = null;
+    lastCommissioned = null;
     port = selectedPort;
     reader = selectedReader;
     setControls("connected");
@@ -319,6 +336,7 @@ export function createSerialMonitor({
     parseBuffer = "";
     codeState = { mt: null, manualCode: null };
     lastPair = null;
+    lastCommissioned = null;
     setStatus(port ? "Live log cleared. The serial monitor is connected." : "Live log cleared.");
   }
 
