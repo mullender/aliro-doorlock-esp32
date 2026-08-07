@@ -8,25 +8,47 @@ const RE_ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_REEMIT_TIMEOUT_MS = 5000;
 
+function normalizedHex(value) {
+  return value.toLowerCase().replace(/^0x0*/, "0x");
+}
+
+function fabricKey(fabric) {
+  return [fabric.fabricIndex, fabric.fabricId, fabric.nodeId, fabric.vendorId]
+    .map(normalizedHex)
+    .join(":");
+}
+
 export function parseOnboardingText(text, previous = {}) {
   const state = {
     mt: previous.mt || null,
     manualCode: previous.manualCode || null,
   };
-  if (previous.fabric) state.fabric = previous.fabric;
+  const fabrics = previous.fabrics
+    ? [...previous.fabrics]
+    : (previous.fabric ? [previous.fabric] : []);
+  if (fabrics.length) {
+    state.fabrics = fabrics;
+    state.fabric = previous.fabric || fabrics[fabrics.length - 1];
+  }
   if (previous.commissioned) state.commissioned = true;
   const cleaned = String(text).replace(RE_ANSI, "");
   for (const line of cleaned.split(/\r?\n/)) {
     if (!state.mt) state.mt = line.match(RE_MT)?.[1] || null;
     if (!state.manualCode) state.manualCode = line.match(RE_MANUAL)?.[1] || null;
-    const fabric = line.match(RE_FABRIC);
-    if (fabric) {
-      state.fabric = {
-        fabricIndex: fabric[1],
-        fabricId: fabric[2],
-        nodeId: fabric[3],
-        vendorId: fabric[4],
+    const fabricMatch = line.match(RE_FABRIC);
+    if (fabricMatch) {
+      const fabric = {
+        fabricIndex: fabricMatch[1],
+        fabricId: fabricMatch[2],
+        nodeId: fabricMatch[3],
+        vendorId: fabricMatch[4],
       };
+      const existingFabric = fabrics.find((item) => fabricKey(item) === fabricKey(fabric));
+      if (!existingFabric) {
+        fabrics.push(fabric);
+      }
+      state.fabrics = fabrics;
+      state.fabric = existingFabric || fabric;
     }
     if (line.includes(COMMISSIONED_MARKER)) state.commissioned = true;
   }
@@ -39,6 +61,7 @@ function outcomeFromState(state, source) {
       ok: true,
       kind: "commissioned",
       fabric: state.fabric || null,
+      fabrics: state.fabrics || [],
       source,
     };
   }
@@ -180,11 +203,13 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
           };
         }
         lineBuffer += decoder.decode(event.value.value, { stream: true }).replace(RE_ANSI, "");
-        state = parseOnboardingText(lineBuffer, state);
-        const outcome = outcomeFromState(state, phase);
-        if (outcome) return outcome;
         const completeLines = lineBuffer.split(/\r?\n/);
         lineBuffer = completeLines.pop() || "";
+        if (completeLines.length) {
+          state = parseOnboardingText(completeLines.join("\n"), state);
+        }
+        const outcome = outcomeFromState(state, phase);
+        if (outcome) return outcome;
         continue;
       }
 

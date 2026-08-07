@@ -50,6 +50,19 @@ export async function runBootParserTests(container) {
   ].join("\n");
 
   {
+    const fabricLines = [
+      "I chip[FP]: Fabric index 0x1 was retrieved from storage. Compressed FabricId 0xAA, FabricId 0x10, NodeId 0x20, VendorId 0x1349",
+      "I chip[FP]: Fabric index 0x1 was retrieved from storage. Compressed FabricId 0xAA, FabricId 0x10, NodeId 0x20, VendorId 0x1349",
+      "I chip[FP]: Fabric index 0x2 was retrieved from storage. Compressed FabricId 0xBB, FabricId 0x11, NodeId 0x21, VendorId 0x6006",
+      "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
+    ];
+    const parsed = parseOnboardingText(fabricLines.join("\n"));
+    const ok = parsed.commissioned && parsed.fabrics.length === 2 &&
+      parsed.fabric === parsed.fabrics[1] && parsed.fabric.vendorId === "0x6006";
+    count(report(container, "multiple fabric lines are retained once", ok));
+  }
+
+  {
     const stream = streamFromText(validLog);
     const result = await parseMatterOnboardingCodes(
       { readable: stream },
