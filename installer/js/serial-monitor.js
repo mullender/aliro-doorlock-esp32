@@ -68,9 +68,12 @@ export function createSerialMonitor({
 
   function handleCodeState() {
     if (codeState.commissioned) {
-      const stateKey = JSON.stringify(codeState.fabric || {});
+      const fabrics = codeState.fabrics?.length
+        ? codeState.fabrics
+        : (codeState.fabric ? [codeState.fabric] : []);
+      const stateKey = JSON.stringify(fabrics);
       if (stateKey !== lastCommissioned) {
-        setupFlow.showCommissioned(codeState.fabric || null, {
+        setupFlow.showCommissioned(fabrics, {
           statusMessage: "Live serial log shows that this device is already commissioned.",
         });
         lastCommissioned = stateKey;
@@ -95,6 +98,7 @@ export function createSerialMonitor({
       mt: null,
       manualCode: null,
       ...(codeState.fabric ? { fabric: codeState.fabric } : {}),
+      ...(codeState.fabrics ? { fabrics: codeState.fabrics } : {}),
     };
   }
 

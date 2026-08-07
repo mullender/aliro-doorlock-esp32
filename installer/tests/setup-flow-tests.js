@@ -14,9 +14,8 @@ function makeFlow() {
   root.innerHTML = `
     <section id="pairing" class="visible" aria-hidden="false"></section>
     <div id="pairing-codes"></div><div id="commissioned" hidden></div>
-    <dl id="fabric-details" hidden></dl>
-    <code id="fabric-index"></code><code id="fabric-id"></code>
-    <code id="node-id"></code><code id="vendor-id"></code>
+    <div id="commissioned-services"></div>
+    <details id="fabric-details" hidden><div id="fabric-list"></div></details>
     <div id="qr">old QR</div><div id="caption">old payload</div>
     <div id="manual">old code</div><div id="status"></div>
     <button id="cancel" hidden></button><button id="retry" hidden></button>`;
@@ -28,11 +27,9 @@ function makeFlow() {
     manual: root.querySelector("#manual"),
     pairingCodes: root.querySelector("#pairing-codes"),
     commissioned: root.querySelector("#commissioned"),
+    commissionedGuidance: root.querySelector("#commissioned-services"),
     fabricDetails: root.querySelector("#fabric-details"),
-    fabricIndex: root.querySelector("#fabric-index"),
-    fabricId: root.querySelector("#fabric-id"),
-    nodeId: root.querySelector("#node-id"),
-    vendorId: root.querySelector("#vendor-id"),
+    fabricList: root.querySelector("#fabric-list"),
     status: root.querySelector("#status"),
     cancel: root.querySelector("#cancel"),
     retry: root.querySelector("#retry"),
@@ -140,6 +137,22 @@ export async function runSetupFlowTests(container) {
     const ok = elements.pairing.getAttribute("aria-hidden") === "false" &&
       elements.qrCaption.textContent === pair.mt && elements.status.textContent === readyStatus;
     count(report(container, "factory terminal success keeps post-flash pairing data", ok));
+  }
+
+  {
+    const { flow, elements } = makeFlow();
+    flow.showCommissioned([
+      { fabricIndex: "0x1", fabricId: "0x10", nodeId: "0x20", vendorId: "0x1349" },
+      { fabricIndex: "0x2", fabricId: "0x11", nodeId: "0x21", vendorId: "0x1384" },
+      { fabricIndex: "0x3", fabricId: "0x12", nodeId: "0x22", vendorId: "0x134B" },
+    ]);
+    const guidance = elements.commissionedGuidance.textContent;
+    const ok = (guidance.match(/Turn On Pairing Mode/g) || []).length === 1 &&
+      guidance.includes("Apple Home and Apple Keychain") &&
+      guidance.includes("Settings > Matter > Add device") &&
+      guidance.includes("Yes, it is already in use") &&
+      elements.fabricList.querySelectorAll(".fabric-record").length === 3;
+    count(report(container, "commissioned services show grouped guidance and all fabrics", ok));
   }
 
   {

@@ -198,11 +198,9 @@ function fakeFlow() {
     manual: fakeElement(),
     pairingCodes: fakeElement(),
     commissioned: fakeElement(),
+    commissionedGuidance: fakeElement(),
     fabricDetails: fakeElement(),
-    fabricIndex: fakeElement(),
-    fabricId: fakeElement(),
-    nodeId: fakeElement(),
-    vendorId: fakeElement(),
+    fabricList: fakeElement(),
     status: fakeElement(),
     cancel: fakeElement(),
     retry: fakeElement(),
@@ -305,19 +303,49 @@ test("boot parser requires the commissioned marker and keeps raw fabric values",
     nodeId: "0x0000000000000001",
     vendorId: "0xFFF1",
   });
+  assert.deepEqual(detailsOnly.fabrics, [detailsOnly.fabric]);
 
   const commissioned = parseOnboardingText(
     `${fabricLine}\nI (843) chip[SVR]: Fabric already commissioned. Disabling BLE advertisement`,
   );
   assert.equal(commissioned.commissioned, true);
   assert.deepEqual(commissioned.fabric, detailsOnly.fabric);
+  assert.deepEqual(commissioned.fabrics, [detailsOnly.fabric]);
 
   const similarText = parseOnboardingText("I chip[SVR]: Fabric is already commissioned");
   assert.equal(similarText.commissioned, undefined);
 });
 
+test("boot parser retains unique fabrics and keeps the single-fabric alias", () => {
+  const appleHome = "I chip[FP]: Fabric index 0x1 was retrieved from storage. " +
+    "Compressed FabricId 0xAA, FabricId 0x10, NodeId 0x20, VendorId 0x1349";
+  const appleKeychain = "I chip[FP]: Fabric index 0x2 was retrieved from storage. " +
+    "Compressed FabricId 0xBB, FabricId 0x11, NodeId 0x21, VendorId 0x1384";
+  const first = parseOnboardingText(appleHome);
+  const parsed = parseOnboardingText([
+    appleHome.toLowerCase(),
+    appleKeychain,
+    "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
+  ].join("\n"), first);
+
+  assert.equal(parsed.commissioned, true);
+  assert.equal(parsed.fabrics.length, 2);
+  assert.deepEqual(parsed.fabrics[0], first.fabric);
+  assert.deepEqual(parsed.fabric, parsed.fabrics[1]);
+  assert.equal(parsed.fabric.vendorId, "0x1384");
+
+  const legacyState = parseOnboardingText(
+    "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
+    { fabric: first.fabric },
+  );
+  assert.deepEqual(legacyState.fabric, first.fabric);
+  assert.deepEqual(legacyState.fabrics, [first.fabric]);
+});
+
 test("serial parser returns commissioned before later QR lines", async () => {
   const readable = textStream([
+    "I chip[FP]: Fabric index 0x1 was retrieved from storage. Compressed FabricId 0xBB, " +
+      "FabricId 0x0000000000000041, NodeId 0x0000000000000098, VendorId 0x1349",
     "I chip[FP]: Fabric index 0x2 was retrieved from storage. Compressed FabricId 0xAA, " +
       "FabricId 0x0000000000000042, NodeId 0x0000000000000099, VendorId 0xFFF1",
     "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
@@ -337,9 +365,45 @@ test("serial parser returns commissioned before later QR lines", async () => {
       nodeId: "0x0000000000000099",
       vendorId: "0xFFF1",
     },
+    fabrics: [
+      {
+        fabricIndex: "0x1",
+        fabricId: "0x0000000000000041",
+        nodeId: "0x0000000000000098",
+        vendorId: "0x1349",
+      },
+      {
+        fabricIndex: "0x2",
+        fabricId: "0x0000000000000042",
+        nodeId: "0x0000000000000099",
+        vendorId: "0xFFF1",
+      },
+    ],
     source: "boot",
   });
   assert.equal(readable.locked, false);
+});
+
+test("serial parser does not retain a vendor ID from a partial line", async () => {
+  const readable = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(
+        "I chip[FP]: Fabric index 0x1 was retrieved from storage. Compressed FabricId 0xAA, " +
+        "FabricId 0x10, NodeId 0x20, VendorId 0x13",
+      ));
+      controller.enqueue(new TextEncoder().encode(
+        "49\nI chip[SVR]: Fabric already commissioned. Disabling BLE advertisement\n",
+      ));
+      controller.close();
+    },
+  });
+  const result = await parseMatterOnboardingCodes(
+    { readable },
+    { timeoutMs: 100, requestReset: false },
+  );
+
+  assert.equal(result.fabrics.length, 1);
+  assert.equal(result.fabrics[0].vendorId, "0x1349");
 });
 
 test("serial parser returns success and no raw log", async () => {
@@ -474,7 +538,7 @@ test("success is the only state that sends pairing data", () => {
   assert.equal(completed.installMode, "factory");
 });
 
-test("commissioned state replaces pairing codes and shows raw fabric values", () => {
+test("commissioned state accepts one fabric and shows its raw values", () => {
   const { flow, elements } = fakeFlow();
   flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
   flow.showCommissioned({
@@ -488,11 +552,35 @@ test("commissioned state replaces pairing codes and shows raw fabric values", ()
   assert.equal(elements.pairingCodes.hidden, true);
   assert.equal(elements.commissioned.hidden, false);
   assert.equal(elements.fabricDetails.hidden, false);
-  assert.equal(elements.fabricIndex.textContent, "0x1");
-  assert.equal(elements.fabricId.textContent, "0x0000000000000001");
-  assert.equal(elements.nodeId.textContent, "0x0000000000000002");
-  assert.equal(elements.vendorId.textContent, "0xFFF1");
+  assert.match(elements.commissionedGuidance.innerHTML, /Other Matter service/);
+  assert.match(elements.fabricList.innerHTML, /0x0000000000000001/);
+  assert.match(elements.fabricList.innerHTML, /0x0000000000000002/);
+  assert.match(elements.fabricList.innerHTML, /0xFFF1/);
   assert.deepEqual(flow.getCurrent().mt, null);
+});
+
+test("commissioned guidance maps services and combines Apple instructions", () => {
+  const { flow, elements } = fakeFlow();
+  flow.showCommissioned([
+    { fabricIndex: "0x1", fabricId: "0x10", nodeId: "0x20", vendorId: "0x1349" },
+    { fabricIndex: "0x2", fabricId: "0x11", nodeId: "0x21", vendorId: "0x1384" },
+    { fabricIndex: "0x3", fabricId: "0x12", nodeId: "0x22", vendorId: "0x6006" },
+    { fabricIndex: "0x4", fabricId: "0x13", nodeId: "0x23", vendorId: "0x134B" },
+    { fabricIndex: "0x5", fabricId: "0x14", nodeId: "0x24", vendorId: "0xABCD" },
+  ]);
+
+  const guidance = elements.commissionedGuidance.innerHTML;
+  assert.equal((guidance.match(/Turn On Pairing Mode/g) || []).length, 1);
+  assert.match(guidance, /Apple Home and Apple Keychain/);
+  assert.match(guidance, /Google LLC/);
+  assert.match(guidance, /Home Assistant \(Open Home Foundation\)/);
+  assert.match(guidance, /Settings &gt; Matter &gt; Add device/);
+  assert.match(guidance, /Yes, it is already in use/);
+  assert.match(guidance, /Other Matter service/);
+  assert.match(guidance, /0xABCD/);
+  assert.equal((elements.fabricList.innerHTML.match(/class="fabric-record"/g) || []).length, 5);
+  assert.match(elements.fabricList.innerHTML, /0x1349/);
+  assert.match(elements.fabricList.innerHTML, /0x1384/);
 });
 
 test("installer buttons force safe erase modes", () => {
@@ -769,7 +857,7 @@ test("live commissioned marker keeps later boot QR lines hidden", async () => {
 
   assert.equal(elements.commissioned.hidden, false);
   assert.equal(elements.pairingCodes.hidden, true);
-  assert.equal(elements.fabricId.textContent, "0x0000000000000001");
+  assert.match(elements.fabricList.innerHTML, /0x0000000000000001/);
   assert.equal(flow.getCurrent().mt, null);
   assert.equal(monitorElements.status.textContent, "Connected. Device is already commissioned.");
   await monitor.destroy();
@@ -1043,6 +1131,7 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
   assert.match(html, /id="serial-copy">Copy logs<\/button>/);
   assert.match(html, /<h2>Already commissioned<\/h2>/);
+  assert.match(html, /<summary>Technical details<\/summary>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
   assert.match(html, /use Factory install\s+if the device was deleted from that controller/);
 });

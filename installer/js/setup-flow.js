@@ -7,6 +7,93 @@ const FAILURE_MESSAGES = {
   "serial-failure": "The flash finished, but the serial read failed. Reconnect the device and run Install again.",
 };
 
+const SERVICE_BY_VENDOR = new Map([
+  [0x1349, { key: "apple", name: "Apple Home" }],
+  [0x1384, { key: "apple", name: "Apple Keychain" }],
+  [0x6006, { key: "google", name: "Google LLC" }],
+  [0x134B, { key: "home-assistant", name: "Home Assistant (Open Home Foundation)" }],
+]);
+
+function serviceForVendor(vendorId) {
+  if (!/^0x[0-9a-f]+$/i.test(String(vendorId))) return null;
+  return SERVICE_BY_VENDOR.get(Number.parseInt(vendorId, 16)) || null;
+}
+
+function uniqueValues(values) {
+  return [...new Set(values)];
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderCommissionedGuidance(fabrics) {
+  const services = fabrics.map((fabric) => ({
+    fabric,
+    service: serviceForVendor(fabric.vendorId),
+  }));
+  const blocks = [];
+  const appleNames = uniqueValues(services
+    .filter(({ service }) => service?.key === "apple")
+    .map(({ service }) => service.name));
+
+  if (appleNames.length) {
+    blocks.push(`<section class="service-guidance"><h3>${appleNames.join(" and ")}</h3>
+      <ol>
+        <li>Open the lock in the <strong>Home</strong> app.</li>
+        <li>Open its settings and select <strong>Turn On Pairing Mode</strong>.</li>
+        <li>Copy the new pairing code. Enter it in the app that you want to add.</li>
+      </ol></section>`);
+  }
+  if (services.some(({ service }) => service?.key === "google")) {
+    blocks.push(`<section class="service-guidance"><h3>Google LLC</h3>
+      <ol>
+        <li>Open the lock in the <strong>Google Home</strong> app.</li>
+        <li>Open <strong>Settings</strong>, then <strong>Linked Matter apps and services</strong>.</li>
+        <li>Select <strong>Link apps and services</strong>, then follow the app.</li>
+      </ol></section>`);
+  }
+  if (services.some(({ service }) => service?.key === "home-assistant")) {
+    blocks.push(`<section class="service-guidance"><h3>Home Assistant (Open Home Foundation)</h3>
+      <ol>
+        <li>Open the Home Assistant Companion app.</li>
+        <li>Go to <strong>Settings &gt; Matter &gt; Add device</strong>.</li>
+        <li>Select <strong>Yes, it is already in use</strong>, then follow the app.</li>
+      </ol></section>`);
+  }
+
+  const unknownVendors = uniqueValues(services
+    .filter(({ service }) => !service)
+    .map(({ fabric }) => fabric.vendorId));
+  if (unknownVendors.length || !fabrics.length) {
+    const vendorText = unknownVendors.length
+      ? `<p>Other Matter service vendor IDs: <code>${unknownVendors.map(escapeHtml).join("</code>, <code>")}</code>.</p>`
+      : "";
+    blocks.push(`<section class="service-guidance"><h3>Other Matter service</h3>
+      ${vendorText}
+      <p>Open the app that added this device. Use its option to share or add an
+        already commissioned Matter device, then follow the app.</p></section>`);
+  }
+  return blocks.join("");
+}
+
+function renderFabricDetails(fabrics) {
+  return fabrics.map((fabric, index) => `<section class="fabric-record">
+    <h3>Fabric ${index + 1}</h3>
+    <dl class="fabric-details">
+      <dt>Fabric index</dt><dd><code>${escapeHtml(fabric.fabricIndex)}</code></dd>
+      <dt>Fabric ID</dt><dd><code>${escapeHtml(fabric.fabricId)}</code></dd>
+      <dt>Node ID</dt><dd><code>${escapeHtml(fabric.nodeId)}</code></dd>
+      <dt>Vendor ID</dt><dd><code>${escapeHtml(fabric.vendorId)}</code></dd>
+    </dl>
+  </section>`).join("");
+}
+
 export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPairing, installMode = "factory" }) {
   let currentMT = null;
   let currentManual = null;
@@ -26,10 +113,8 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     elements.pairingCodes.hidden = false;
     elements.commissioned.hidden = true;
     elements.fabricDetails.hidden = true;
-    elements.fabricIndex.textContent = "";
-    elements.fabricId.textContent = "";
-    elements.nodeId.textContent = "";
-    elements.vendorId.textContent = "";
+    elements.commissionedGuidance.innerHTML = "";
+    elements.fabricList.innerHTML = "";
     elements.pairing.classList.remove("visible");
     elements.pairing.setAttribute("aria-hidden", "true");
   }
@@ -68,16 +153,17 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     return true;
   }
 
-  function showCommissioned(fabric = null, options = {}) {
+  function showCommissioned(fabricOrFabrics = null, options = {}) {
     hidePairing();
+    const fabrics = Array.isArray(fabricOrFabrics)
+      ? fabricOrFabrics
+      : (fabricOrFabrics ? [fabricOrFabrics] : []);
     elements.pairingCodes.hidden = true;
     elements.commissioned.hidden = false;
-    if (fabric) {
+    elements.commissionedGuidance.innerHTML = renderCommissionedGuidance(fabrics);
+    if (fabrics.length) {
       elements.fabricDetails.hidden = false;
-      elements.fabricIndex.textContent = fabric.fabricIndex;
-      elements.fabricId.textContent = fabric.fabricId;
-      elements.nodeId.textContent = fabric.nodeId;
-      elements.vendorId.textContent = fabric.vendorId;
+      elements.fabricList.innerHTML = renderFabricDetails(fabrics);
     }
     elements.pairing.classList.add("visible");
     elements.pairing.setAttribute("aria-hidden", "false");
@@ -92,7 +178,7 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     abortController = null;
     if (result?.ok && result.kind === "commissioned") {
       elements.retry.hidden = true;
-      showCommissioned(result.fabric);
+      showCommissioned(result.fabrics?.length ? result.fabrics : result.fabric);
       dispatch("install-commissioned", { installMode: currentInstallMode });
       return true;
     }
