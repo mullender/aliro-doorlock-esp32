@@ -12,11 +12,13 @@ function monitorElements() {
   const root = document.createElement("div");
   root.innerHTML = `
     <button id="connect"></button><button id="reset"></button>
-    <button id="clear"></button><button id="disconnect"></button>
+    <button id="copy"></button><button id="clear"></button>
+    <button id="disconnect"></button>
     <div id="status"></div><pre id="log"></pre>`;
   return {
     connect: root.querySelector("#connect"),
     reset: root.querySelector("#reset"),
+    copy: root.querySelector("#copy"),
     clear: root.querySelector("#clear"),
     disconnect: root.querySelector("#disconnect"),
     status: root.querySelector("#status"),
@@ -64,6 +66,7 @@ export async function runSerialMonitorTests(container) {
     const port = serialPort();
     const elements = monitorElements();
     let found;
+    let copiedText;
     const monitor = createSerialMonitor({
       elements,
       setupFlow: {
@@ -73,6 +76,7 @@ export async function runSerialMonitorTests(container) {
         },
       },
       serial: new FakeSerial([port]),
+      clipboard: { writeText: async (text) => { copiedText = text; } },
       secureContext: true,
       resetPulseMs: 0,
     });
@@ -82,12 +86,15 @@ export async function runSerialMonitorTests(container) {
       "I (1110) chip[SVR]: Manual pairing code: [34970112332]\n",
     ));
     await nextTask();
+    elements.copy.click();
+    await nextTask();
     const released = await monitor.releaseForInstall();
     const ok = connected && released && found?.manualCode === "34970112332" &&
       found?.options.statusMessage === "Live serial setup codes are ready." &&
-      /SetupQRCode/.test(elements.log.textContent) && !port.readable.locked &&
+      copiedText === elements.log.textContent && /SetupQRCode/.test(copiedText) &&
+      !port.readable.locked &&
       port.closeCount === 1;
-    count(report(container, "live logs find setup codes and release before install", ok));
+    count(report(container, "live logs copy, find setup codes, and release before install", ok));
   }
 
   {

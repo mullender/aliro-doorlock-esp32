@@ -313,6 +313,7 @@
   <div class="serial-controls">
     <button type="button" id="serial-connect">Connect device</button>
     <button type="button" id="serial-reset" disabled>Reset device</button>
+    <button type="button" id="serial-copy">Copy logs</button>
     <button type="button" id="serial-clear">Clear</button>
     <button type="button" id="serial-disconnect" disabled>Disconnect</button>
   </div>
@@ -369,6 +370,7 @@ const serialMonitor = createSerialMonitor({
   elements: {
     connect: document.getElementById("serial-connect"),
     reset: document.getElementById("serial-reset"),
+    copy: document.getElementById("serial-copy"),
     clear: document.getElementById("serial-clear"),
     disconnect: document.getElementById("serial-disconnect"),
     status: document.getElementById("serial-status"),

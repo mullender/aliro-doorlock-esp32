@@ -97,6 +97,7 @@ function fakeMonitorElements() {
   return {
     connect: new FakeControl(),
     reset: new FakeControl(),
+    copy: new FakeControl(),
     clear: new FakeControl(),
     disconnect: new FakeControl(),
     status: new FakeControl(),
@@ -719,6 +720,31 @@ test("live serial monitor shows logs and sends valid codes through setup flow", 
     "Serial monitor disconnected for install. Click the install button again to continue.");
 });
 
+test("copy logs button writes the full current console text to the clipboard", async () => {
+  const serialPort = fakeSerialPort();
+  const elements = fakeMonitorElements();
+  let copiedText = null;
+  const monitor = createSerialMonitor({
+    elements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([serialPort]),
+    clipboard: {
+      async writeText(text) { copiedText = text; },
+    },
+    secureContext: true,
+  });
+  await monitor.connect();
+  serialPort.streamController.enqueue(new TextEncoder().encode("First line\n"));
+  serialPort.streamController.enqueue(new TextEncoder().encode("Second line\n"));
+  await nextTask();
+
+  elements.copy.click();
+  await nextTask();
+  assert.equal(copiedText, "First line\nSecond line\n");
+  assert.equal(elements.status.textContent, "Live logs copied to the clipboard.");
+  await monitor.destroy();
+});
+
 test("live commissioned marker keeps later boot QR lines hidden", async () => {
   const serialPort = fakeSerialPort();
   const monitorElements = fakeMonitorElements();
@@ -1005,6 +1031,7 @@ test("installer page includes all live monitor controls", () => {
   for (const id of [
     "serial-connect",
     "serial-reset",
+    "serial-copy",
     "serial-clear",
     "serial-disconnect",
     "serial-status",
@@ -1014,6 +1041,7 @@ test("installer page includes all live monitor controls", () => {
   }
   assert.match(html, /id="serial-connect">Connect device<\/button>/);
   assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
+  assert.match(html, /id="serial-copy">Copy logs<\/button>/);
   assert.match(html, /<h2>Already commissioned<\/h2>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
   assert.match(html, /use Factory install\s+if the device was deleted from that controller/);
