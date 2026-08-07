@@ -28,6 +28,13 @@
     .update-card button[slot="activate"] { color: #fff; background: var(--accent); }
     .danger-card button[slot="activate"] { color: #fff; background: #a11; }
     .browser-note { color: var(--muted); font-size: 0.9em; text-align: center; margin-top: 0.3rem; }
+    .serial-card { margin: 1.5rem 0; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: 6px; }
+    .serial-card h2 { margin-top: 0; }
+    .serial-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+    .serial-controls button { font: inherit; padding: 0.45rem 0.9rem; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 4px; cursor: pointer; }
+    .serial-controls button:disabled { cursor: default; opacity: 0.55; }
+    .serial-status { min-height: 1.5em; color: var(--muted); }
+    .serial-log { box-sizing: border-box; width: 100%; height: 15rem; margin: 0.5rem 0 0; padding: 0.75rem; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: rgba(128,128,128,0.08); white-space: pre-wrap; overflow-wrap: anywhere; }
     .setup-result { margin: 0.75rem auto 1.5rem; max-width: 42rem; text-align: center; }
     .setup-status { min-height: 1.5em; color: var(--muted); }
     .setup-result button { font: inherit; margin: 0.35rem; padding: 0.4rem 0.85rem; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 4px; cursor: pointer; }
@@ -66,7 +73,7 @@
     /* Print: hide install row, keep pairing */
     @media print {
       body { background: white; color: black; }
-      .install-row, .setup-result, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
+      .install-row, .setup-result, .serial-card, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
       .pairing { display: block !important; border: none; padding: 0; }
       .qr-box { border: none; }
     }
@@ -93,6 +100,23 @@
     ZBT-1 / ZBT-2, Apple HomePod, or Google Nest Hub 2nd gen).</li>
   <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
 </ul>
+
+<section class="serial-card" aria-labelledby="serial-heading">
+  <h2 id="serial-heading">Live serial monitor</h2>
+  <p>
+    Connect to view local device logs before or after an install. If the log
+    contains valid Matter setup codes, this page shows the pairing QR panel.
+    Log data stays in this browser page.
+  </p>
+  <div class="serial-controls">
+    <button type="button" id="serial-connect">Connect device</button>
+    <button type="button" id="serial-reset" disabled>Reset device</button>
+    <button type="button" id="serial-clear">Clear</button>
+    <button type="button" id="serial-disconnect" disabled>Disconnect</button>
+  </div>
+  <div class="serial-status" id="serial-status" role="status" aria-live="polite"></div>
+  <pre class="serial-log mono" id="serial-log" tabindex="0" aria-label="Live serial log"></pre>
+</section>
 
 <section class="install-card update-card" aria-labelledby="update-heading">
   <h2 id="update-heading">Update firmware — keep setup</h2>
@@ -293,6 +317,7 @@
 import { renderMTasSVG } from "./js/qr-render.js";
 import { createSetupFlow } from "./js/setup-flow.js";
 import { configureInstallButtons } from "./js/install-controller.js";
+import { createSerialMonitor } from "./js/serial-monitor.js";
 
 const pairingEl = document.getElementById("pairing");
 const qrEl = document.getElementById("qr");
@@ -315,6 +340,17 @@ const setupFlow = createSetupFlow({
   renderQRCode: renderMTasSVG,
   eventTarget: factoryButton,
   scrollPairing: () => pairingEl.scrollIntoView({ behavior: "smooth", block: "start" }),
+});
+const serialMonitor = createSerialMonitor({
+  elements: {
+    connect: document.getElementById("serial-connect"),
+    reset: document.getElementById("serial-reset"),
+    clear: document.getElementById("serial-clear"),
+    disconnect: document.getElementById("serial-disconnect"),
+    status: document.getElementById("serial-status"),
+    log: document.getElementById("serial-log"),
+  },
+  setupFlow,
 });
 
 document.getElementById("cancel-code-read").addEventListener("click", () => setupFlow.cancel());
@@ -355,8 +391,10 @@ tabs.forEach(t => t.addEventListener("click", () => {
 }));
 
 customElements.whenDefined("esp-web-install-button").then(() => {
-  configureInstallButtons({ factoryButton, updateButton, setupFlow });
+  configureInstallButtons({ factoryButton, updateButton, setupFlow, serialMonitor });
 });
+
+window.addEventListener("pagehide", () => { void serialMonitor.destroy(); }, { once: true });
 
 // Dev mode: ?dev=1 shows the shared example payload without flashing.
 // Useful for reviewing the UI and testing pairing flow with a bench device

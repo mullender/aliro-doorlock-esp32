@@ -43,6 +43,9 @@
 <h2>Setup flow state</h2>
 <div id="setup-flow"></div>
 
+<h2>Live serial monitor</h2>
+<div id="serial-monitor"></div>
+
 <h2>QR preview (positive vectors)</h2>
 <div id="qr-previews"></div>
 
@@ -53,6 +56,7 @@ import { renderMTasSVG } from "../js/qr-render.js";
 import { BASE38_VECTORS, INVALID_BASE38_VECTORS, VECTORS, NEGATIVE_VECTORS } from "./test-vectors.js";
 import { runBootParserTests } from "./boot-parser-tests.js";
 import { runSetupFlowTests } from "./setup-flow-tests.js";
+import { runSerialMonitorTests } from "./serial-monitor-tests.js";
 
 let pass = 0, fail = 0;
 
@@ -151,6 +155,11 @@ const sfEl = document.getElementById("setup-flow");
 const sf = await runSetupFlowTests(sfEl);
 pass += sf.pass;
 fail += sf.fail;
+
+const smEl = document.getElementById("serial-monitor");
+const sm = await runSerialMonitorTests(smEl);
+pass += sm.pass;
+fail += sm.fail;
 
 // Final summary
 const s = document.getElementById("summary");

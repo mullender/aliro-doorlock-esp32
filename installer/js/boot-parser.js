@@ -84,6 +84,8 @@ async function requestDeviceReset(port, pulseMs = 100) {
   return true;
 }
 
+export const resetSerialDevice = requestDeviceReset;
+
 async function requestCodeReemit(port) {
   if (!port.writable) return false;
   const writer = port.writable.getWriter();

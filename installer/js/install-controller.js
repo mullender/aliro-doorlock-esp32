@@ -17,12 +17,30 @@ function enableButton(button, activator) {
   button.removeAttribute("inert");
 }
 
+function guardInstallClick(activator, serialMonitor) {
+  if (!serialMonitor) return;
+  let releasing = false;
+  activator.addEventListener("click", (event) => {
+    if (!serialMonitor.isActive()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (releasing) return;
+    releasing = true;
+    activator.disabled = true;
+    void serialMonitor.releaseForInstall().catch(() => false).finally(() => {
+      releasing = false;
+      activator.disabled = false;
+    });
+  }, { capture: true });
+}
+
 export function configureInstallButtons({
   factoryButton,
   updateButton,
   setupFlow,
   parseCodes = parseMatterOnboardingCodes,
   logger = console,
+  serialMonitor,
 }) {
   const factoryActivator = prepareButton(factoryButton, true);
   const updateActivator = prepareButton(updateButton, false);
@@ -62,6 +80,8 @@ export function configureInstallButtons({
 
   updateButton.onPostFlash = async () => {};
 
+  guardInstallClick(factoryActivator, serialMonitor);
+  guardInstallClick(updateActivator, serialMonitor);
   enableButton(factoryButton, factoryActivator);
   enableButton(updateButton, updateActivator);
 }

@@ -38,7 +38,7 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     return abortController.signal;
   }
 
-  function showPairing(mt, manualCode) {
+  function showPairing(mt, manualCode, options = {}) {
     hidePairing();
     const validation = validatePair(mt, manualCode);
     if (!validation.valid) return false;
@@ -55,7 +55,8 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     elements.manual.textContent = manualCode.replace(/(\d{4})(\d{4})(\d{3})/, "$1-$2-$3");
     elements.pairing.classList.add("visible");
     elements.pairing.setAttribute("aria-hidden", "false");
-    elements.status.textContent = "Flash complete. The Matter setup codes are ready.";
+    elements.status.textContent = options.statusMessage ||
+      "Flash complete. The Matter setup codes are ready.";
     scrollPairing?.();
     return true;
   }
