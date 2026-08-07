@@ -59,6 +59,7 @@ The monitor has these controls:
 
 - **Connect device** asks for serial-port permission and starts one reader.
 - **Reset device** sends the ESP reset signal and keeps the reader active.
+- **Copy logs** copies all current console text to the clipboard.
 - **Clear** removes the displayed log. It does not change the device.
 - **Disconnect** stops the reader, releases its lock, and closes the port.
 

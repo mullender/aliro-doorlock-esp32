@@ -97,6 +97,7 @@ function fakeMonitorElements() {
   return {
     connect: new FakeControl(),
     reset: new FakeControl(),
+    copy: new FakeControl(),
     clear: new FakeControl(),
     disconnect: new FakeControl(),
     status: new FakeControl(),
@@ -195,6 +196,13 @@ function fakeFlow() {
     qr: fakeElement(),
     qrCaption: fakeElement(),
     manual: fakeElement(),
+    pairingCodes: fakeElement(),
+    commissioned: fakeElement(),
+    fabricDetails: fakeElement(),
+    fabricIndex: fakeElement(),
+    fabricId: fakeElement(),
+    nodeId: fakeElement(),
+    vendorId: fakeElement(),
     status: fakeElement(),
     cancel: fakeElement(),
     retry: fakeElement(),
@@ -283,6 +291,55 @@ test("boot fixtures use the production parser", () => {
       assert.deepEqual(result, fixture.expect, fixture.label);
     }
   }
+});
+
+test("boot parser requires the commissioned marker and keeps raw fabric values", () => {
+  const fabricLine = "I (773) chip[FP]: Fabric index 0x1 was retrieved from storage. " +
+    "Compressed FabricId 0x992322CA0AB8BB0A, FabricId 0x0000000000000001, " +
+    "NodeId 0x0000000000000001, VendorId 0xFFF1";
+  const detailsOnly = parseOnboardingText(fabricLine);
+  assert.equal(detailsOnly.commissioned, undefined);
+  assert.deepEqual(detailsOnly.fabric, {
+    fabricIndex: "0x1",
+    fabricId: "0x0000000000000001",
+    nodeId: "0x0000000000000001",
+    vendorId: "0xFFF1",
+  });
+
+  const commissioned = parseOnboardingText(
+    `${fabricLine}\nI (843) chip[SVR]: Fabric already commissioned. Disabling BLE advertisement`,
+  );
+  assert.equal(commissioned.commissioned, true);
+  assert.deepEqual(commissioned.fabric, detailsOnly.fabric);
+
+  const similarText = parseOnboardingText("I chip[SVR]: Fabric is already commissioned");
+  assert.equal(similarText.commissioned, undefined);
+});
+
+test("serial parser returns commissioned before later QR lines", async () => {
+  const readable = textStream([
+    "I chip[FP]: Fabric index 0x2 was retrieved from storage. Compressed FabricId 0xAA, " +
+      "FabricId 0x0000000000000042, NodeId 0x0000000000000099, VendorId 0xFFF1",
+    "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
+    "I chip[SVR]: Manual pairing code: [34970112332]",
+  ].join("\n"));
+  const result = await parseMatterOnboardingCodes(
+    { readable },
+    { timeoutMs: 100, requestReset: false },
+  );
+  assert.deepEqual(result, {
+    ok: true,
+    kind: "commissioned",
+    fabric: {
+      fabricIndex: "0x2",
+      fabricId: "0x0000000000000042",
+      nodeId: "0x0000000000000099",
+      vendorId: "0xFFF1",
+    },
+    source: "boot",
+  });
+  assert.equal(readable.locked, false);
 });
 
 test("serial parser returns success and no raw log", async () => {
@@ -415,6 +472,27 @@ test("success is the only state that sends pairing data", () => {
   }), true);
   assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
   assert.equal(completed.installMode, "factory");
+});
+
+test("commissioned state replaces pairing codes and shows raw fabric values", () => {
+  const { flow, elements } = fakeFlow();
+  flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
+  flow.showCommissioned({
+    fabricIndex: "0x1",
+    fabricId: "0x0000000000000001",
+    nodeId: "0x0000000000000002",
+    vendorId: "0xFFF1",
+  });
+
+  assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
+  assert.equal(elements.pairingCodes.hidden, true);
+  assert.equal(elements.commissioned.hidden, false);
+  assert.equal(elements.fabricDetails.hidden, false);
+  assert.equal(elements.fabricIndex.textContent, "0x1");
+  assert.equal(elements.fabricId.textContent, "0x0000000000000001");
+  assert.equal(elements.nodeId.textContent, "0x0000000000000002");
+  assert.equal(elements.vendorId.textContent, "0xFFF1");
+  assert.deepEqual(flow.getCurrent().mt, null);
 });
 
 test("installer buttons force safe erase modes", () => {
@@ -640,6 +718,61 @@ test("live serial monitor shows logs and sends valid codes through setup flow", 
   assert.equal(monitor.isActive(), false);
   assert.equal(monitorElements.status.textContent,
     "Serial monitor disconnected for install. Click the install button again to continue.");
+});
+
+test("copy logs button writes the full current console text to the clipboard", async () => {
+  const serialPort = fakeSerialPort();
+  const elements = fakeMonitorElements();
+  let copiedText = null;
+  const monitor = createSerialMonitor({
+    elements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([serialPort]),
+    clipboard: {
+      async writeText(text) { copiedText = text; },
+    },
+    secureContext: true,
+  });
+  await monitor.connect();
+  serialPort.streamController.enqueue(new TextEncoder().encode("First line\n"));
+  serialPort.streamController.enqueue(new TextEncoder().encode("Second line\n"));
+  await nextTask();
+
+  elements.copy.click();
+  await nextTask();
+  assert.equal(copiedText, "First line\nSecond line\n");
+  assert.equal(elements.status.textContent, "Live logs copied to the clipboard.");
+  await monitor.destroy();
+});
+
+test("live commissioned marker keeps later boot QR lines hidden", async () => {
+  const serialPort = fakeSerialPort();
+  const monitorElements = fakeMonitorElements();
+  const { flow, elements } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial: new FakeSerial([serialPort]),
+    secureContext: true,
+  });
+  await monitor.connect();
+
+  serialPort.streamController.enqueue(new TextEncoder().encode([
+    "I chip[FP]: Fabric index 0x1 was retrieved from storage. Compressed FabricId 0xAA, " +
+      "FabricId 0x0000000000000001, NodeId 0x0000000000000002, VendorId 0xFFF1",
+    "I chip[SVR]: Fabric already commissioned. Disabling BLE advertisement",
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]",
+    "I chip[SVR]: Manual pairing code: [34970112332]",
+    "",
+  ].join("\n")));
+  await nextTask();
+
+  assert.equal(elements.commissioned.hidden, false);
+  assert.equal(elements.pairingCodes.hidden, true);
+  assert.equal(elements.fabricId.textContent, "0x0000000000000001");
+  assert.equal(flow.getCurrent().mt, null);
+  assert.equal(monitorElements.status.textContent, "Connected. Device is already commissioned.");
+  await monitor.destroy();
 });
 
 test("clear allows the same setup-code pair to be shown again", async () => {
@@ -898,6 +1031,7 @@ test("installer page includes all live monitor controls", () => {
   for (const id of [
     "serial-connect",
     "serial-reset",
+    "serial-copy",
     "serial-clear",
     "serial-disconnect",
     "serial-status",
@@ -907,4 +1041,8 @@ test("installer page includes all live monitor controls", () => {
   }
   assert.match(html, /id="serial-connect">Connect device<\/button>/);
   assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
+  assert.match(html, /id="serial-copy">Copy logs<\/button>/);
+  assert.match(html, /<h2>Already commissioned<\/h2>/);
+  assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
+  assert.match(html, /use Factory install\s+if the device was deleted from that controller/);
 });

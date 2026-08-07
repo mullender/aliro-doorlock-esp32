@@ -17,6 +17,7 @@ export function createSerialMonitor({
   elements,
   setupFlow,
   serial = globalThis.navigator?.serial,
+  clipboard = globalThis.navigator?.clipboard,
   secureContext = globalThis.isSecureContext === true,
   baudRate = DEFAULT_BAUD_RATE,
   bufferSize = DEFAULT_BUFFER_SIZE,
@@ -36,6 +37,7 @@ export function createSerialMonitor({
   let parseBuffer = "";
   let codeState = { mt: null, manualCode: null };
   let lastPair = null;
+  let lastCommissioned = null;
 
   function setStatus(message) {
     elements.status.textContent = message;
@@ -46,6 +48,7 @@ export function createSerialMonitor({
     elements.connect.disabled = !supported || state !== "idle";
     elements.reset.disabled = state !== "connected";
     elements.disconnect.disabled = !["connected", "blocked"].includes(state);
+    elements.copy.disabled = destroyed;
     elements.clear.disabled = destroyed;
   }
 
@@ -64,6 +67,17 @@ export function createSerialMonitor({
   }
 
   function handleCodeState() {
+    if (codeState.commissioned) {
+      const stateKey = JSON.stringify(codeState.fabric || {});
+      if (stateKey !== lastCommissioned) {
+        setupFlow.showCommissioned(codeState.fabric || null, {
+          statusMessage: "Live serial log shows that this device is already commissioned.",
+        });
+        lastCommissioned = stateKey;
+        setStatus("Connected. Device is already commissioned.");
+      }
+      return;
+    }
     if (!codeState.mt || !codeState.manualCode) return;
     const pairKey = `${codeState.mt}\n${codeState.manualCode}`;
     if (pairKey !== lastPair) {
@@ -77,7 +91,11 @@ export function createSerialMonitor({
         setStatus("Connected, but the live setup codes are invalid or do not match.");
       }
     }
-    codeState = { mt: null, manualCode: null };
+    codeState = {
+      mt: null,
+      manualCode: null,
+      ...(codeState.fabric ? { fabric: codeState.fabric } : {}),
+    };
   }
 
   function parseCompleteLines(text, flush = false) {
@@ -217,6 +235,7 @@ export function createSerialMonitor({
     parseBuffer = "";
     codeState = { mt: null, manualCode: null };
     lastPair = null;
+    lastCommissioned = null;
     port = selectedPort;
     reader = selectedReader;
     setControls("connected");
@@ -319,7 +338,28 @@ export function createSerialMonitor({
     parseBuffer = "";
     codeState = { mt: null, manualCode: null };
     lastPair = null;
+    lastCommissioned = null;
     setStatus(port ? "Live log cleared. The serial monitor is connected." : "Live log cleared.");
+  }
+
+  async function copy() {
+    const text = elements.log.textContent;
+    if (!text) {
+      setStatus("There are no live logs to copy.");
+      return false;
+    }
+    if (!clipboard?.writeText) {
+      setStatus("Clipboard access is not available. Select the log and copy it manually.");
+      return false;
+    }
+    try {
+      await clipboard.writeText(text);
+      setStatus("Live logs copied to the clipboard.");
+      return true;
+    } catch {
+      setStatus("The live logs could not be copied. Select the log and copy it manually.");
+      return false;
+    }
   }
 
   function isActive() {
@@ -338,6 +378,7 @@ export function createSerialMonitor({
 
   const onConnect = () => { void connect(); };
   const onReset = () => { void reset(); };
+  const onCopy = () => { void copy(); };
   const onClear = () => clear();
   const onDisconnect = () => { void disconnect(); };
   const onPortDisconnect = (event) => {
@@ -349,6 +390,7 @@ export function createSerialMonitor({
 
   elements.connect.addEventListener("click", onConnect);
   elements.reset.addEventListener("click", onReset);
+  elements.copy.addEventListener("click", onCopy);
   elements.clear.addEventListener("click", onClear);
   elements.disconnect.addEventListener("click", onDisconnect);
   serial?.addEventListener?.("disconnect", onPortDisconnect);
@@ -370,6 +412,7 @@ export function createSerialMonitor({
     destroyed = true;
     elements.connect.removeEventListener("click", onConnect);
     elements.reset.removeEventListener("click", onReset);
+    elements.copy.removeEventListener("click", onCopy);
     elements.clear.removeEventListener("click", onClear);
     elements.disconnect.removeEventListener("click", onDisconnect);
     serial?.removeEventListener?.("disconnect", onPortDisconnect);

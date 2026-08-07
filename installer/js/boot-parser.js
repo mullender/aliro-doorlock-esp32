@@ -2,6 +2,8 @@ import { validatePair } from "./matter-payload.js";
 
 const RE_MT = /(?:CHIP\s*(?:\[\s*SVR\s*\]|:\s*SVR)|CH\s*:\s*SVR|CH\s*:)[^\n\r]*SetupQRCode\s*:\s*\[?(MT:[0-9A-Z\-.]{16,128})\]?/i;
 const RE_MANUAL = /(?:CHIP\s*(?:\[\s*SVR\s*\]|:\s*SVR)|CH\s*:\s*SVR|CH\s*:)[^\n\r]*Manual pairing code\s*:\s*\[?(\d{11})\]?/i;
+const RE_FABRIC = /Fabric index\s+(0x[0-9A-F]+)[^\n\r]*\bFabricId\s+(0x[0-9A-F]+)[^\n\r]*\bNodeId\s+(0x[0-9A-F]+)[^\n\r]*\bVendorId\s+(0x[0-9A-F]+)/i;
+const COMMISSIONED_MARKER = "Fabric already commissioned";
 const RE_ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_REEMIT_TIMEOUT_MS = 5000;
@@ -11,16 +13,35 @@ export function parseOnboardingText(text, previous = {}) {
     mt: previous.mt || null,
     manualCode: previous.manualCode || null,
   };
+  if (previous.fabric) state.fabric = previous.fabric;
+  if (previous.commissioned) state.commissioned = true;
   const cleaned = String(text).replace(RE_ANSI, "");
   for (const line of cleaned.split(/\r?\n/)) {
     if (!state.mt) state.mt = line.match(RE_MT)?.[1] || null;
     if (!state.manualCode) state.manualCode = line.match(RE_MANUAL)?.[1] || null;
-    if (state.mt && state.manualCode) break;
+    const fabric = line.match(RE_FABRIC);
+    if (fabric) {
+      state.fabric = {
+        fabricIndex: fabric[1],
+        fabricId: fabric[2],
+        nodeId: fabric[3],
+        vendorId: fabric[4],
+      };
+    }
+    if (line.includes(COMMISSIONED_MARKER)) state.commissioned = true;
   }
   return state;
 }
 
 function outcomeFromState(state, source) {
+  if (state.commissioned) {
+    return {
+      ok: true,
+      kind: "commissioned",
+      fabric: state.fabric || null,
+      source,
+    };
+  }
   if (!state.mt || !state.manualCode) return null;
   const validation = validatePair(state.mt, state.manualCode);
   if (!validation.valid) {
@@ -203,6 +224,8 @@ export async function parseMatterOnboardingCodes(port, opts = {}) {
 export const __internals = {
   RE_MT,
   RE_MANUAL,
+  RE_FABRIC,
+  COMMISSIONED_MARKER,
   RE_ANSI,
   requestDeviceReset,
   requestCodeReemit,
