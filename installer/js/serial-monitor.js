@@ -246,6 +246,7 @@ export function createSerialMonitor({
     setStatus("Connected. Live logs stay in this browser page.");
     const targetSession = session;
     readTask = readLoop(selectedPort, selectedReader, targetSession);
+    await reset();
     return true;
   }
 
@@ -319,12 +320,12 @@ export function createSerialMonitor({
     try {
       const supported = await resetSerialDevice(port, resetPulseMs);
       setStatus(supported
-        ? "Device reset requested. Reading the new boot log."
-        : "This serial port does not support a reset signal.");
+        ? "Connected. The lock restarted. Reading its boot status."
+        : "Connected, but this serial port cannot restart the lock.");
       return supported;
     } catch (error) {
       logger.error("[serial-monitor] The device reset failed.", error);
-      setStatus(`The device reset failed: ${errorMessage(error)}`);
+      setStatus(`Connected, but the lock did not restart: ${errorMessage(error)}`);
       return false;
     } finally {
       elements.reset.disabled = !port || !reader;
@@ -407,7 +408,7 @@ export function createSerialMonitor({
     setStatus("Web Serial requires HTTPS or localhost.");
   } else {
     setControls("idle");
-    setStatus("Connect a device to view live logs.");
+    setStatus("Connect a device to read its status.");
     authorizedConnectTask = connectPreviouslyAuthorizedPort()
       .finally(() => { authorizedConnectTask = null; });
   }

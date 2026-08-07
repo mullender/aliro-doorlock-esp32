@@ -52,12 +52,15 @@ node --test installer/tests/node-tests.mjs
 The installer has a local Web Serial monitor. If the site has permission for
 exactly one serial port, the monitor connects to it automatically. Otherwise,
 select **Connect device**, then select the device USB port. The monitor opens
-the port at 115200 baud and shows the live log in the page. The page does not
-upload or persist the log. The page never opens the port picker automatically.
+the port at 115200 baud, starts its reader, and restarts the lock once. The
+restart lets the page capture the boot status, pairing codes, and all Matter
+fabrics. The page does not upload or persist the log. The page never opens the
+port picker automatically.
 
 The monitor has these controls:
 
-- **Connect device** asks for serial-port permission and starts one reader.
+- **Connect device** asks for serial-port permission, starts one reader, and
+  restarts the lock once.
 - **Reset device** sends the ESP reset signal and keeps the reader active.
 - **Copy logs** copies all current console text to the clipboard.
 - **Clear** removes the displayed log. It does not change the device.
