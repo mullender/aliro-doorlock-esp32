@@ -1502,6 +1502,11 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
   assert.match(html, /id="serial-copy">Copy logs<\/button>/);
   assert.match(html, /<h2>Already commissioned<\/h2>/);
+  assert.match(html, /https:\/\/github\.com\/mullender\/aliro-doorlock-esp32/);
+  assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/m5stack-nanoc6-dev-kit/);
+  assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/nfc-universal-unit-st25r3916/);
+  assert.match(html, /About \$13 total/);
+  assert.match(html, /Google wallet key is not yet\s+verified/);
   assert.match(html, /<summary>Technical details<\/summary>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
   assert.match(html, /If no controllers remain,\s+follow the <a href="#decommission-heading">full reset guidance<\/a>/);

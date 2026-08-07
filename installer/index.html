@@ -35,6 +35,9 @@
     .serial-controls button:disabled { cursor: default; opacity: 0.55; }
     .serial-status { min-height: 1.5em; color: var(--muted); }
     .serial-log { box-sizing: border-box; width: 100%; height: 15rem; margin: 0.5rem 0 0; padding: 0.75rem; overflow: auto; border: 1px solid var(--line); border-radius: 4px; background: rgba(128,128,128,0.08); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .hardware-card { margin: 1.5rem 0; padding: 1rem 1.25rem; border: 2px solid var(--accent); border-radius: 6px; }
+    .hardware-card h2 { margin-top: 0; }
+    .hardware-total { color: var(--accent); font-size: 1.1em; font-weight: 700; }
     .success-state { color: var(--accent); font-weight: 700; }
     .settings-card { margin: 1rem 0 1.5rem; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: 6px; }
     .settings-card h2 { margin-top: 0; }
@@ -117,6 +120,36 @@
   USB, then commission it into Apple Home, Google Home, or Home Assistant
   as a Matter door-lock over Thread.
 </p>
+
+<section class="hardware-card" aria-labelledby="hardware-heading">
+  <h2 id="hardware-heading">Build a $13 tap-to-unlock Matter lock</h2>
+  <p>
+    Connect a
+    <a href="https://shop.m5stack.com/products/m5stack-nanoc6-dev-kit">M5Stack NanoC6 Dev Kit</a>
+    (about $6) to an
+    <a href="https://shop.m5stack.com/products/nfc-universal-unit-st25r3916">M5Stack NFC Universal Unit</a>
+    ($7.00).
+  </p>
+  <p class="hardware-total">About $13 total before tax and shipping.</p>
+  <p>
+    The result is a virtual Matter-over-Thread door lock. Tap a tested
+    Apple Home Key at the NFC reader, then use the lock state to start an
+    automation. For example, unlock a real lock, open a garage door,
+    disarm an alarm, or run another action.
+  </p>
+  <p>
+    Aliro is designed for wallet credentials across smart-home ecosystems.
+    Apple Home Key works with this build. A Google wallet key is not yet
+    verified here and depends on Google's Aliro rollout.
+  </p>
+  <p>
+    The board does not drive a physical lock by itself. Use an automation
+    controller for the real action. Prices can change.
+  </p>
+  <p>
+    <a href="https://github.com/mullender/aliro-doorlock-esp32">Read the project README and view the source</a>.
+  </p>
+</section>
 
 <section class="serial-card connection-card" aria-labelledby="connection-heading">
   <h2 id="connection-heading">Connect and read lock status</h2>
