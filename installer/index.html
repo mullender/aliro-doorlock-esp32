@@ -99,6 +99,18 @@
   as a Matter door-lock over Thread.
 </p>
 
+<section class="serial-card connection-card" aria-labelledby="connection-heading">
+  <h2 id="connection-heading">Connect and read lock status</h2>
+  <p>
+    Connect the lock to read its boot status, pairing codes, and Matter
+    fabrics. Connecting briefly restarts the lock.
+  </p>
+  <div class="serial-controls">
+    <button type="button" id="serial-connect">Connect device</button>
+  </div>
+  <div class="serial-status" id="serial-status" role="status" aria-live="polite"></div>
+</section>
+
 <!-- Pairing panel: hidden until Phase 4's serial parser sets pairing state -->
 <section class="pairing" id="pairing" aria-hidden="true">
   <div id="pairing-commissioned" hidden>
@@ -309,20 +321,18 @@
 </div>
 
 <section class="serial-card" aria-labelledby="serial-heading">
-  <h2 id="serial-heading">Live serial monitor</h2>
+  <h2 id="serial-heading">Logs and device controls</h2>
   <p>
-    Connect to view local device logs before or after an install. If the log
-    contains valid Matter setup codes, this page shows the pairing QR panel.
-    Log data stays in this browser page.
+    Review the local device log or use the manual controls. If the log contains
+    valid Matter setup codes, this page shows the pairing QR panel. Log data
+    stays in this browser page.
   </p>
   <div class="serial-controls">
-    <button type="button" id="serial-connect">Connect device</button>
     <button type="button" id="serial-reset" disabled>Reset device</button>
     <button type="button" id="serial-copy">Copy logs</button>
     <button type="button" id="serial-clear">Clear</button>
     <button type="button" id="serial-disconnect" disabled>Disconnect</button>
   </div>
-  <div class="serial-status" id="serial-status" role="status" aria-live="polite"></div>
   <pre class="serial-log mono" id="serial-log" tabindex="0" aria-label="Live serial log"></pre>
 </section>
 

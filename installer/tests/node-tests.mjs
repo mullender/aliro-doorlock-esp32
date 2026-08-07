@@ -800,12 +800,102 @@ test("live serial monitor shows logs and sends valid codes through setup flow", 
   assert.deepEqual(serialPort.signalCalls, [
     { dataTerminalReady: false, requestToSend: true },
     { dataTerminalReady: false, requestToSend: false },
+    { dataTerminalReady: false, requestToSend: true },
+    { dataTerminalReady: false, requestToSend: false },
   ]);
   assert.equal(serialPort.closeCalls, 1);
   assert.equal(serialPort.readable.locked, false);
   assert.equal(monitor.isActive(), false);
   assert.equal(monitorElements.status.textContent,
     "Serial monitor disconnected for install. Click the install button again to continue.");
+});
+
+test("serial monitor starts its read loop before the automatic reset", async () => {
+  let locked = false;
+  let readStarted = false;
+  let finishRead;
+  const readable = {
+    get locked() { return locked; },
+    getReader() {
+      locked = true;
+      return {
+        read() {
+          readStarted = true;
+          return new Promise((resolve) => { finishRead = resolve; });
+        },
+        async cancel() { finishRead({ done: true }); },
+        releaseLock() { locked = false; },
+      };
+    },
+  };
+  const serialPort = {
+    readable,
+    async open() {},
+    async close() {},
+    async setSignals() {
+      assert.equal(readStarted, true);
+      assert.equal(readable.locked, true);
+    },
+  };
+  const monitor = createSerialMonitor({
+    elements: fakeMonitorElements(),
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([serialPort]),
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+
+  assert.equal(await monitor.connect(), true);
+  assert.equal(readStarted, true);
+  await monitor.destroy();
+});
+
+test("each successful connection gets one automatic reset", async () => {
+  const firstPort = fakeSerialPort();
+  const secondPort = fakeSerialPort();
+  const monitor = createSerialMonitor({
+    elements: fakeMonitorElements(),
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([firstPort, secondPort]),
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+
+  assert.equal(await monitor.connect(), true);
+  assert.equal(await monitor.disconnect(), true);
+  assert.equal(await monitor.connect(), true);
+  assert.deepEqual(firstPort.signalCalls, [
+    { dataTerminalReady: false, requestToSend: true },
+    { dataTerminalReady: false, requestToSend: false },
+  ]);
+  assert.deepEqual(secondPort.signalCalls, firstPort.signalCalls);
+  await monitor.destroy();
+});
+
+test("an automatic reset failure keeps the serial reader connected", async () => {
+  const serialPort = fakeSerialPort();
+  serialPort.setSignals = async function setSignals(value) {
+    this.signalCalls.push(value);
+    throw new Error("reset unavailable");
+  };
+  const elements = fakeMonitorElements();
+  const monitor = createSerialMonitor({
+    elements,
+    setupFlow: { showPairing: () => true },
+    serial: new FakeSerial([serialPort]),
+    secureContext: true,
+    resetPulseMs: 0,
+    logger: { error() {} },
+  });
+
+  assert.equal(await monitor.connect(), true);
+  assert.equal(monitor.getState().connected, true);
+  assert.equal(serialPort.readable.locked, true);
+  assert.equal(serialPort.closeCalls, 0);
+  assert.equal(serialPort.signalCalls.length, 3);
+  assert.equal(elements.status.textContent,
+    "Connected, but the lock did not restart: reset unavailable");
+  await monitor.destroy();
 });
 
 test("copy logs button writes the full current console text to the clipboard", async () => {
@@ -926,13 +1016,20 @@ test("one authorized port connects automatically without a picker", async () => 
     setupFlow: { showPairing: () => true },
     serial,
     secureContext: true,
+    resetPulseMs: 0,
   });
 
+  await nextTask();
   await nextTask();
 
   assert.equal(serial.getPortsCount, 1);
   assert.equal(serial.requestCount, 0);
   assert.deepEqual(serialPort.openCalls, [{ baudRate: 115200, bufferSize: 8192 }]);
+  assert.deepEqual(serialPort.signalCalls, [
+    { dataTerminalReady: false, requestToSend: true },
+    { dataTerminalReady: false, requestToSend: false },
+  ]);
+  assert.equal(serialPort.readable.locked, true);
   assert.equal(monitor.getState().connected, true);
   await monitor.destroy();
 });
@@ -1134,4 +1231,29 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /<summary>Technical details<\/summary>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
   assert.match(html, /use Factory install\s+if the device was deleted from that controller/);
+});
+
+test("installer page keeps connection at the top and logs at the bottom", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const connection = html.indexOf('id="connection-heading"');
+  const connectButton = html.indexOf('id="serial-connect"');
+  const serialStatus = html.indexOf('id="serial-status"');
+  const prerequisites = html.indexOf("<h2>Before you start</h2>");
+  const update = html.indexOf('id="update-heading"');
+  const factory = html.indexOf('id="factory-heading"');
+  const logs = html.indexOf('id="serial-heading"');
+  const resetButton = html.indexOf('id="serial-reset"');
+  const serialLog = html.indexOf('id="serial-log"');
+  const footer = html.indexOf("<footer>");
+
+  assert.ok(connection >= 0);
+  assert.ok(connection < connectButton);
+  assert.ok(connectButton < serialStatus);
+  assert.ok(serialStatus < prerequisites);
+  assert.ok(prerequisites < update);
+  assert.ok(update < factory);
+  assert.ok(factory < logs);
+  assert.ok(logs < resetButton);
+  assert.ok(resetButton < serialLog);
+  assert.ok(serialLog < footer);
 });
