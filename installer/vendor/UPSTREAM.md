@@ -31,17 +31,19 @@ the first erase or write.
 
 ## Upstream PR
 
-- **Issue:** to be filed on `esphome/esp-web-tools` after Phase 4b lands.
-  Frame the callback, terminal result, policy, and flash-check APIs as
-  generic installer safety features, not Matter features.
-- **PR:** to follow the issue, using the fork branch verbatim.
-- **State:** not filed yet.
-
-Record the upstream issue and PR URLs here when they exist:
-
-- Issue: <TODO>
-- PR: <TODO>
+- **Issue:** [esphome/esp-web-tools#449](https://github.com/esphome/esp-web-tools/issues/449)
+- **PR:** [esphome/esp-web-tools#733](https://github.com/esphome/esp-web-tools/pull/733)
+- **State:** open against `esphome/esp-web-tools:main`; CI started on
+  2026-08-07.
+- **Fork branch:** `mullender:feat/awaited-post-flash-callback`
+- **Commit:** `f41e746a4b40214b87b211d03701808a300f1484`
 - Merged in: <TODO — target upstream version if merged>
+
+The PR contains only the general callback. It does not contain the local erase
+policy, flash checks, or terminal result event. Its tests cover callback order,
+callback errors, and an absent callback. The production installer stays pinned
+to `21e9cdcbd7a43244a016b56550ae2b2b1015986a` until the upstream change has
+review and release proof.
 
 ## Transition plan (post-Phase 4)
 
