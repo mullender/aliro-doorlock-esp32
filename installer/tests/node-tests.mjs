@@ -1528,7 +1528,8 @@ test("firmware source checks require conditional tap-to-lock behavior", () => {
 
   assert.match(script, /DoorLock::Attributes::LockState::Get\(door_lock_endpoint_id, lock_state\)/);
   assert.match(script, /lock_state\.Value\(\) == DoorLock::DlLockState::kLocked/);
-  assert.match(script, /DoorLock::DoorLockServer::Instance\(\)\.GetAutoRelockTime/);
+  assert.match(script, /::DoorLockServer::Instance\(\)\.GetAutoRelockTime/);
+  assert.doesNotMatch(script, /DoorLock::DoorLockServer::Instance/);
   assert.match(script, /auto_relock_seconds != 0/);
   assert.match(script, /BoltLockMgr\(\)\.Lock\(door_lock_endpoint_id/);
   assert.match(script, /BoltLockMgr\(\)\.Unlock\(door_lock_endpoint_id/);

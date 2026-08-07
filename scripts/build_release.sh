@@ -396,7 +396,7 @@ validate_aliro_tap_toggle() {
     'lock_state.Value() == DoorLock::DlLockState::kLocked'
     'BoltLockMgr().Unlock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro)'
     'lock_state.Value() != DoorLock::DlLockState::kUnlocked'
-    'DoorLock::DoorLockServer::Instance().GetAutoRelockTime(door_lock_endpoint_id, auto_relock_seconds)'
+    '::DoorLockServer::Instance().GetAutoRelockTime(door_lock_endpoint_id, auto_relock_seconds)'
     'auto_relock_seconds != 0'
     'BoltLockMgr().Lock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro)'
     'ApplyAliroTapLockAction()'
