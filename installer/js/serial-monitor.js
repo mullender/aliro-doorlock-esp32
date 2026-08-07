@@ -1,4 +1,5 @@
 import { parseOnboardingText, resetSerialDevice } from "./boot-parser.js";
+import { parseAliroProtocolLine } from "./device-protocol.js";
 
 const DEFAULT_BAUD_RATE = 115200;
 const DEFAULT_BUFFER_SIZE = 8192;
@@ -32,6 +33,8 @@ export function createSerialMonitor({
   let authorizedConnectTask = null;
   let disconnectTask = null;
   let resetTask = null;
+  let writeQueue = Promise.resolve();
+  let writePending = false;
   let session = 0;
   let destroyed = false;
   let parseBuffer = "";
@@ -50,6 +53,11 @@ export function createSerialMonitor({
     elements.disconnect.disabled = !["connected", "blocked"].includes(state);
     elements.copy.disabled = destroyed;
     elements.clear.disabled = destroyed;
+    if (elements.connected) elements.connected.hidden = state !== "connected";
+  }
+
+  function dispatch(type, detail = {}) {
+    protocolTarget.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
   function appendLog(text) {
@@ -109,13 +117,24 @@ export function createSerialMonitor({
     parseBuffer = flush ? "" : tail;
     if (parseBuffer.length > 8192) parseBuffer = parseBuffer.slice(-8192);
     for (const line of lines) {
+      handleProtocolLine(line);
       codeState = parseOnboardingText(line, codeState);
       handleCodeState();
     }
     if (flush && tail) {
+      handleProtocolLine(tail);
       codeState = parseOnboardingText(tail, codeState);
       handleCodeState();
     }
+  }
+
+  function handleProtocolLine(line) {
+    const result = parseAliroProtocolLine(line);
+    if (!result) return;
+    dispatch("aliro-protocol", result);
+    if (result.type === "status") dispatch("aliro-status", result.status);
+    if (result.type === "error") dispatch("aliro-error", result);
+    if (result.type.startsWith("invalid-")) dispatch("aliro-invalid", result);
   }
 
   async function closePort(target) {
@@ -159,6 +178,7 @@ export function createSerialMonitor({
         if (closed) port = null;
         readTask = null;
         setControls(closed ? "idle" : "blocked");
+        if (closed) dispatch("serial-disconnected");
         if (ended && closed) {
           setStatus("The device ended the serial connection. You can reconnect.");
         }
@@ -247,6 +267,9 @@ export function createSerialMonitor({
     const targetSession = session;
     readTask = readLoop(selectedPort, selectedReader, targetSession);
     await reset();
+    if (targetSession === session && port === selectedPort && reader === selectedReader) {
+      dispatch("serial-connected");
+    }
     return true;
   }
 
@@ -272,6 +295,9 @@ export function createSerialMonitor({
   async function disconnectNow(message, allowCloseFailure = false) {
     if (connectTask) await connectTask;
     if (resetTask) await resetTask;
+    if (writePending) {
+      try { await writeQueue; } catch { /* The write caller reports the error. */ }
+    }
     if (!port && !reader && !readTask) {
       setControls("idle");
       if (message) setStatus(message);
@@ -300,6 +326,7 @@ export function createSerialMonitor({
       if (readTask === targetTask) readTask = null;
       setControls("idle");
       setStatus(message || "Serial monitor disconnected. You can reconnect.");
+      dispatch("serial-disconnected");
     } else {
       setControls("blocked");
     }
@@ -367,6 +394,47 @@ export function createSerialMonitor({
     }
   }
 
+  function validateWriteLine(line) {
+    if (typeof line !== "string" || !line.length || line.length > 255) {
+      throw new Error("The serial request must contain 1 to 255 characters.");
+    }
+    if (!/^[\x20-\x7e]+$/.test(line)) {
+      throw new Error("The serial request contains an unsafe character.");
+    }
+    if (!line.startsWith("ALIRO/1 ")) {
+      throw new Error("The serial request does not use the Aliro protocol.");
+    }
+  }
+
+  async function writeLine(line) {
+    validateWriteLine(line);
+    const targetPort = port;
+    const targetSession = session;
+    if (!targetPort || !reader) throw new Error("Connect the device before you save settings.");
+
+    writePending = true;
+    const queued = writeQueue.catch(() => {}).then(async () => {
+      if (targetPort !== port || targetSession !== session || !reader) {
+        throw new Error("The serial connection changed before the request was sent.");
+      }
+      if (!targetPort.writable) throw new Error("This serial port cannot send settings.");
+      if (targetPort.writable.locked) throw new Error("The serial writer is already in use.");
+      const writer = targetPort.writable.getWriter();
+      try {
+        await writer.write(new TextEncoder().encode(`${line}\n`));
+      } finally {
+        try { writer.releaseLock(); } catch { /* The writer is already free. */ }
+      }
+      return true;
+    });
+    writeQueue = queued;
+    try {
+      return await queued;
+    } finally {
+      if (writeQueue === queued) writePending = false;
+    }
+  }
+
   function isActive() {
     return Boolean(
       port || reader || readTask || connectTask || authorizedConnectTask || disconnectTask || resetTask
@@ -392,6 +460,8 @@ export function createSerialMonitor({
       void disconnect("Device disconnected. You can reconnect.", true);
     }
   };
+
+  const protocolTarget = new EventTarget();
 
   elements.connect.addEventListener("click", onConnect);
   elements.reset.addEventListener("click", onReset);
@@ -435,6 +505,9 @@ export function createSerialMonitor({
     destroy,
     isActive,
     releaseForInstall,
+    writeLine,
+    addEventListener: (...args) => protocolTarget.addEventListener(...args),
+    removeEventListener: (...args) => protocolTarget.removeEventListener(...args),
     getState: () => ({
       connected: Boolean(port && reader),
       connecting: Boolean(connectTask),

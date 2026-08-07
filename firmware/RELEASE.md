@@ -12,7 +12,7 @@ the pinned sources below.
 | esp-matter commit | `85c76a1788c5b70b4b0811734af8616dda15e7ac` |
 | connectedhomeip commit | `efefc94fee39d8d1fbbc3c27b9d7fc9025095887` |
 | ESP-IDF version | `5.5.4` (tag `v5.5.4`) |
-| Release tag | `aliro-c6-v0.0.3-devkit` |
+| Release tag | `aliro-c6-v0.0.4-devkit` |
 | Merged image size | 4 MiB (4 194 304 bytes), padded with `0xFF` |
 
 The build never modifies the shared `~/Development/esp-matter` checkout.
@@ -40,8 +40,9 @@ The stock `sdkconfig.esp32c6.aliro` supplies every other setting:
 Thread MTD, BLE peripheral, Wi-Fi station off, mbedTLS trimming,
 Aliro-over-NFC on, and the 4 MB partition layout.
 
-The build script applies the audited patches in `firmware/patches/`
-in file-name order:
+The build script applies the audited patches in `firmware/patches/`.
+It applies source patches before dependency resolution and the managed
+component patch after dependency resolution:
 
 1. `0001-print-onboarding-codes.patch` prints the Matter QR payload
    and manual pairing code after Matter starts.
@@ -60,12 +61,16 @@ in file-name order:
 5. `0005-add-m5nfc-aliro-ecp.patch` changes the pinned managed
    `m5nfc` component. It sends the Aliro ECP frame before NFC-A
    activation and reports the activation type to the door lock.
+6. `0006-add-aliro-settings.patch` adds persistent serial settings. It
+   controls auto-relock time and the three RGB result colors and
+   durations. It also sets the project version flow for this release.
 
 The expected Door Lock FeatureMap is `0x2100` (`USR | ALIRO`). The
 build script checks the source feature calls and the pinned feature-bit
 values before it starts `idf.py`. It also checks the RGB worker, Aliro
-FCI, and reader-lock source contracts. It removes all patches in reverse
-order when it exits.
+FCI, reader-lock, and settings source contracts. It compiles and runs the
+host parser test before it starts `idf.py`. It removes all patches in
+reverse order when it exits.
 
 The source assigns blue in two cases: a selected non-ISO-DEP NFC-A tag,
 or an ISO-DEP tag that rejects the Aliro AID select. A successful Aliro
@@ -79,6 +84,49 @@ these bytes through the ST25R3916 transmit-with-CRC path, which appends
 CRC-A. The lock updates this identifier when Matter sets or restores
 the reader configuration. It clears the identifier when Matter clears
 the reader configuration.
+
+## Serial settings protocol
+
+Version 0.0.4 adds the `ALIRO/1` line protocol on the native USB serial
+console. Commands use printable ASCII and end with CR or LF.
+
+```
+ALIRO/1 GET
+ALIRO/1 SET auto_relock_seconds=5
+ALIRO/1 SET success_rgb=00FF00 success_ms=1000
+```
+
+`SET` accepts one or more keys. Keys that are not in a command keep their
+current values. A command cannot contain the same key two times.
+
+| Key | Format and range | Default |
+|---|---|---|
+| `auto_relock_seconds` | Decimal, 0 to 3600 | 5 |
+| `success_rgb` | Six hexadecimal digits, `RRGGBB` | `00FF00` |
+| `failure_rgb` | Six hexadecimal digits, `RRGGBB` | `FF0000` |
+| `other_rgb` | Six hexadecimal digits, `RRGGBB` | `0000FF` |
+| `success_ms` | Decimal, 0 to 10000 | 1000 |
+| `failure_ms` | Decimal, 0 to 10000 | 1000 |
+| `other_ms` | Decimal, 0 to 10000 | 1000 |
+
+The firmware emits one status line when serial input starts, after `GET`,
+and after a successful `SET`:
+
+```
+ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000
+```
+
+The firmware returns `ALIRO/1 ERROR code=<code>` for a rejected command.
+The protocol defines `bad_request`, `unknown_key`, `invalid_value`,
+`line_too_long`, `storage`, and `matter`. A rejected command does not
+change the active settings. Successful settings persist in the
+`aliro_settings` NVS namespace and survive a preserving update.
+
+The status version comes from the ESP-IDF app descriptor. The release
+script removes `aliro-c6-v` from `TAG` and passes the result to CMake as
+`CLI_PROJECT_VER`. It passes the semantic patch number as
+`CLI_PROJECT_VER_NUMBER`. Thus the release tag, app descriptor, and
+serial status use one version value.
 
 ### Symbols we intentionally do NOT set
 
@@ -106,48 +154,54 @@ connectedhomeip checkout before it starts the build.
 export ESP_MATTER_SRC=/absolute/path/to/clean/esp-matter/snapshot
 export ESP_MATTER_REVISION=85c76a1788c5b70b4b0811734af8616dda15e7ac
 scripts/build_release.sh                       # build only
+scripts/build_release.sh --source-check        # source and parser checks only
 scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
 ```
 
 `build_release.sh`:
 
-1. Applies source patches 0001 through 0004 to the clean source tree.
+1. Applies source patches 0001 through 0004 and 0006 to the clean source
+   tree.
 2. Checks that the Door Lock FeatureMap is `0x2100` (`USR | ALIRO`).
-3. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
-4. Runs `idf.py set-target esp32c6` with
+3. Checks the settings source contract, then compiles and runs the host
+   parser test.
+4. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
+5. Runs `idf.py set-target esp32c6` with the version from `TAG` and
    `SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"`.
-5. Applies patch 0005 after `idf.py` fetches the managed components.
-6. Checks the ECP frame, GroupIdentifier mapping, NFC activation order,
+6. Applies patch 0005 after `idf.py` fetches the managed components.
+7. Checks the ECP frame, GroupIdentifier mapping, NFC activation order,
    RGB pins, and result mapping.
-7. Runs `idf.py build`.
-8. Prints `idf.py size` for the audit.
-9. Removes the temporary overlay and all patches in reverse order
+8. Runs `idf.py build` with the same version values.
+9. Prints `idf.py size` for the audit.
+10. Removes the temporary overlay and all patches in reverse order
    on exit.
 
 `prepare_release.sh`:
 
-1. Reads the part list from `build/flasher_args.json`.
-2. Verifies that the partition-table SHA-256 is
+1. Verifies that `project_description.json` has the version from the
+   release tag.
+2. Reads the part list from `build/flasher_args.json`.
+3. Verifies that the partition-table SHA-256 is
    `22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421`.
-3. Copies `build/door_lock.bin` byte-for-byte to the app-only release
+4. Copies `build/door_lock.bin` byte-for-byte to the app-only release
    asset and rejects an app larger than the `0x1e0000`-byte OTA slot.
-4. Invokes `esptool.py merge_bin --flash_size 4MB --fill-flash-size 4MB`.
-5. Verifies that the merged image is exactly 4 194 304 bytes.
-6. Verifies that the factory partition-table slice has the approved
+5. Invokes `esptool.py merge_bin --flash_size 4MB --fill-flash-size 4MB`.
+6. Verifies that the merged image is exactly 4 194 304 bytes.
+7. Verifies that the factory partition-table slice has the approved
    SHA-256 and that its app slice is identical to the app asset.
-7. Writes both images, their SHA-256 sidecars, and a per-part
+8. Writes both images, their SHA-256 sidecars, and a per-part
    `manifest.txt` to a staging directory.
-8. Replaces `artifacts/<tag>/` only after all checks pass. A failed
+9. Replaces `artifacts/<tag>/` only after all checks pass. A failed
    package run keeps the prior complete artifact set.
 
 ## Artifacts
 
 ```
-artifacts/aliro-c6-v0.0.3-devkit/
-  aliro-c6-v0.0.3-devkit-factory.bin          4 MiB, padded 0xFF
-  aliro-c6-v0.0.3-devkit-factory.bin.sha256   sha256 sidecar
-  aliro-c6-v0.0.3-devkit-app.bin              app-only update image
-  aliro-c6-v0.0.3-devkit-app.bin.sha256       sha256 sidecar
+artifacts/aliro-c6-v0.0.4-devkit/
+  aliro-c6-v0.0.4-devkit-factory.bin          4 MiB, padded 0xFF
+  aliro-c6-v0.0.4-devkit-factory.bin.sha256   sha256 sidecar
+  aliro-c6-v0.0.4-devkit-app.bin              app-only update image
+  aliro-c6-v0.0.4-devkit-app.bin.sha256       sha256 sidecar
   manifest.txt                                per-part audit
 ```
 
@@ -178,7 +232,21 @@ table SHA-256 is
 The update writes both OTA slots because the browser manifest does not
 know which slot `otadata` selects.
 
-### Verified build for `aliro-c6-v0.0.3-devkit`
+### Verified build: `aliro-c6-v0.0.4-devkit`
+
+The clean build and packaging passed on 2026-08-07. A NanoC6 hardware
+test is still required.
+
+- `door_lock.bin`: 1,607,584 bytes
+- Smallest app partition: `0x1e0000` bytes, with 358,496 bytes free
+  (18%)
+- App-only SHA-256:
+  `15cc3dd5e3244287d062b2ba2771d06b25257cfa4e3007a6062ac8a2a6d20dee`
+- Factory image: 4,194,304 bytes
+- Factory SHA-256:
+  `93df8a20e7e8de93a01e6c0e409304f67f2654d862fcff12494387f36a992995`
+
+### Previous verified build: `aliro-c6-v0.0.3-devkit`
 
 The clean build and packaging passed on 2026-08-05.
 

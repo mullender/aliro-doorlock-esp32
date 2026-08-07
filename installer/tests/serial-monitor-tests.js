@@ -28,11 +28,17 @@ function monitorElements() {
 
 function serialPort() {
   let streamController;
+  const writes = [];
   const readable = new ReadableStream({
     start(controller) { streamController = controller; },
   });
+  const writable = new WritableStream({
+    write(value) { writes.push(new TextDecoder().decode(value)); },
+  });
   return {
     readable,
+    writable,
+    writes,
     streamController,
     closeCount: 0,
     signals: [],
@@ -66,6 +72,7 @@ export async function runSerialMonitorTests(container) {
     const port = serialPort();
     const elements = monitorElements();
     let found;
+    let foundStatus;
     let copiedText;
     const monitor = createSerialMonitor({
       elements,
@@ -80,18 +87,27 @@ export async function runSerialMonitorTests(container) {
       secureContext: true,
       resetPulseMs: 0,
     });
+    monitor.addEventListener("aliro-status", (event) => { foundStatus = event.detail; });
     const connected = await monitor.connect();
     port.streamController.enqueue(new TextEncoder().encode(
       "I (1110) chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
       "I (1110) chip[SVR]: Manual pairing code: [34970112332]\n",
     ));
+    port.streamController.enqueue(new TextEncoder().encode(
+      "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+      "auto_relock_seconds=10 success_rgb=00ff00 success_ms=750 " +
+      "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500\n",
+    ));
     await nextTask();
+    await monitor.writeLine("ALIRO/1 SET auto_relock_seconds=0");
     elements.copy.click();
     await nextTask();
     const released = await monitor.releaseForInstall();
     const ok = connected && released && found?.manualCode === "34970112332" &&
       found?.options.statusMessage === "Live serial setup codes are ready." &&
       copiedText === elements.log.textContent && /SetupQRCode/.test(copiedText) &&
+      foundStatus?.firmware === "0.0.4-devkit" &&
+      port.writes[0] === "ALIRO/1 SET auto_relock_seconds=0\n" &&
       !port.readable.locked &&
       port.closeCount === 1;
     count(report(container, "live logs copy, find setup codes, and release before install", ok));

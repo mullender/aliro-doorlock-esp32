@@ -19,9 +19,8 @@ CONFIG_BSP_BUTTON_1_GPIO=9
 CONFIG_BSP_BUTTON_1_LEVEL=0
 
 # --- No LEDs ------------------------------------------------------------
-# The NanoC6 carries an on-board RGB LED but the devkit build does not
-# drive it. Zero LEDs keeps the led_strip / RGB backends out of the
-# binary entirely.
+# The NanoC6 carries an on-board RGB LED. The audited Aliro source patch
+# drives it directly. Zero LEDs disables only the BSP LED owner.
 CONFIG_BSP_LEDS_NUM=0
 
 # --- Native USB console -----------------------------------------------

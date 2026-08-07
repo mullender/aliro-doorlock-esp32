@@ -7,16 +7,20 @@
 # is checked out at the pinned commit (a git-archive extract is fine).
 #
 # Usage:
-#   scripts/build_release.sh
+#   scripts/build_release.sh [--source-check]
+#
+# Options:
+#   --source-check    apply and validate source patches, run the parser
+#                     test, clean the source tree, and exit without idf.py
 #
 # Required environment:
 #   ESP_MATTER_SRC   absolute path to a clean esp-matter source tree,
 #                    already checked out at the pinned commit
-#   IDF_PATH         set by ESP-IDF's export.sh (or by direnv). Script
-#                    exits if unset.
+#   IDF_PATH         set by ESP-IDF's export.sh (or by direnv). Required
+#                    unless --source-check is set.
 #
 # Optional environment:
-#   TAG              release tag; default aliro-c6-v0.0.3-devkit
+#   TAG              release tag; default aliro-c6-v0.0.4-devkit
 #   ESP_MATTER_REVISION
 #                    required when ESP_MATTER_SRC is a git archive
 #
@@ -30,9 +34,22 @@
 set -euo pipefail
 
 : "${ESP_MATTER_SRC:?set to absolute path of a clean esp-matter source tree}"
-: "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
 
-TAG="${TAG:-aliro-c6-v0.0.3-devkit}"
+SOURCE_CHECK_ONLY=0
+if [[ "$#" -gt 1 ]]; then
+  echo "usage: $0 [--source-check]" >&2
+  exit 2
+fi
+case "${1:-}" in
+  "") ;;
+  --source-check) SOURCE_CHECK_ONLY=1 ;;
+  *) echo "usage: $0 [--source-check]" >&2; exit 2 ;;
+esac
+if [[ "$SOURCE_CHECK_ONLY" == "0" ]]; then
+  : "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
+fi
+
+TAG="${TAG:-aliro-c6-v0.0.4-devkit}"
 PINNED_ESP_MATTER="85c76a1788c5b70b4b0811734af8616dda15e7ac"
 PINNED_CONNECTEDHOMEIP="efefc94fee39d8d1fbbc3c27b9d7fc9025095887"
 
@@ -40,8 +57,14 @@ if [[ ! -f "$ESP_MATTER_SRC/examples/door_lock/sdkconfig.esp32c6.aliro" ]]; then
   echo "error: $ESP_MATTER_SRC does not look like an esp-matter tree" >&2
   exit 2
 fi
-if [[ ! "$TAG" =~ ^aliro-c6-[A-Za-z0-9._-]+$ ]]; then
+if [[ ! "$TAG" =~ ^aliro-c6-v([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
   echo "error: invalid Aliro release tag: $TAG" >&2
+  exit 2
+fi
+FIRMWARE_VERSION="${TAG#aliro-c6-v}"
+FIRMWARE_VERSION_NUMBER="${BASH_REMATCH[3]}"
+if [[ "${#FIRMWARE_VERSION}" -gt 31 ]]; then
+  echo "error: firmware version exceeds the 31-character app descriptor limit: $FIRMWARE_VERSION" >&2
   exit 2
 fi
 
@@ -82,6 +105,7 @@ SOURCE_PATCHES=(
   "$REPO_ROOT/firmware/patches/0002-advertise-aliro-credentials-only.patch"
   "$REPO_ROOT/firmware/patches/0003-add-nanoc6-rgb-feedback.patch"
   "$REPO_ROOT/firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch"
+  "$REPO_ROOT/firmware/patches/0006-add-aliro-settings.patch"
 )
 DEPENDENCY_PATCHES=(
   "$REPO_ROOT/firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -203,10 +227,11 @@ validate_nanoc6_nfc_feedback() {
     'strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB'
     'strip_config.led_model = LED_MODEL_WS2812'
     'QueueHandle_t g_status_led_queue = nullptr'
-    'g_status_led_queue = xQueueCreate(1, sizeof(StatusLedResult))'
+    'g_status_led_queue = xQueueCreate(1, sizeof(StatusLedCommand))'
     'xTaskCreate(StatusLedTask, "aliro_led"'
-    'xQueueReceive(g_status_led_queue, &next_result, pdMS_TO_TICKS(kStatusLedDurationMs))'
-    'xQueueOverwrite(g_status_led_queue, &result)'
+    'xQueueReceive(g_status_led_queue, &next_command, pdMS_TO_TICKS(command.duration_ms))'
+    'xQueueOverwrite(g_status_led_queue, &command)'
+    'const AliroSettingsSnapshot settings = AliroSettingsGet()'
     'kFciTemplateTag = 0x6F'
     'kDedicatedFileNameTag = 0x84'
     'response_len < status_len'
@@ -297,10 +322,78 @@ validate_nanoc6_nfc_feedback() {
     echo "error: Aliro ECP must run before the NFC-A request" >&2
     return 2
   fi
-  echo "=== NanoC6 NFC: ECP enabled; green success, red failure, blue other tag ==="
+  echo "=== NanoC6 NFC: ECP and configurable RGB feedback enabled ==="
+}
+
+validate_aliro_settings() {
+  local cmake_source="$APP_DIR/CMakeLists.txt"
+  local app_source="$APP_DIR/main/app_main.cpp"
+  local settings_source="$APP_DIR/main/aliro_settings.cpp"
+  local protocol_source="$APP_DIR/main/aliro_settings_protocol.cpp"
+  local parser_test="$REPO_ROOT/firmware/tests/aliro_settings_protocol_test.cpp"
+  local parser_binary
+  local required_text
+  local required_settings_text=(
+    'kNvsNamespace[] = "aliro_settings"'
+    'kSettingsSchemaVersion = 1'
+    'esp_app_get_description()->version'
+    'ALIRO/1 STATUS firmware=%s protocol=1'
+    'esp_matter::attribute::update(g_door_lock_endpoint_id, DoorLock::Id'
+    'xTaskCreate(SerialTask, "aliro_serial"'
+  )
+
+  for required_text in \
+      'set(PROJECT_VER "0.0.4-devkit")' \
+      'set(PROJECT_VER_NUMBER 4)' \
+      'set(PROJECT_VER "${CLI_PROJECT_VER}")' \
+      'set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")'; do
+    if ! grep -Fq "$required_text" "$cmake_source"; then
+      echo "error: project version source is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  for required_text in \
+      'AliroSettingsInit()' \
+      'create_auto_relock_time(door_lock_cluster, settings.auto_relock_seconds)' \
+      'AliroSettingsStartSerial(door_lock_endpoint_id)'; do
+    if ! grep -Fq "$required_text" "$app_source"; then
+      echo "error: Aliro settings integration is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  for required_text in "${required_settings_text[@]}"; do
+    if ! grep -Fq "$required_text" "$settings_source"; then
+      echo "error: Aliro settings source is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  if [[ ! -f "$parser_test" ]]; then
+    echo "error: parser test not found at $parser_test" >&2
+    return 2
+  fi
+  parser_binary="$(mktemp "${TMPDIR:-/tmp}/aliro-settings-parser.XXXXXX")"
+  if ! "${CXX:-c++}" -std=gnu++17 -Wall -Wextra -Werror \
+      -I "$APP_DIR/main" "$protocol_source" "$parser_test" -o "$parser_binary"; then
+    command rm -f "$parser_binary"
+    echo "error: Aliro settings parser test did not compile" >&2
+    return 2
+  fi
+  if ! "$parser_binary"; then
+    command rm -f "$parser_binary"
+    echo "error: Aliro settings parser test failed" >&2
+    return 2
+  fi
+  command rm -f "$parser_binary"
+  echo "=== Aliro settings: source contract and parser test passed ==="
 }
 
 validate_aliro_feature_map
+validate_aliro_settings
+
+if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
+  echo "=== Source patch check complete; idf.py was not run ==="
+  exit 0
+fi
 
 # Copy the overlay into the example dir so idf.py's SDKCONFIG_DEFAULTS
 # search resolves it relative to the app directory.
@@ -320,6 +413,8 @@ fi
 
 echo "=== set-target esp32c6 with layered defaults ==="
 idf.py \
+  -D CLI_PROJECT_VER="$FIRMWARE_VERSION" \
+  -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6" \
   set-target esp32c6
 
@@ -345,7 +440,10 @@ done
 validate_nanoc6_nfc_feedback
 
 echo "=== build ==="
-idf.py build
+idf.py \
+  -D CLI_PROJECT_VER="$FIRMWARE_VERSION" \
+  -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
+  build
 
 echo "=== size ==="
 idf.py size

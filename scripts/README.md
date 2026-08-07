@@ -12,6 +12,11 @@ before doing it. None modify tracked files. None commit.
   reachable, USB port present). Read only.
 - `build.sh` — invoke `idf.py set-target esp32c6` and `idf.py build`
   against `esp-matter/examples/door_lock` with the aliro config.
+- `build_release.sh` — apply the audited release patches, run the fast
+  settings parser test and source checks, then build the pinned release.
+  Use `--source-check` to stop before `idf.py`.
+- `prepare_release.sh` — verify and package the factory and app-only
+  release images.
 - `flash_monitor.sh` — erase + flash + monitor. Requires a `--port`
   argument; will refuse to guess.
 - `capture_boot_log.sh` — flash and capture the boot log to a fresh

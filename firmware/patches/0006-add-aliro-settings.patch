@@ -1,0 +1,703 @@
+diff --git a/examples/door_lock/CMakeLists.txt b/examples/door_lock/CMakeLists.txt
+index efc0ba7..b363c39 100644
+--- a/examples/door_lock/CMakeLists.txt
++++ b/examples/door_lock/CMakeLists.txt
+@@ -8,7 +8,15 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
+     message(FATAL_ERROR "Please set ESP_MATTER_PATH to the path of esp-matter repo")
+ endif(NOT DEFINED ENV{ESP_MATTER_PATH})
+ 
+-set(PROJECT_VER "1.0")
+-set(PROJECT_VER_NUMBER 1)
++if(NOT DEFINED CLI_PROJECT_VER)
++    set(PROJECT_VER "0.0.4-devkit")
++else()
++    set(PROJECT_VER "${CLI_PROJECT_VER}")
++endif()
++if(NOT DEFINED CLI_PROJECT_VER_NUMBER)
++    set(PROJECT_VER_NUMBER 4)
++else()
++    set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")
++endif()
+ 
+ set(ESP_MATTER_PATH $ENV{ESP_MATTER_PATH})
+diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
+index 283d5c3..7effa9e 100644
+--- a/examples/door_lock/main/app_main.cpp
++++ b/examples/door_lock/main/app_main.cpp
+@@ -25,6 +25,7 @@
+ #include <app/server/CommissioningWindowManager.h>
+ #include <app/server/Server.h>
++#include <aliro_settings.h>
+ #ifdef CONFIG_ENABLE_ALIRO_OVER_NFC
+ #include <aliro_door_lock_delegate.h>
+ #include <setup_payload/OnboardingCodesUtil.h>
+ #endif
+@@ -145,7 +146,10 @@ extern "C" void app_main()
+     esp_err_t err = ESP_OK;
+ 
+     /* Initialize the ESP NVS layer */
+-    nvs_flash_init();
++    err = nvs_flash_init();
++    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialize NVS: %s", esp_err_to_name(err)));
++    err = AliroSettingsInit();
++    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialize Aliro settings: %s", esp_err_to_name(err)));
+ 
+ #if CONFIG_PM_ENABLE
+     esp_pm_config_t pm_config = {
+@@ -181,6 +185,7 @@ extern "C" void app_main()
+ #endif
+     cluster::door_lock::feature::user::add(door_lock_cluster, &user_config);
+-    cluster::door_lock::attribute::create_auto_relock_time(door_lock_cluster, 5);
++    const AliroSettingsSnapshot settings = AliroSettingsGet();
++    cluster::door_lock::attribute::create_auto_relock_time(door_lock_cluster, settings.auto_relock_seconds);
+ 
+     door_lock_endpoint_id = endpoint::get_id(endpoint);
+     ESP_LOGI(TAG, "Door lock created with endpoint_id %d", door_lock_endpoint_id);
+@@ -210,6 +215,9 @@ extern "C" void app_main()
+     /* do nothing now */
+     door_lock_init();
+ 
++    err = AliroSettingsStartSerial(door_lock_endpoint_id);
++    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Aliro serial input: %s", esp_err_to_name(err)));
++
+ #if CONFIG_ENABLE_ENCRYPTED_OTA
+     err = esp_matter_ota_requestor_encrypted_init(s_decryption_key, s_decryption_key_len);
+     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialized the encrypted OTA, err: %d", err));
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 59d44da..4794321 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -27,6 +27,7 @@
+ #include <platform/PlatformManager.h>
+ 
+ #include "aliro_door_lock_delegate.h"
++#include "aliro_settings.h"
+ #include "door_lock_manager.h"
+ 
+ using namespace chip;
+@@ -46,10 +47,8 @@ namespace {
+ 
+ constexpr gpio_num_t kStatusLedPowerPin = GPIO_NUM_19;
+ constexpr gpio_num_t kStatusLedDataPin = GPIO_NUM_20;
+-constexpr uint32_t kStatusLedDurationMs = 1000;
+ constexpr uint32_t kStatusLedTaskStackSize = 3072;
+ constexpr UBaseType_t kStatusLedTaskPriority = 3;
+-constexpr uint8_t kStatusLedBrightness = 255;
+ constexpr uint8_t kSelectHeader[] = { 0x00, 0xA4, 0x04, 0x00, 0x09 };
+ constexpr uint8_t kAliroExpeditedAid[] = { 0xA0, 0x00, 0x00, 0x09, 0x09, 0xAC, 0xCE, 0x55, 0x01 };
+ constexpr uint8_t kFciTemplateTag = 0x6F;
+@@ -62,6 +60,13 @@ enum class StatusLedResult {
+     kOtherTag,
+ };
+ 
++struct StatusLedCommand {
++    uint8_t red;
++    uint8_t green;
++    uint8_t blue;
++    uint32_t duration_ms;
++};
++
+ led_strip_handle_t g_status_led = nullptr;
+ QueueHandle_t g_status_led_queue = nullptr;
+ TaskHandle_t g_status_led_task = nullptr;
+@@ -121,23 +126,9 @@ bool IsSuccessfulAliroSelectResponse(const uint8_t *response, size_t response_l
+     return BytesEqual(response + aid_offset, kAliroExpeditedAid, sizeof(kAliroExpeditedAid));
+ }
+ 
+-esp_err_t SetStatusLedColor(StatusLedResult result)
++esp_err_t SetStatusLedColor(const StatusLedCommand &command)
+ {
+-    uint8_t red = 0;
+-    uint8_t green = 0;
+-    uint8_t blue = 0;
+-    switch (result) {
+-    case StatusLedResult::kSuccess:
+-        green = kStatusLedBrightness;
+-        break;
+-    case StatusLedResult::kFailure:
+-        red = kStatusLedBrightness;
+-        break;
+-    case StatusLedResult::kOtherTag:
+-        blue = kStatusLedBrightness;
+-        break;
+-    }
+-    ESP_RETURN_ON_ERROR(led_strip_set_pixel(g_status_led, 0, red, green, blue), "Aliro",
++    ESP_RETURN_ON_ERROR(led_strip_set_pixel(g_status_led, 0, command.red, command.green, command.blue), "Aliro",
+                         "Failed to set NanoC6 RGB LED");
+     return led_strip_refresh(g_status_led);
+ }
+@@ -150,20 +143,20 @@ void StatusLedTask(void *)
+         ESP_LOGW("Aliro", "Failed to clear NanoC6 RGB LED: %s", esp_err_to_name(err));
+     }
+ 
+-    StatusLedResult result;
++    StatusLedCommand command;
+     while (true) {
+-        if (xQueueReceive(g_status_led_queue, &result, portMAX_DELAY) != pdTRUE) {
++        if (xQueueReceive(g_status_led_queue, &command, portMAX_DELAY) != pdTRUE) {
+             continue;
+         }
+         while (true) {
+-            err = SetStatusLedColor(result);
++            err = SetStatusLedColor(command);
+             if (err != ESP_OK) {
+                 ESP_LOGW("Aliro", "Failed to update NanoC6 RGB LED: %s", esp_err_to_name(err));
+             }
+ 
+-            StatusLedResult next_result;
+-            if (xQueueReceive(g_status_led_queue, &next_result, pdMS_TO_TICKS(kStatusLedDurationMs)) == pdTRUE) {
+-                result = next_result;
++            StatusLedCommand next_command;
++            if (xQueueReceive(g_status_led_queue, &next_command, pdMS_TO_TICKS(command.duration_ms)) == pdTRUE) {
++                command = next_command;
+                 continue;
+             }
+             err = led_strip_clear(g_status_led);
+@@ -224,7 +217,7 @@ esp_err_t InitStatusLed()
+         return err;
+     }
+ 
+-    g_status_led_queue = xQueueCreate(1, sizeof(StatusLedResult));
++    g_status_led_queue = xQueueCreate(1, sizeof(StatusLedCommand));
+     if (!g_status_led_queue) {
+         CleanupStatusLed();
+         return ESP_ERR_NO_MEM;
+@@ -243,7 +236,28 @@ void ShowStatusLed(StatusLedResult result)
+     if (!g_status_led_queue) {
+         return;
+     }
+-    (void)xQueueOverwrite(g_status_led_queue, &result);
++
++    const AliroSettingsSnapshot settings = AliroSettingsGet();
++    uint32_t rgb;
++    StatusLedCommand command = {};
++    switch (result) {
++    case StatusLedResult::kSuccess:
++        rgb = settings.success_rgb;
++        command.duration_ms = settings.success_ms;
++        break;
++    case StatusLedResult::kFailure:
++        rgb = settings.failure_rgb;
++        command.duration_ms = settings.failure_ms;
++        break;
++    case StatusLedResult::kOtherTag:
++        rgb = settings.other_rgb;
++        command.duration_ms = settings.other_ms;
++        break;
++    }
++    command.red = static_cast<uint8_t>(rgb >> 16);
++    command.green = static_cast<uint8_t>(rgb >> 8);
++    command.blue = static_cast<uint8_t>(rgb);
++    (void)xQueueOverwrite(g_status_led_queue, &command);
+ }
+ 
+ } // namespace
+diff --git a/examples/door_lock/main/aliro_settings_protocol.h b/examples/door_lock/main/aliro_settings_protocol.h
+new file mode 100644
+index 0000000..75ec0da
+--- /dev/null
++++ b/examples/door_lock/main/aliro_settings_protocol.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <stdint.h>
++
++struct AliroSettingsSnapshot {
++    uint32_t auto_relock_seconds;
++    uint32_t success_rgb;
++    uint32_t failure_rgb;
++    uint32_t other_rgb;
++    uint32_t success_ms;
++    uint32_t failure_ms;
++    uint32_t other_ms;
++};
++
++constexpr AliroSettingsSnapshot kAliroDefaultSettings = {
++    .auto_relock_seconds = 5,
++    .success_rgb = 0x00FF00,
++    .failure_rgb = 0xFF0000,
++    .other_rgb = 0x0000FF,
++    .success_ms = 1000,
++    .failure_ms = 1000,
++    .other_ms = 1000,
++};
++
++enum class AliroRequestKind {
++    kGet,
++    kSet,
++};
++
++enum class AliroParseError {
++    kNone,
++    kBadRequest,
++    kUnknownKey,
++    kInvalidValue,
++};
++
++struct AliroParsedRequest {
++    AliroRequestKind kind;
++    AliroSettingsSnapshot settings;
++};
++
++AliroParseError AliroParseRequest(char *line, const AliroSettingsSnapshot &current, AliroParsedRequest &request);
++const char *AliroParseErrorCode(AliroParseError error);
+diff --git a/examples/door_lock/main/aliro_settings_protocol.cpp b/examples/door_lock/main/aliro_settings_protocol.cpp
+new file mode 100644
+index 0000000..4cab7c8
+--- /dev/null
++++ b/examples/door_lock/main/aliro_settings_protocol.cpp
+@@ -0,0 +1,176 @@
++#include "aliro_settings_protocol.h"
++
++#include <stddef.h>
++#include <string.h>
++
++namespace {
++
++constexpr char kGetRequest[] = "ALIRO/1 GET";
++constexpr char kSetPrefix[] = "ALIRO/1 SET ";
++
++bool ParseDecimal(const char *text, uint32_t maximum, uint32_t &value)
++{
++    if (!text || !text[0]) {
++        return false;
++    }
++
++    uint32_t parsed = 0;
++    for (const char *cursor = text; *cursor; ++cursor) {
++        if (*cursor < '0' || *cursor > '9') {
++            return false;
++        }
++        const uint32_t digit = static_cast<uint32_t>(*cursor - '0');
++        if (parsed > (maximum - digit) / 10) {
++            return false;
++        }
++        parsed = parsed * 10 + digit;
++    }
++    value = parsed;
++    return true;
++}
++
++bool ParseRgb(const char *text, uint32_t &value)
++{
++    if (!text || strlen(text) != 6) {
++        return false;
++    }
++
++    uint32_t parsed = 0;
++    for (size_t index = 0; index < 6; ++index) {
++        const char character = text[index];
++        uint32_t digit;
++        if (character >= '0' && character <= '9') {
++            digit = static_cast<uint32_t>(character - '0');
++        } else if (character >= 'A' && character <= 'F') {
++            digit = static_cast<uint32_t>(character - 'A' + 10);
++        } else if (character >= 'a' && character <= 'f') {
++            digit = static_cast<uint32_t>(character - 'a' + 10);
++        } else {
++            return false;
++        }
++        parsed = (parsed << 4) | digit;
++    }
++    value = parsed;
++    return true;
++}
++
++AliroParseError ParseSetting(char *token, AliroSettingsSnapshot &settings, uint32_t &seen_keys)
++{
++    char *equals = strchr(token, '=');
++    if (!equals || equals == token || !equals[1] || strchr(equals + 1, '=')) {
++        return AliroParseError::kBadRequest;
++    }
++    *equals = '\0';
++    const char *key = token;
++    const char *value = equals + 1;
++
++    uint32_t key_bit;
++    uint32_t *target;
++    uint32_t maximum;
++    bool is_rgb = false;
++    if (strcmp(key, "auto_relock_seconds") == 0) {
++        key_bit = 1U << 0;
++        target = &settings.auto_relock_seconds;
++        maximum = 3600;
++    } else if (strcmp(key, "success_rgb") == 0) {
++        key_bit = 1U << 1;
++        target = &settings.success_rgb;
++        maximum = 0xFFFFFF;
++        is_rgb = true;
++    } else if (strcmp(key, "failure_rgb") == 0) {
++        key_bit = 1U << 2;
++        target = &settings.failure_rgb;
++        maximum = 0xFFFFFF;
++        is_rgb = true;
++    } else if (strcmp(key, "other_rgb") == 0) {
++        key_bit = 1U << 3;
++        target = &settings.other_rgb;
++        maximum = 0xFFFFFF;
++        is_rgb = true;
++    } else if (strcmp(key, "success_ms") == 0) {
++        key_bit = 1U << 4;
++        target = &settings.success_ms;
++        maximum = 10000;
++    } else if (strcmp(key, "failure_ms") == 0) {
++        key_bit = 1U << 5;
++        target = &settings.failure_ms;
++        maximum = 10000;
++    } else if (strcmp(key, "other_ms") == 0) {
++        key_bit = 1U << 6;
++        target = &settings.other_ms;
++        maximum = 10000;
++    } else {
++        return AliroParseError::kUnknownKey;
++    }
++
++    if ((seen_keys & key_bit) != 0) {
++        return AliroParseError::kBadRequest;
++    }
++    seen_keys |= key_bit;
++
++    uint32_t parsed;
++    if (!(is_rgb ? ParseRgb(value, parsed) : ParseDecimal(value, maximum, parsed))) {
++        return AliroParseError::kInvalidValue;
++    }
++    *target = parsed;
++    return AliroParseError::kNone;
++}
++
++} // namespace
++
++AliroParseError AliroParseRequest(char *line, const AliroSettingsSnapshot &current, AliroParsedRequest &request)
++{
++    if (!line) {
++        return AliroParseError::kBadRequest;
++    }
++    if (strcmp(line, kGetRequest) == 0) {
++        request = { .kind = AliroRequestKind::kGet, .settings = current };
++        return AliroParseError::kNone;
++    }
++    if (strncmp(line, kSetPrefix, sizeof(kSetPrefix) - 1) != 0) {
++        return AliroParseError::kBadRequest;
++    }
++
++    AliroSettingsSnapshot candidate = current;
++    uint32_t seen_keys = 0;
++    char *cursor = line + sizeof(kSetPrefix) - 1;
++    while (*cursor) {
++        char *token = cursor;
++        char *separator = strchr(cursor, ' ');
++        if (separator) {
++            if (separator == token || !separator[1]) {
++                return AliroParseError::kBadRequest;
++            }
++            *separator = '\0';
++            cursor = separator + 1;
++        } else {
++            cursor += strlen(cursor);
++        }
++
++        AliroParseError error = ParseSetting(token, candidate, seen_keys);
++        if (error != AliroParseError::kNone) {
++            return error;
++        }
++    }
++    if (seen_keys == 0) {
++        return AliroParseError::kBadRequest;
++    }
++
++    request = { .kind = AliroRequestKind::kSet, .settings = candidate };
++    return AliroParseError::kNone;
++}
++
++const char *AliroParseErrorCode(AliroParseError error)
++{
++    switch (error) {
++    case AliroParseError::kBadRequest:
++        return "bad_request";
++    case AliroParseError::kUnknownKey:
++        return "unknown_key";
++    case AliroParseError::kInvalidValue:
++        return "invalid_value";
++    case AliroParseError::kNone:
++        break;
++    }
++    return "internal";
++}
+diff --git a/examples/door_lock/main/aliro_settings.h b/examples/door_lock/main/aliro_settings.h
+new file mode 100644
+index 0000000..fc5da7b
+--- /dev/null
++++ b/examples/door_lock/main/aliro_settings.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "aliro_settings_protocol.h"
++
++#include <esp_err.h>
++#include <stdint.h>
++
++esp_err_t AliroSettingsInit();
++AliroSettingsSnapshot AliroSettingsGet();
++esp_err_t AliroSettingsStartSerial(uint16_t door_lock_endpoint_id);
+diff --git a/examples/door_lock/main/aliro_settings.cpp b/examples/door_lock/main/aliro_settings.cpp
+new file mode 100644
+index 0000000..d548556
+--- /dev/null
++++ b/examples/door_lock/main/aliro_settings.cpp
+@@ -0,0 +1,256 @@
++#include "aliro_settings.h"
++
++#include <esp_app_desc.h>
++#include <esp_log.h>
++#include <esp_matter.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/semphr.h>
++#include <freertos/task.h>
++#include <inttypes.h>
++#include <nvs.h>
++#include <stdio.h>
++#include <string.h>
++
++using namespace chip::app::Clusters;
++
++namespace {
++
++constexpr char kTag[] = "aliro_settings";
++constexpr char kNvsNamespace[] = "aliro_settings";
++constexpr char kNvsKey[] = "config";
++constexpr uint32_t kSettingsSchemaVersion = 1;
++constexpr size_t kSerialLineSize = 256;
++constexpr uint32_t kSerialTaskStackSize = 4096;
++constexpr UBaseType_t kSerialTaskPriority = 2;
++
++struct PersistedSettings {
++    uint32_t schema_version;
++    AliroSettingsSnapshot settings;
++};
++
++static_assert(sizeof(PersistedSettings) == 8 * sizeof(uint32_t));
++
++SemaphoreHandle_t g_settings_mutex = nullptr;
++AliroSettingsSnapshot g_settings = kAliroDefaultSettings;
++uint16_t g_door_lock_endpoint_id = 0;
++
++bool SettingsAreValid(const AliroSettingsSnapshot &settings)
++{
++    return settings.auto_relock_seconds <= 3600 && settings.success_rgb <= 0xFFFFFF &&
++        settings.failure_rgb <= 0xFFFFFF && settings.other_rgb <= 0xFFFFFF && settings.success_ms <= 10000 &&
++        settings.failure_ms <= 10000 && settings.other_ms <= 10000;
++}
++
++esp_err_t StoreSettings(const AliroSettingsSnapshot &settings)
++{
++    nvs_handle_t handle;
++    esp_err_t error = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
++    if (error != ESP_OK) {
++        return error;
++    }
++
++    const PersistedSettings persisted = {
++        .schema_version = kSettingsSchemaVersion,
++        .settings = settings,
++    };
++    error = nvs_set_blob(handle, kNvsKey, &persisted, sizeof(persisted));
++    if (error == ESP_OK) {
++        error = nvs_commit(handle);
++    }
++    nvs_close(handle);
++    return error;
++}
++
++esp_err_t LoadSettings(AliroSettingsSnapshot &settings)
++{
++    nvs_handle_t handle;
++    esp_err_t error = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
++    if (error != ESP_OK) {
++        return error;
++    }
++
++    PersistedSettings persisted = {};
++    size_t size = sizeof(persisted);
++    error = nvs_get_blob(handle, kNvsKey, &persisted, &size);
++    nvs_close(handle);
++    if (error != ESP_OK) {
++        return error;
++    }
++    if (size != sizeof(persisted) || persisted.schema_version != kSettingsSchemaVersion ||
++        !SettingsAreValid(persisted.settings)) {
++        return ESP_ERR_INVALID_VERSION;
++    }
++    settings = persisted.settings;
++    return ESP_OK;
++}
++
++void SetCurrentSettings(const AliroSettingsSnapshot &settings)
++{
++    if (xSemaphoreTake(g_settings_mutex, portMAX_DELAY) == pdTRUE) {
++        g_settings = settings;
++        (void)xSemaphoreGive(g_settings_mutex);
++    }
++}
++
++void EmitError(const char *code)
++{
++    printf("ALIRO/1 ERROR code=%s\n", code);
++    fflush(stdout);
++}
++
++void EmitStatus()
++{
++    const AliroSettingsSnapshot settings = AliroSettingsGet();
++    printf("ALIRO/1 STATUS firmware=%s protocol=1 auto_relock_seconds=%" PRIu32
++           " success_rgb=%06" PRIX32 " failure_rgb=%06" PRIX32 " other_rgb=%06" PRIX32
++           " success_ms=%" PRIu32 " failure_ms=%" PRIu32 " other_ms=%" PRIu32 "\n",
++           esp_app_get_description()->version, settings.auto_relock_seconds, settings.success_rgb,
++           settings.failure_rgb, settings.other_rgb,
++           settings.success_ms, settings.failure_ms, settings.other_ms);
++    fflush(stdout);
++}
++
++esp_err_t ApplySettings(const AliroSettingsSnapshot &candidate, bool &storage_error)
++{
++    storage_error = true;
++    const AliroSettingsSnapshot previous = AliroSettingsGet();
++    esp_err_t error = StoreSettings(candidate);
++    if (error != ESP_OK) {
++        return error;
++    }
++
++    if (candidate.auto_relock_seconds != previous.auto_relock_seconds) {
++        storage_error = false;
++        esp_matter_attr_val_t value = esp_matter_uint32(candidate.auto_relock_seconds);
++        error = esp_matter::attribute::update(g_door_lock_endpoint_id, DoorLock::Id,
++                                              DoorLock::Attributes::AutoRelockTime::Id, &value);
++        if (error != ESP_OK) {
++            esp_err_t rollback_error = StoreSettings(previous);
++            if (rollback_error != ESP_OK) {
++                ESP_LOGE(kTag, "Could not restore settings after a Matter attribute error: %s",
++                         esp_err_to_name(rollback_error));
++            }
++            return error;
++        }
++    }
++
++    SetCurrentSettings(candidate);
++    return ESP_OK;
++}
++
++void ProcessLine(char *line)
++{
++    AliroParsedRequest request;
++    AliroParseError parse_error = AliroParseRequest(line, AliroSettingsGet(), request);
++    if (parse_error != AliroParseError::kNone) {
++        EmitError(AliroParseErrorCode(parse_error));
++        return;
++    }
++    if (request.kind == AliroRequestKind::kGet) {
++        EmitStatus();
++        return;
++    }
++
++    bool storage_error;
++    esp_err_t error = ApplySettings(request.settings, storage_error);
++    if (error != ESP_OK) {
++        ESP_LOGE(kTag, "Could not apply settings: %s", esp_err_to_name(error));
++        EmitError(storage_error ? "storage" : "matter");
++        return;
++    }
++    EmitStatus();
++}
++
++void SerialTask(void *)
++{
++    EmitStatus();
++
++    char line[kSerialLineSize];
++    size_t length = 0;
++    bool discard_line = false;
++    bool non_ascii = false;
++    while (true) {
++        const int input = fgetc(stdin);
++        if (input == EOF) {
++            clearerr(stdin);
++            vTaskDelay(pdMS_TO_TICKS(10));
++            continue;
++        }
++        if (input == '\r' || input == '\n') {
++            if (discard_line) {
++                EmitError("line_too_long");
++            } else if (non_ascii) {
++                EmitError("bad_request");
++            } else if (length != 0) {
++                line[length] = '\0';
++                ProcessLine(line);
++            }
++            length = 0;
++            discard_line = false;
++            non_ascii = false;
++            continue;
++        }
++        if (input < 0x20 || input > 0x7E) {
++            non_ascii = true;
++            continue;
++        }
++        if (length + 1 >= sizeof(line)) {
++            discard_line = true;
++            continue;
++        }
++        if (!discard_line) {
++            line[length++] = static_cast<char>(input);
++        }
++    }
++}
++
++} // namespace
++
++esp_err_t AliroSettingsInit()
++{
++    g_settings_mutex = xSemaphoreCreateMutex();
++    if (!g_settings_mutex) {
++        return ESP_ERR_NO_MEM;
++    }
++
++    AliroSettingsSnapshot settings;
++    esp_err_t error = LoadSettings(settings);
++    if (error == ESP_ERR_NVS_NOT_FOUND) {
++        settings = kAliroDefaultSettings;
++        error = StoreSettings(settings);
++    } else if (error != ESP_OK) {
++        ESP_LOGW(kTag, "Stored settings are invalid. Restoring defaults: %s", esp_err_to_name(error));
++        settings = kAliroDefaultSettings;
++        error = StoreSettings(settings);
++    }
++    if (error != ESP_OK) {
++        vSemaphoreDelete(g_settings_mutex);
++        g_settings_mutex = nullptr;
++        return error;
++    }
++
++    SetCurrentSettings(settings);
++    return ESP_OK;
++}
++
++AliroSettingsSnapshot AliroSettingsGet()
++{
++    AliroSettingsSnapshot settings = kAliroDefaultSettings;
++    if (g_settings_mutex && xSemaphoreTake(g_settings_mutex, portMAX_DELAY) == pdTRUE) {
++        settings = g_settings;
++        (void)xSemaphoreGive(g_settings_mutex);
++    }
++    return settings;
++}
++
++esp_err_t AliroSettingsStartSerial(uint16_t door_lock_endpoint_id)
++{
++    if (!g_settings_mutex || door_lock_endpoint_id == 0) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    g_door_lock_endpoint_id = door_lock_endpoint_id;
++    if (xTaskCreate(SerialTask, "aliro_serial", kSerialTaskStackSize, nullptr, kSerialTaskPriority, nullptr) != pdPASS) {
++        return ESP_ERR_NO_MEM;
++    }
++    return ESP_OK;
++}
