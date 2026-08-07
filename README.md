@@ -1,6 +1,7 @@
 # Aliro Door Lock for ESP32-C6
 
-Build a tap-to-unlock, virtual Matter-over-Thread door lock for about **$13**.
+Build a tap-to-lock or unlock, virtual Matter-over-Thread door lock for about
+**$13**.
 Add it to your smart home, use an Apple Home Key at the NFC reader, and use
 the lock state to start an automation.
 
@@ -28,7 +29,9 @@ cable, then connect the NanoC6 to your computer with a USB-C data cable.
 - Matter door lock over Thread on the ESP32-C6.
 - Matter setup from the browser, with a QR code for Apple Home, Google Home,
   or Home Assistant.
-- Apple Home Key setup and tap-to-unlock.
+- Apple Home Key setup and tap-to-lock or unlock. A valid tap changes the
+  lock state when auto-lock is off. When auto-lock is on, a valid tap unlocks
+  a locked lock and the timer locks it again.
 - Persistent Matter, Thread, Aliro, auto-lock, and LED settings across a
   preserving firmware update.
 - Green, red, or blue RGB feedback for successful credentials, failed

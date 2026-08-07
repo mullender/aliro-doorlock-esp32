@@ -126,7 +126,10 @@ The live monitor reads lines that start with `ALIRO/1`. It sends
 the user applies changed settings. The settings panel stays hidden until the
 monitor receives a complete, valid `ALIRO/1 STATUS` line for protocol 1.
 Auto-lock accepts 0 through 3,600 seconds. Zero disables auto-lock. Each LED
-duration accepts 0 through 10,000 milliseconds.
+duration accepts 0 through 10,000 milliseconds. If auto-lock is on and the lock
+is locked, a valid tap unlocks it. If the lock is already unlocked, the tap
+restarts the timer. If auto-lock is off, a valid tap unlocks a locked lock or
+locks an unlocked lock.
 
 The page gets the latest release version from `manifest-update.json`. It
 normalizes the release tag before it compares the version with the installed

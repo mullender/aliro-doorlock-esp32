@@ -64,6 +64,9 @@ component patch after dependency resolution:
 6. `0006-add-aliro-settings.patch` adds persistent serial settings. It
    controls auto-relock time and the three RGB result colors and
    durations. It also sets the project version flow for this release.
+7. `0007-toggle-lock-on-aliro-tap.patch` reads the Matter `LockState`
+   after each valid Aliro tap. It unlocks a locked lock. It locks an
+   unlocked lock only when auto-lock is off.
 
 The expected Door Lock FeatureMap is `0x2100` (`USR | ALIRO`). The
 build script checks the source feature calls and the pinned feature-bit
@@ -71,6 +74,14 @@ values before it starts `idf.py`. It also checks the RGB worker, Aliro
 FCI, reader-lock, and settings source contracts. It compiles and runs the
 host parser test before it starts `idf.py`. It removes all patches in
 reverse order when it exits.
+
+The tap source uses the generated Matter `LockState::Get` accessor and the
+existing `BoltLockMgr().Lock` and `BoltLockMgr().Unlock` methods. It reads the
+runtime auto-lock value from `DoorLockServer::GetAutoRelockTime()`. This is the
+same Matter attribute source that the relock timer uses. `AliroSettingsGet()`
+supplies the stored value when the app creates the attribute. When auto-lock is
+on, a tap restarts the Matter timer for an unlocked lock. This also starts a
+timer if auto-lock was enabled while the lock was already unlocked.
 
 The source assigns blue in two cases: a selected non-ISO-DEP NFC-A tag,
 or an ISO-DEP tag that rejects the Aliro AID select. A successful Aliro
@@ -160,11 +171,11 @@ scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
 
 `build_release.sh`:
 
-1. Applies source patches 0001 through 0004 and 0006 to the clean source
-   tree.
+1. Applies source patches 0001 through 0004, then 0006 and 0007, to the
+   clean source tree.
 2. Checks that the Door Lock FeatureMap is `0x2100` (`USR | ALIRO`).
-3. Checks the settings source contract, then compiles and runs the host
-   parser test.
+3. Checks the settings and tap-toggle source contracts, then compiles and
+   runs the host parser test.
 4. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
 5. Runs `idf.py set-target esp32c6` with the version from `TAG` and
    `SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"`.

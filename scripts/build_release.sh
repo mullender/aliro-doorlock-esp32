@@ -106,6 +106,7 @@ SOURCE_PATCHES=(
   "$REPO_ROOT/firmware/patches/0003-add-nanoc6-rgb-feedback.patch"
   "$REPO_ROOT/firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch"
   "$REPO_ROOT/firmware/patches/0006-add-aliro-settings.patch"
+  "$REPO_ROOT/firmware/patches/0007-toggle-lock-on-aliro-tap.patch"
 )
 DEPENDENCY_PATCHES=(
   "$REPO_ROOT/firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -387,8 +388,37 @@ validate_aliro_settings() {
   echo "=== Aliro settings: source contract and parser test passed ==="
 }
 
+validate_aliro_tap_toggle() {
+  local delegate_source="$APP_DIR/main/lock/aliro_door_lock_delegate.cpp"
+  local required_text
+  local required_tap_text=(
+    'DoorLock::Attributes::LockState::Get(door_lock_endpoint_id, lock_state)'
+    'lock_state.Value() == DoorLock::DlLockState::kLocked'
+    'BoltLockMgr().Unlock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro)'
+    'lock_state.Value() != DoorLock::DlLockState::kUnlocked'
+    'DoorLock::DoorLockServer::Instance().GetAutoRelockTime(door_lock_endpoint_id, auto_relock_seconds)'
+    'auto_relock_seconds != 0'
+    'BoltLockMgr().Lock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro)'
+    'ApplyAliroTapLockAction()'
+  )
+
+  for required_text in "${required_tap_text[@]}"; do
+    if ! grep -Fq "$required_text" "$delegate_source"; then
+      echo "error: Aliro tap-toggle source is missing: $required_text" >&2
+      return 2
+    fi
+  done
+  if [[ "$(grep -Fc 'BoltLockMgr().Unlock(' "$delegate_source")" -ne 2 ||
+        "$(grep -Fc 'BoltLockMgr().Lock(' "$delegate_source")" -ne 1 ]]; then
+    echo "error: Aliro taps must have one lock path and two unlock paths" >&2
+    return 2
+  fi
+  echo "=== Aliro tap: lock toggle contract passed ==="
+}
+
 validate_aliro_feature_map
 validate_aliro_settings
+validate_aliro_tap_toggle
 
 if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
   echo "=== Source patch check complete; idf.py was not run ==="
