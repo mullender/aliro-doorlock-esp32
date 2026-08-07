@@ -122,7 +122,7 @@
 </p>
 
 <section class="hardware-card" aria-labelledby="hardware-heading">
-  <h2 id="hardware-heading">Build a $13 tap-to-unlock Matter lock</h2>
+  <h2 id="hardware-heading">Build a $13 tap-to-lock or unlock Matter lock</h2>
   <p>
     Connect a
     <a href="https://shop.m5stack.com/products/m5stack-nanoc6-dev-kit">M5Stack NanoC6 Dev Kit</a>
@@ -178,6 +178,11 @@
         <input type="number" id="auto-lock-seconds" min="1" max="3600" step="1" inputmode="numeric" required /> seconds
       </label>
     </div>
+    <p id="auto-lock-help">
+      If auto-lock is on and the lock is locked, a valid tap unlocks it. If the
+      lock is already unlocked, the tap restarts the timer. If auto-lock is
+      off, a valid tap unlocks a locked lock or locks an unlocked lock.
+    </p>
     <div class="settings-grid">
       <span class="settings-heading">Result</span>
       <span class="settings-heading">Color</span>

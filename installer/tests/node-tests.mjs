@@ -1505,6 +1505,7 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/m5stack-nanoc6-dev-kit/);
   assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/nfc-universal-unit-st25r3916/);
   assert.match(html, /About \$13 total/);
+  assert.match(html, /Build a \$13 tap-to-lock or unlock Matter lock/);
   assert.match(html, /Google wallet key is not yet\s+verified/);
   assert.match(html, /<summary>Technical details<\/summary>/);
   assert.match(html, /The original QR cannot start pairing while BLE commissioning is closed/);
@@ -1513,9 +1514,25 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /Remove it from every Matter service and let each removal finish/);
   assert.match(html, /Factory install cannot notify a Matter service/);
   assert.match(html, /id="auto-lock-seconds"[^>]*max="3600"/);
+  assert.match(
+    html,
+    /If auto-lock is on and the lock is locked, a valid tap unlocks it\. If the\s+lock is already unlocked, the tap restarts the timer\. If auto-lock is\s+off, a valid tap unlocks a locked lock or locks an unlocked lock\./,
+  );
   for (const id of ["success-ms", "failure-ms", "other-ms"]) {
     assert.match(html, new RegExp(`id="${id}"[^>]*max="10000"`));
   }
+});
+
+test("firmware source checks require conditional tap-to-lock behavior", () => {
+  const script = readFileSync(new URL("../../scripts/build_release.sh", import.meta.url), "utf8");
+
+  assert.match(script, /DoorLock::Attributes::LockState::Get\(door_lock_endpoint_id, lock_state\)/);
+  assert.match(script, /lock_state\.Value\(\) == DoorLock::DlLockState::kLocked/);
+  assert.match(script, /DoorLock::DoorLockServer::Instance\(\)\.GetAutoRelockTime/);
+  assert.match(script, /auto_relock_seconds != 0/);
+  assert.match(script, /BoltLockMgr\(\)\.Lock\(door_lock_endpoint_id/);
+  assert.match(script, /BoltLockMgr\(\)\.Unlock\(door_lock_endpoint_id/);
+  assert.match(script, /0007-toggle-lock-on-aliro-tap\.patch/);
 });
 
 test("README and installer link to each other", () => {

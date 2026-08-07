@@ -23,6 +23,8 @@ stock `sdkconfig.esp32c6.aliro`.
 - `patches/0006-add-aliro-settings.patch` adds the versioned serial
   settings protocol, NVS storage, auto-relock control, and configurable
   RGB colors and durations.
+- `patches/0007-toggle-lock-on-aliro-tap.patch` unlocks a locked lock after
+  a valid tap. When auto-lock is off, it also locks an unlocked lock.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot.

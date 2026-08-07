@@ -1,0 +1,59 @@
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+index 0000000..0000000 100644
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -22,3 +22,4 @@
+-#include <app/clusters/door-lock-server/door-lock-server.h>
+-#include <lib/support/CodeUtils.h>
+-#include <platform/ESP32/ESP32Config.h>
++#include <app-common/zap-generated/attributes/Accessors.h>
++#include <app/clusters/door-lock-server/door-lock-server.h>
++#include <lib/support/CodeUtils.h>
++#include <platform/ESP32/ESP32Config.h>
+@@ -274,1 +275,35 @@
+-} // namespace
++void ApplyAliroTapLockAction()
++{
++    using namespace app::Clusters;
++
++    app::DataModel::Nullable<DoorLock::DlLockState> lock_state;
++    const Protocols::InteractionModel::Status status =
++        DoorLock::Attributes::LockState::Get(door_lock_endpoint_id, lock_state);
++    if (status != Protocols::InteractionModel::Status::Success || lock_state.IsNull()) {
++        ESP_LOGW("Aliro", "Could not read the lock state after a valid tap");
++        return;
++    }
++
++    if (lock_state.Value() == DoorLock::DlLockState::kLocked) {
++        BoltLockMgr().Unlock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro);
++        return;
++    }
++
++    if (lock_state.Value() != DoorLock::DlLockState::kUnlocked) {
++        return;
++    }
++
++    uint32_t auto_relock_seconds = 0;
++    if (!DoorLock::DoorLockServer::Instance().GetAutoRelockTime(door_lock_endpoint_id, auto_relock_seconds)) {
++        ESP_LOGW("Aliro", "Could not read the auto-lock time after a valid tap");
++        return;
++    }
++    if (auto_relock_seconds != 0) {
++        BoltLockMgr().Unlock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro);
++        return;
++    }
++
++    BoltLockMgr().Lock(door_lock_endpoint_id, DoorLock::OperationSourceEnum::kAliro);
++}
++
++} // namespace
+@@ -447,8 +482,7 @@ void AliroDoorLockDelegate::NfcDetectTask(void *delegate)
+             ShowStatusLed(StatusLedResult::kSuccess);
+             ESP_LOGI("Aliro", "Aliro NFC transaction completed successfully in %lld ms", (long long)session_time_ms);
+-            // UnLock the door lock
+             (void) DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+-                BoltLockMgr().Unlock(door_lock_endpoint_id, OperationSourceEnum::kAliro);
++                ApplyAliroTapLockAction();
+             });
+         } else if (g_aliro_select_rejected) {
+             ShowStatusLed(StatusLedResult::kOtherTag);
