@@ -28,7 +28,7 @@ cable, then connect the NanoC6 to your computer with a USB-C data cable.
 - Matter door lock over Thread on the ESP32-C6.
 - Matter setup from the browser, with a QR code for Apple Home, Google Home,
   or Home Assistant.
-- Apple Home Key setup and tap-to-lock or tap-to-unlock.
+- Apple Home Key setup and tap-to-unlock.
 - Persistent Matter, Thread, Aliro, auto-lock, and LED settings across a
   preserving firmware update.
 - Green, red, or blue RGB feedback for successful credentials, failed
@@ -50,8 +50,9 @@ You need:
 - the two M5Stack parts above;
 - a USB-C data cable;
 - Chrome or Edge on a desktop computer;
-- a Thread border router, such as a HomePod, a compatible Google Nest Hub,
-  or Home Assistant with a supported Thread radio; and
+- a Thread border router, such as a HomePod mini, a second-generation
+  HomePod, a compatible Google Nest Hub, or Home Assistant with a supported
+  Thread radio; and
 - Bluetooth on the phone that you use for Matter setup.
 
 Then:

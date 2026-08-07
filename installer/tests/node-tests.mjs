@@ -1502,7 +1502,6 @@ test("installer page includes all live monitor controls", () => {
   assert.match(html, /id="serial-reset" disabled>Reset device<\/button>/);
   assert.match(html, /id="serial-copy">Copy logs<\/button>/);
   assert.match(html, /<h2>Already commissioned<\/h2>/);
-  assert.match(html, /https:\/\/github\.com\/mullender\/aliro-doorlock-esp32/);
   assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/m5stack-nanoc6-dev-kit/);
   assert.match(html, /https:\/\/shop\.m5stack\.com\/products\/nfc-universal-unit-st25r3916/);
   assert.match(html, /About \$13 total/);
@@ -1517,6 +1516,20 @@ test("installer page includes all live monitor controls", () => {
   for (const id of ["success-ms", "failure-ms", "other-ms"]) {
     assert.match(html, new RegExp(`id="${id}"[^>]*max="10000"`));
   }
+});
+
+test("README and installer link to each other", () => {
+  const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+
+  assert.match(
+    readme,
+    /\[[^\]]+\]\(https:\/\/mullender\.github\.io\/aliro-doorlock-esp32\/\)/,
+  );
+  assert.match(
+    html,
+    /href=["']https:\/\/github\.com\/mullender\/aliro-doorlock-esp32["']/,
+  );
 });
 
 test("installer page keeps connection at the top and logs at the bottom", () => {

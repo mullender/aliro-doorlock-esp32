@@ -104,7 +104,7 @@
     /* Print: hide install row, keep pairing */
     @media print {
       body { background: white; color: black; }
-      .install-row, .setup-result, .serial-card, .settings-card, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
+      .hardware-card, .install-row, .setup-result, .serial-card, .settings-card, .warn, .browser-note, footer, .platform-tabs, .actions, .dev-banner { display: none !important; }
       .pairing { display: block !important; border: none; padding: 0; }
       .qr-box { border: none; }
     }
@@ -145,6 +145,10 @@
   <p>
     The board does not drive a physical lock by itself. Use an automation
     controller for the real action. Prices can change.
+  </p>
+  <p>
+    This is development hardware with Matter test attestation. Do not use it
+    as the only control for a door, alarm, or other safety-critical system.
   </p>
   <p>
     <a href="https://github.com/mullender/aliro-doorlock-esp32">Read the project README and view the source</a>.
@@ -250,10 +254,10 @@
           <summary>Apple Home refuses the QR</summary>
           <p>iOS 17.x sometimes rejects a valid Matter test attestation
              when the paired Thread border router has not published its
-             credentials. Confirm your HomePod or Apple TV is signed in
-             to the same iCloud account as the phone and try again after
-             a minute. If it still fails, use Home Assistant Companion
-             instead.</p>
+             credentials. Confirm your HomePod mini, second-generation
+             HomePod, or compatible Apple TV is signed in to the same iCloud
+             account as the phone and try again after a minute. If it still
+             fails, use Home Assistant Companion instead.</p>
         </details>
       </div>
 
@@ -326,7 +330,8 @@
   <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
     Safari and Firefox do not support Web Serial.</li>
   <li>A Thread border router on your LAN (Home Assistant + SkyConnect /
-    ZBT-1 / ZBT-2, Apple HomePod, or Google Nest Hub 2nd gen).</li>
+    ZBT-1 / ZBT-2, Apple HomePod mini or second-generation HomePod, or
+    Google Nest Hub 2nd gen).</li>
   <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
 </ul>
 
