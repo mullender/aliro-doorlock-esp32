@@ -127,7 +127,7 @@ complete install flow.
 
 ## Serial recovery limit
 
-Release `aliro-c6-v0.0.3-devkit` does not enable the CHIP shell. The
+Release `aliro-c6-v0.0.4-devkit` does not enable the CHIP shell. The
 post-install parser can reset the device once to capture a new boot log, but
 it cannot
 use `matter onboardingcodes` to reprint missed codes. The parser supports

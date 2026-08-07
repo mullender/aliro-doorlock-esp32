@@ -8,7 +8,7 @@
 # Arguments:
 #   BUILD_DIR   absolute path to an idf.py build/ directory that
 #               contains flasher_args.json (produced by `idf.py build`)
-#   TAG         release tag; default aliro-c6-v0.0.3-devkit
+#   TAG         release tag; default aliro-c6-v0.0.4-devkit
 #
 # Outputs (relative to the repo root):
 #   artifacts/<TAG>/<TAG>-factory.bin
@@ -24,16 +24,39 @@
 set -euo pipefail
 
 BUILD_DIR="${1:?usage: prepare_release.sh <BUILD_DIR> [<TAG>]}"
-TAG="${2:-aliro-c6-v0.0.3-devkit}"
+TAG="${2:-aliro-c6-v0.0.4-devkit}"
 
-if [[ ! "$TAG" =~ ^aliro-c6-[A-Za-z0-9._-]+$ ]]; then
+if [[ ! "$TAG" =~ ^aliro-c6-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
   echo "error: invalid Aliro release tag: $TAG" >&2
+  exit 2
+fi
+FIRMWARE_VERSION="${TAG#aliro-c6-v}"
+if [[ "${#FIRMWARE_VERSION}" -gt 31 ]]; then
+  echo "error: firmware version exceeds the 31-character app descriptor limit: $FIRMWARE_VERSION" >&2
   exit 2
 fi
 
 if [[ ! -f "$BUILD_DIR/flasher_args.json" ]]; then
   echo "error: $BUILD_DIR/flasher_args.json not found. Was 'idf.py build' run?" >&2
   exit 2
+fi
+if [[ ! -f "$BUILD_DIR/project_description.json" ]]; then
+  echo "error: $BUILD_DIR/project_description.json not found. Was 'idf.py build' run?" >&2
+  exit 2
+fi
+
+BUILD_VERSION="$(python3 - "$BUILD_DIR/project_description.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    description = json.load(source)
+print(description.get("project_version", ""))
+PY
+)"
+if [[ "$BUILD_VERSION" != "$FIRMWARE_VERSION" ]]; then
+  echo "error: build version is '$BUILD_VERSION', but tag requires '$FIRMWARE_VERSION'" >&2
+  exit 3
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

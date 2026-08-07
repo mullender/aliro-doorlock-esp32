@@ -20,9 +20,14 @@ stock `sdkconfig.esp32c6.aliro`.
   reader group identifier to ECP and handles selected non-ISO-DEP tags.
 - `patches/0005-add-m5nfc-aliro-ecp.patch` adds ECP and activation
   results to the pinned managed `m5nfc` component.
+- `patches/0006-add-aliro-settings.patch` adds the versioned serial
+  settings protocol, NVS storage, auto-relock control, and configurable
+  RGB colors and durations.
 - `RELEASE.md` contains the source pins, overlay symbols, build notes,
   and artifact contract.
 - `../scripts/build_release.sh` builds from a clean esp-matter snapshot.
+  It also compiles and runs the settings parser test before it starts the
+  firmware build.
 - `../scripts/prepare_release.sh` creates a 4 MB factory binary and an
   app-only preserving-update binary, with SHA-256 files for both. It
   stages and cross-checks the complete set before it publishes it.
