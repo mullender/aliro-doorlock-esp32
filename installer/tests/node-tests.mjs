@@ -3367,6 +3367,109 @@ test("assemble_release.py fails and preserves the destination inode when an empt
   });
 });
 
+// --- deploy-installer.yml Phase 1B matrix flow assertions ---
+// These read the workflow as text and verify the contract expected
+// by Phase 1B task 5B: only the matrix flow, no old aliro-c6 flow,
+// no placeholder writes, all three packages required from one tag,
+// the assembler is called, its per-variant output is copied, and
+// the current UI aliases point at the nanoc6-thread manifests.
+
+test("deploy-installer.yml drops the old aliro-c6 single-image flow and every placeholder path", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/deploy-installer.yml", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(workflow, /aliro-c6-/,
+    "old aliro-c6-* prefix must not appear anywhere in the workflow");
+  // Placeholder / empty manifest paths from the old flow.
+  for (const pattern of [
+    /no firmware yet/i,
+    /placeholder manifest/i,
+    /"builds": *\[\]/,
+    /no_binary\.flag/,
+    /publishing empty manifests/i,
+  ]) {
+    assert.doesNotMatch(workflow, pattern,
+      `workflow must not contain placeholder path: ${pattern}`);
+  }
+});
+
+test("deploy-installer.yml requires every variant's five-file package from one matrix release tag", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/deploy-installer.yml", import.meta.url),
+    "utf8",
+  );
+  // Strict matrix tag pattern is used to filter releases.
+  assert.match(workflow, /aliro-v\\d\+\\\.\\d\+\\\.\\d\+/);
+  // The three required variants are listed as REQUIRED_VARIANT_IDS.
+  assert.match(workflow, /REQUIRED_VARIANT_IDS = \("nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"\)/);
+  // Each variant requires exactly the five file names.
+  for (const suffix of [
+    "-factory.bin",
+    "-factory.bin.sha256",
+    "-app.bin",
+    "-app.bin.sha256",
+    "-manifest.txt",
+  ]) {
+    assert.match(workflow, new RegExp(`f"{stem}${suffix}"`),
+      `workflow must require every variant to ship ${suffix}`);
+  }
+  // Every asset must be present exactly once.
+  assert.match(workflow, /must have exactly one .* asset \(got \{len\(matches\)\}\)/);
+  // Extra assets outside the required matrix set are rejected.
+  assert.match(workflow, /carries assets outside the required matrix set/);
+});
+
+test("deploy-installer.yml calls scripts/assemble_release.py before Pages upload and copies its output", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/deploy-installer.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /python3 scripts\/assemble_release\.py \\/,
+    "workflow must invoke scripts/assemble_release.py");
+  assert.match(workflow, /--tag "\$\{\{ steps\.matrix\.outputs\.tag \}\}"/);
+  assert.match(workflow, /--variants firmware\/variants\.json/);
+  assert.match(workflow, /--assets  "\$\{\{ steps\.matrix\.outputs\.assets_dir \}\}"/);
+  assert.match(workflow, /--out     work\/assembled/);
+  // The verified output gets copied into _site before Pages runs.
+  assert.match(workflow, /cp -R work\/assembled\/\. _site\//);
+  // Order: the assemble step must appear BEFORE upload-pages-artifact.
+  const assemblePos = workflow.indexOf("Assemble the matrix release");
+  const uploadPos = workflow.indexOf("upload-pages-artifact");
+  const deployPos = workflow.indexOf("deploy-pages");
+  assert.ok(assemblePos > 0 && uploadPos > 0 && deployPos > 0);
+  assert.ok(assemblePos < uploadPos,
+    "assembler must run before Pages upload");
+  assert.ok(uploadPos < deployPos,
+    "Pages upload must precede deploy");
+});
+
+test("deploy-installer.yml aliases manifest.json and manifest-update.json to the nanoc6-thread manifests", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/deploy-installer.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /test -f "_site\/manifest-nanoc6-thread\.json"/,
+    "alias step must first assert the source manifest exists");
+  assert.match(workflow, /test -f "_site\/manifest-update-nanoc6-thread\.json"/);
+  assert.match(workflow, /cp "_site\/manifest-nanoc6-thread\.json" "_site\/manifest\.json"/);
+  assert.match(workflow,
+    /cp "_site\/manifest-update-nanoc6-thread\.json" "_site\/manifest-update\.json"/);
+  // No other variant may be aliased to the UI-facing names.
+  assert.doesNotMatch(workflow, /manifest-nanoc6-wifi\.json"\s+"_site\/manifest\.json"/);
+  assert.doesNotMatch(workflow,
+    /manifest-atoms3-lite-wifi\.json"\s+"_site\/manifest\.json"/);
+});
+
+test("deploy-installer.yml does not write releases.json until code consumes it", () => {
+  const workflow = readFileSync(
+    new URL("../../.github/workflows/deploy-installer.yml", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(workflow, /releases\.json/,
+    "workflow must not create releases.json unless current code consumes it");
+});
+
 test("README and installer link to each other", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");

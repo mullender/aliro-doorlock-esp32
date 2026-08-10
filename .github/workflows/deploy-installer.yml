@@ -1,30 +1,50 @@
 # Build and publish the aliro-doorlock-esp32 installer to GitHub Pages.
 #
-# The installer is a small ESP Web Tools page. Its factory and app-only
-# binaries come from a GitHub Release on this repo (tags matching "aliro-c6-*").
-# Direct browser fetches of release assets do not carry CORS headers
-# (release-assets.githubusercontent.com sends no
-# Access-Control-Allow-Origin), so this workflow downloads the verified
-# binaries and serves them from the same Pages origin.
+# The installer is a small ESP Web Tools page. Its per-variant factory
+# and app assets come from one matrix release on this repository. Direct
+# browser fetches of release assets do not carry CORS headers, so this
+# workflow downloads the verified assets and serves them from the same
+# Pages origin.
 #
-# Also: this repo vendors esp-web-tools under
+# Phase 1B matrix flow:
+#
+# 1. Select exactly one published non-draft GitHub Release whose tag
+#    matches the strict pattern `aliro-vX.Y.Z` with an optional
+#    `-<suffix>` label. A requested or event tag must match exactly.
+#    If no matching release exists, the workflow fails. It never
+#    writes placeholder or empty manifests.
+# 2. Download the complete five-file package for each variant
+#    (`nanoc6-thread`, `nanoc6-wifi`, `atoms3-lite-wifi`) from that
+#    release. Place the downloads in the layout
+#    `<work>/assets/<TAG>/<VARIANT>/` that scripts/assemble_release.py
+#    accepts.
+# 3. Run `scripts/assemble_release.py` before preparing `_site`. The
+#    assembler verifies every asset (sidecars, package manifest
+#    identity, chip, 4 MiB factory size, embedded partition SHA at
+#    0xC000, embedded app at 0x20000) and emits one factory + one
+#    preserving-update manifest per variant. If any check fails, the
+#    job fails before Pages is uploaded or deployed.
+# 4. Copy the verified flat assembler output into `_site`, along with
+#    the static installer HTML and JS and the built vendored
+#    esp-web-tools files.
+# 5. Alias `manifest.json` and `manifest-update.json` to the
+#    nanoc6-thread manifests so the current installer UI keeps
+#    working until a later task refreshes it. The aliases contain
+#    real verified data; no placeholder is generated.
+#
+# The workflow also vendors esp-web-tools under
 # installer/vendor/esp-web-tools (git submodule). The vendored branch
 # carries only PR 733 (awaited onPostFlash callback) on top of upstream
 # esphome/esp-web-tools main. The workflow builds it (npm ci +
-# script/build) and copies dist/web/ into _site/vendor/dist/ so the
-# installer HTML references a local, PR-733-patched copy of the library.
+# script/build) and copies dist/web/ into _site/vendor/dist/.
 #
 # Triggers:
-#   - release: published (tag prefix aliro-c6-*)
-#   - workflow_dispatch (manual, optional tag input)
-#   - push to installer/** or .github/workflows/deploy-installer.yml so a
-#     patch to the vendored library, flasher UI, or workflow republishes
-#     without waiting on a new firmware release.
-#
-# This workflow is a sibling of the one in mullender/HomeKey-ESP32.
-# The download-and-verify pattern is intentionally the same shape so
-# the two repos are easy to reason about together, but this repo's
-# tag prefix, chip family, and Node build step are distinct.
+#   - release: published (matrix tag prefix `aliro-v`)
+#   - workflow_dispatch (manual, optional exact tag input)
+#   - push to installer/**, firmware/variants.json,
+#     scripts/assemble_release.py, or this file so a UI, matrix, or
+#     assembler change republishes without waiting on a new firmware
+#     release.
 
 name: deploy-installer
 
@@ -34,13 +54,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish as latest (empty = newest matching)"
+        description: "Matrix release tag to publish (empty = newest matching)"
         required: false
         default: ""
   push:
     branches: [main]
     paths:
       - "installer/**"
+      - "firmware/variants.json"
+      - "scripts/assemble_release.py"
       - ".github/workflows/deploy-installer.yml"
 
 permissions:
@@ -56,13 +78,13 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    # Only run for our own release tag prefix, or for manual dispatch,
-    # or for a push. Releases on other tag prefixes are ignored.
+    # Only run for a matrix release tag, a manual dispatch, or a push
+    # to a watched path. Other release tag prefixes are ignored.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'push' ||
       (github.event_name == 'release' &&
-       startsWith(github.event.release.tag_name, 'aliro-c6-'))
+       startsWith(github.event.release.tag_name, 'aliro-v'))
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -84,11 +106,11 @@ jobs:
           cache-dependency-path: installer/vendor/esp-web-tools/package-lock.json
 
       - name: Build vendored esp-web-tools
-        # NB: the fork's build script writes src/version.ts as a side effect
-        # and then rebuilds. That is expected. If this step errors with
-        # "cannot find module", the submodule is either missing or empty —
-        # run scripts/setup_vendor.sh locally, commit the submodule
-        # reference, and retry.
+        # The fork's build script writes src/version.ts as a side
+        # effect and then rebuilds. That is expected. If this step
+        # errors with "cannot find module", the submodule is either
+        # missing or empty. Run scripts/setup_vendor.sh locally, commit
+        # the submodule reference, and retry.
         working-directory: installer/vendor/esp-web-tools
         run: |
           npm ci --loglevel=error --no-progress
@@ -98,49 +120,41 @@ jobs:
       - name: Test installer integration
         run: node --test installer/tests/node-tests.mjs
 
-      - name: Set up Python (for release download and verification)
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Prepare _site skeleton
-        run: |
-          set -euo pipefail
-          mkdir -p _site _site/vendor _site/vendor/dist
-
-          # Static UI on top: installer/index.html and its js/, vendor/qrcode.js.
-          cp installer/index.html _site/index.html
-          mkdir -p _site/js
-          cp installer/js/*.js _site/js/
-          # QR generator library (checked in, not built).
-          cp installer/vendor/qrcode.js _site/vendor/qrcode.js
-
-          # Built esp-web-tools output from the fork.
-          cp -r installer/vendor/esp-web-tools/dist/web/* _site/vendor/dist/
-
-          # .nojekyll is important — the file names include hashes with
-          # leading underscores that Jekyll would filter out silently.
-          touch _site/.nojekyll
-
-      - name: Discover the target firmware release
-        id: firmware
+      - name: Select the matrix release and download every variant
+        id: matrix
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           REQUESTED_TAG: ${{ github.event.inputs.tag || '' }}
           EVENT_TAG: ${{ github.event.release.tag_name || '' }}
+        # The step enumerates non-draft releases from the GitHub API,
+        # picks exactly one that matches the strict matrix tag
+        # pattern, and downloads the five files each variant requires
+        # into work/assets/<TAG>/<VARIANT>/. Any missing file, wrong
+        # count, or wrong pattern fails the job before Pages runs.
         run: |
           set -euo pipefail
-
-          # Enumerate aliro-c6-* releases (newest first per API ordering).
-          # If there are none yet (repo just created, no firmware released),
-          # write placeholder manifests that the installer UI will render as
-          # "no firmware available" gracefully and continue with the site.
           python3 - <<'PY'
-          import json, os, sys, urllib.request
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          TAG_PATTERN = re.compile(r"^aliro-v\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$")
+          REQUIRED_VARIANT_IDS = ("nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi")
 
           repo = os.environ["REPO"]
           token = os.environ["GH_TOKEN"]
+          requested = os.environ.get("REQUESTED_TAG", "").strip()
+          event = os.environ.get("EVENT_TAG", "").strip()
 
           def gh(url):
               req = urllib.request.Request(url, headers={
@@ -154,221 +168,150 @@ jobs:
           page = 1
           while True:
               batch = gh(f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}")
-              if not batch: break
+              if not batch:
+                  break
               releases.extend(batch)
+              if len(batch) < 100:
+                  break
               page += 1
-              if len(batch) < 100: break
 
-          matching = [r for r in releases if r["tag_name"].startswith("aliro-c6-")]
-          matching.sort(key=lambda r: r["created_at"], reverse=True)
+          def is_matrix(release):
+              return (not release.get("draft") and
+                      isinstance(release.get("tag_name"), str) and
+                      TAG_PATTERN.match(release["tag_name"]))
 
-          if not matching:
-              print("::warning::No releases match 'aliro-c6-*'. Publishing site "
-                    "without a firmware. The install button will be non-functional "
-                    "until a release exists.")
-              # Write placeholder manifests so the page still renders.
-              factory_manifest = {
-                  "name": "Aliro door-lock reader (no firmware yet)",
-                  "version": "unreleased",
-                  "new_install_prompt_erase": False,
-                  "new_install_improv_wait_time": 0,
-                  "builds": [],
-              }
-              with open("_site/manifest.json", "w") as f:
-                  json.dump(factory_manifest, f, indent=2)
-              update_manifest = {
-                  "name": "Aliro door-lock reader update (no firmware yet)",
-                  "version": "unreleased",
-                  "new_install_prompt_erase": True,
-                  "new_install_improv_wait_time": 0,
-                  "builds": [],
-              }
-              with open("_site/manifest-update.json", "w") as f:
-                  json.dump(update_manifest, f, indent=2)
-              with open("_site/releases.json", "w") as f:
-                  json.dump({
-                      "latest_tag": None,
-                      "partition_layout": {
-                          "id": "esp32c6-door-lock-4mb-v1",
-                          "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
-                          "ota_slot_size": 0x1E0000,
-                          "ota_offsets": [0x20000, 0x200000],
-                      },
-                      "releases": [],
-                  }, f, indent=2)
-              # Signal downstream steps that there are no binaries to fetch.
-              open("no_binary.flag", "w").close()
-              sys.exit(0)
+          matching = [r for r in releases if is_matrix(r)]
 
-          req_tag = os.environ.get("REQUESTED_TAG", "").strip()
-          event_tag = os.environ.get("EVENT_TAG", "").strip()
+          def die(message):
+              print(f"::error::{message}")
+              sys.exit(1)
 
-          latest = None
-          if req_tag:
-              latest = next((r for r in matching if r["tag_name"] == req_tag), None)
-              if latest is None:
-                  print(f"::error::Requested tag '{req_tag}' not found among aliro-c6-* releases.")
-                  sys.exit(1)
-          elif event_tag and event_tag.startswith("aliro-c6-"):
-              latest = next((r for r in matching if r["tag_name"] == event_tag), None) or matching[0]
+          if requested:
+              if not TAG_PATTERN.match(requested):
+                  die(f"requested tag {requested!r} does not match aliro-vX.Y.Z pattern")
+              selected = [r for r in matching if r["tag_name"] == requested]
+              if not selected:
+                  die(f"no published non-draft matrix release with tag {requested!r}")
+              release = selected[0]
+          elif event:
+              if not TAG_PATTERN.match(event):
+                  die(f"event tag {event!r} does not match aliro-vX.Y.Z pattern")
+              selected = [r for r in matching if r["tag_name"] == event]
+              if not selected:
+                  die(f"event tag {event!r} has no matching published non-draft matrix release")
+              release = selected[0]
           else:
-              latest = matching[0]
+              if not matching:
+                  die("no published non-draft matrix release matches the aliro-vX.Y.Z pattern")
+              matching.sort(key=lambda r: r["created_at"], reverse=True)
+              release = matching[0]
 
-          print(f"Latest release: {latest['tag_name']} (target={latest['target_commitish']})")
+          tag = release["tag_name"]
+          print(f"Selected matrix release: {tag}")
 
-          with open("_site/releases.json", "w") as f:
-              json.dump({
-                  "latest_tag": latest["tag_name"],
-                  "notes": "Only 'latest_tag' is flashable from this Pages site.",
-                  "partition_layout": {
-                      "id": "esp32c6-door-lock-4mb-v1",
-                      "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
-                      "ota_slot_size": 0x1E0000,
-                      "ota_offsets": [0x20000, 0x200000],
-                  },
-                  "releases": [{
-                      "tag": r["tag_name"],
-                      "commit": r["target_commitish"],
-                      "prerelease": r["prerelease"],
-                      "created_at": r["created_at"],
-                      "html_url": r["html_url"],
-                      "assets": [
-                          {"name": a["name"], "size": a["size"],
-                           "browser_download_url": a["browser_download_url"]}
-                          for a in r["assets"]
-                      ],
-                  } for r in matching],
-              }, f, indent=2)
-          with open("latest_release.json", "w") as f:
-              json.dump(latest, f)
-          PY
+          assets = {a["name"]: a for a in release.get("assets", [])}
 
-      - name: Download and verify factory and update binaries
-        if: hashFiles('no_binary.flag') == ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, hashlib, os, sys, urllib.request
-
-          latest = json.load(open("latest_release.json"))
-          token = os.environ["GH_TOKEN"]
-          tag   = latest["tag_name"]
-
-          assets = latest["assets"]
-          expected_names = {
-              "factory": f"{tag}-factory.bin",
-              "factory_sha": f"{tag}-factory.bin.sha256",
-              "app": f"{tag}-app.bin",
-              "app_sha": f"{tag}-app.bin.sha256",
-          }
-
-          def require_asset(name):
-              matches = [asset for asset in assets if asset["name"] == name]
-              if len(matches) != 1:
-                  print(f"::error::Expected exactly one release asset named '{name}' on {tag}, got {len(matches)}")
-                  sys.exit(1)
-              return matches[0]
-
-          selected = {key: require_asset(name) for key, name in expected_names.items()}
-
-          def download(asset_id):
+          def download(asset):
               req = urllib.request.Request(
-                  f"https://api.github.com/repos/{os.environ['REPO']}/releases/assets/{asset_id}",
+                  f"https://api.github.com/repos/{repo}/releases/assets/{asset['id']}",
                   headers={"Authorization": f"Bearer {token}",
                            "Accept": "application/octet-stream"})
-              return urllib.request.urlopen(req, timeout=120).read()
+              return urllib.request.urlopen(req, timeout=180).read()
 
-          def verify_pair(binary_key, sidecar_key):
-              binary_asset = selected[binary_key]
-              sidecar_asset = selected[sidecar_key]
-              binary = download(binary_asset["id"])
-              sidecar = download(sidecar_asset["id"]).decode().strip().split()
-              if len(sidecar) < 2 or sidecar[1] != binary_asset["name"]:
-                  print(f"::error::Invalid SHA-256 sidecar for {binary_asset['name']}")
-                  sys.exit(1)
-              expected = sidecar[0].lower()
-              actual = hashlib.sha256(binary).hexdigest().lower()
-              if expected != actual:
-                  print(f"::error::SHA-256 mismatch on {binary_asset['name']}: expected {expected}, got {actual}")
-                  sys.exit(1)
-              if len(binary) != binary_asset["size"]:
-                  print(f"::error::Size mismatch on {binary_asset['name']}: expected {binary_asset['size']}, got {len(binary)}")
-                  sys.exit(1)
-              with open(f"_site/{binary_asset['name']}", "wb") as output:
-                  output.write(binary)
-              with open(f"_site/{sidecar_asset['name']}", "w") as output:
-                  output.write(f"{actual}  {binary_asset['name']}\n")
-              return binary_asset["name"], binary, actual
+          work = Path("work") / "assets" / tag
+          for variant_id in REQUIRED_VARIANT_IDS:
+              stem = f"{tag}-{variant_id}"
+              expected = [
+                  f"{stem}-factory.bin",
+                  f"{stem}-factory.bin.sha256",
+                  f"{stem}-app.bin",
+                  f"{stem}-app.bin.sha256",
+                  f"{stem}-manifest.txt",
+              ]
+              variant_dir = work / variant_id
+              variant_dir.mkdir(parents=True, exist_ok=True)
+              for name in expected:
+                  matches = [a for a in release["assets"] if a["name"] == name]
+                  if len(matches) != 1:
+                      die(f"variant {variant_id}: release {tag} must have exactly one {name} asset (got {len(matches)})")
+                  data = download(matches[0])
+                  if len(data) != matches[0]["size"]:
+                      die(f"asset size mismatch on {name}: expected {matches[0]['size']}, downloaded {len(data)}")
+                  (variant_dir / name).write_bytes(data)
 
-          factory_name, factory_bytes, factory_sha = verify_pair("factory", "factory_sha")
-          app_name, app_bytes, app_sha = verify_pair("app", "app_sha")
-          factory_size = len(factory_bytes)
-          app_size = len(app_bytes)
-          if factory_size != 4 * 1024 * 1024:
-              print(f"::error::Factory image is {factory_size} bytes; expected 4194304")
-              sys.exit(1)
-          if app_size == 0 or app_size > 0x1E0000:
-              print(f"::error::App image is {app_size} bytes; OTA slot limit is 0x1E0000")
-              sys.exit(1)
-          partition_bytes = factory_bytes[0xC000:0xCC00]
-          partition_sha = hashlib.sha256(partition_bytes).hexdigest()
-          expected_partition_sha = "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421"
-          if len(partition_bytes) != 0xC00 or partition_sha != expected_partition_sha:
-              print(f"::error::Factory partition-table SHA-256 is {partition_sha}; expected {expected_partition_sha}")
-              sys.exit(1)
-          if factory_bytes[0x20000:0x20000 + app_size] != app_bytes:
-              print("::error::App asset does not match the factory image at offset 0x20000")
-              sys.exit(1)
+          # Also refuse to proceed if the release contains extra
+          # per-variant assets that do not belong to the matrix.
+          # A stray file could sneak into a later assembler run.
+          allowed = set()
+          for variant_id in REQUIRED_VARIANT_IDS:
+              stem = f"{tag}-{variant_id}"
+              allowed.update([
+                  f"{stem}-factory.bin", f"{stem}-factory.bin.sha256",
+                  f"{stem}-app.bin", f"{stem}-app.bin.sha256",
+                  f"{stem}-manifest.txt",
+              ])
+          extras = sorted(name for name in assets if name not in allowed)
+          if extras:
+              die(f"release {tag} carries assets outside the required matrix set: {extras}")
 
-          # ESP Web Tools manifests for ESP32-C6.
-          # improv is false because the Aliro C6 build is Matter-over-Thread —
-          # commissioning runs over BLE from a phone app, not over Improv
-          # Wi-Fi. new_install_improv_wait_time=0 short-circuits the library's
-          # Improv wait state.
-          factory_manifest = {
-              "name": "Aliro door-lock reader (M5 NanoC6)",
-              "version": tag,
-              "new_install_prompt_erase": False,
-              "new_install_improv_wait_time": 0,
-              "builds": [{
-                  "chipFamily": "ESP32-C6",
-                  "parts": [{"path": factory_name, "offset": 0}],
-              }],
-          }
-          with open("_site/manifest.json", "w") as f:
-              json.dump(factory_manifest, f, indent=2)
-
-          update_manifest = {
-              "name": "Aliro door-lock reader update (keep setup)",
-              "version": tag,
-              "new_install_prompt_erase": True,
-              "new_install_improv_wait_time": 0,
-              "builds": [{
-                  "chipFamily": "ESP32-C6",
-                  "parts": [
-                      {"path": app_name, "offset": 0x20000},
-                      {"path": app_name, "offset": 0x200000},
-                  ],
-              }],
-          }
-          with open("_site/manifest-update.json", "w") as f:
-              json.dump(update_manifest, f, indent=2)
-
-          print(f"Prepared factory image {factory_name} ({factory_size} bytes, sha256={factory_sha})")
-          print(f"Prepared app image {app_name} ({app_size} bytes, sha256={app_sha})")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as sink:
+              sink.write(f"tag={tag}\n")
+              sink.write(f"assets_dir={work.parent}\n")
           PY
+
+      - name: Assemble the matrix release
+        # The assembler verifies every downloaded package and writes a
+        # single flat output directory with per-variant factory + app +
+        # sidecars + factory manifest + update manifest. A failure here
+        # exits non-zero and short-circuits Pages upload.
+        run: |
+          set -euo pipefail
+          python3 scripts/assemble_release.py \
+            --tag "${{ steps.matrix.outputs.tag }}" \
+            --variants firmware/variants.json \
+            --assets  "${{ steps.matrix.outputs.assets_dir }}" \
+            --out     work/assembled
+
+      - name: Prepare _site skeleton
+        # Copy the assembled matrix output plus the static installer
+        # into _site. The alias step below preserves the current UI's
+        # `manifest.json` and `manifest-update.json` request paths.
+        run: |
+          set -euo pipefail
+          mkdir -p _site _site/vendor _site/vendor/dist _site/js
+
+          cp installer/index.html _site/index.html
+          cp installer/js/*.js _site/js/
+          cp installer/vendor/qrcode.js _site/vendor/qrcode.js
+          cp -r installer/vendor/esp-web-tools/dist/web/* _site/vendor/dist/
+
+          # .nojekyll is important — some file names include hashes with
+          # leading underscores that Jekyll would filter out silently.
+          touch _site/.nojekyll
+
+          cp -R work/assembled/. _site/
+
+      - name: Alias the current UI manifests to nanoc6-thread
+        # installer/index.html and installer/js/device-settings.js
+        # still request `manifest.json` and `manifest-update.json`.
+        # Alias both to the verified nanoc6-thread manifests so the UI
+        # keeps working until the next task refreshes it. The aliases
+        # carry real verified data; nothing is generated.
+        run: |
+          set -euo pipefail
+          test -f "_site/manifest-nanoc6-thread.json"
+          test -f "_site/manifest-update-nanoc6-thread.json"
+          cp "_site/manifest-nanoc6-thread.json" "_site/manifest.json"
+          cp "_site/manifest-update-nanoc6-thread.json" "_site/manifest-update.json"
 
       - name: Dump _site contents for the run log
         run: |
           echo "==== _site tree ===="
           find _site -maxdepth 3 -print
-          echo "==== manifest.json ===="
-          cat _site/manifest.json || true
-          echo "==== manifest-update.json ===="
-          cat _site/manifest-update.json || true
+          for manifest in _site/manifest*.json; do
+            echo "==== $(basename "$manifest") ===="
+            cat "$manifest" || true
+          done
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
