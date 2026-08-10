@@ -1,0 +1,191 @@
+Add a minimal browser firmware-upload UI on top of the POST
+/api/ota endpoint from patch 0016. Applied only to nanoc6-wifi
+and atoms3-lite-wifi via variants.json; nanoc6-thread never
+applies, compiles, links, or exposes any of the code here.
+
+Scope, kept minimal (no new C++ handler or endpoint, no
+multipart, no XHR / progress bar, no polling / reconnect loop,
+no authentication, no settings or log changes, no new runtime
+dependency, no partition change, no build-file change, no
+other UI redesign):
+
+  * MODIFY main/aliro_local_web.cpp -> kIndexHtml only:
+      - New "Update firmware" section between the Recent logs
+        block and the Machine endpoints list:
+          * <p><small> warning that the .bin must match the
+            board and transport variant.
+          * <form id="ota-form" onsubmit="return false">
+            containing a required <input type="file"
+            id="ota-file" accept=".bin"> and a
+            <button type="submit" id="ota-submit">
+            Upload and restart</button>.
+          * <p id="ota-status" role="status"
+            aria-live="polite">.
+      - /api/ota added to the Machine endpoints <ul>: a plain
+        <code>POST /api/ota</code> item documenting the
+        application/octet-stream body and the exact
+        {"ok":true,"restarting":true} success response.
+      - New <script> IIFE, SEPARATE from the QR IIFE, the
+        settings IIFE, and the log-viewer IIFE, wires the OTA
+        form. On submit:
+          * preventDefault so the browser never navigates.
+          * Read the selected File. Missing or zero-byte file
+            -> setStatus red, controls stay enabled, return.
+          * Disable the file input and the submit button; set
+            status to Uploading (aria-live).
+          * fetch POST /api/ota with headers
+            'Content-Type':'application/octet-stream' and the
+            File as the raw body. No multipart, no FormData,
+            no manual chunking, no progress bar.
+          * On the response: require r.ok, else throw
+            'HTTP <status>'; then call r.json() (letting
+            r.json() reject with its original error name so
+            SyntaxError / TypeError are classified correctly);
+            then require the strict schema
+            j.ok === true && j.restarting === true, else throw
+            'unexpected response'.
+          * On success: setStatus 'Update accepted. The device
+            is restarting.' Controls STAY DISABLED so a false
+            success cannot be re-submitted while the device
+            reboots.
+          * On any failure (HTTP, network, JSON, schema, body
+            read): setStatus red with the failure message,
+            RE-ENABLE both controls so the user can retry.
+
+Explicit non-goals for this patch: no new C++ handler or
+endpoint (POST /api/ota is patch 0016), no multipart parser,
+no XHR / XMLHttpRequest, no upload progress bar, no polling or
+reconnect loop, no auth, no settings or log changes, no new
+runtime dependency, no partition change, no build-system
+change (SRC_DIRS "." already picks up main/ .cpp files), no
+other UI redesign.
+
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+--- a/examples/door_lock/main/aliro_local_web.cpp
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -178,23 +178,39 @@
+     "<button type=\"button\" id=\"logs-refresh\">Refresh logs</button> "
+     "<a href=\"/api/logs\" id=\"logs-link\">Open <code>/api/logs</code></a>"
+     "</p>"
+     "<pre id=\"logs\" style=\"max-height:20rem;overflow:auto;background:#f5f5f5;"
+     "padding:.5rem;border-radius:.25rem;white-space:pre-wrap;word-break:break-all;"
+     "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em\">"
+     "Loading logs&hellip;</pre>"
+     "<p id=\"logs-status\" role=\"status\" aria-live=\"polite\"></p>"
++    "<h2>Update firmware</h2>"
++    "<p><small>Upload a firmware <code>.bin</code> built for this "
++    "exact board and transport variant. The device will reject a "
++    "mismatched image after upload; re-check the download name "
++    "before uploading.</small></p>"
++    "<form id=\"ota-form\" onsubmit=\"return false\">"
++    "<p>"
++    "<input type=\"file\" id=\"ota-file\" accept=\".bin\" required> "
++    "<button type=\"submit\" id=\"ota-submit\">Upload and restart</button>"
++    "</p>"
++    "</form>"
++    "<p id=\"ota-status\" role=\"status\" aria-live=\"polite\"></p>"
+     "<h2>Machine endpoints</h2><ul>"
+     "<li><a href=\"/api/status\"><code>/api/status</code></a></li>"
+     "<li><a href=\"/api/pairing\"><code>/api/pairing</code></a></li>"
+     "<li><a href=\"/api/settings\"><code>/api/settings</code></a> "
+     "(GET and POST application/x-www-form-urlencoded)</li>"
+     "<li><a href=\"/api/logs\"><code>/api/logs</code></a> "
+     "(text/plain, recent 16 KiB ring)</li>"
++    "<li><code>POST /api/ota</code> "
++    "(application/octet-stream, raw firmware image; the response "
++    "is <code>{\"ok\":true,\"restarting\":true}</code> and the "
++    "device restarts on success)</li>"
+     "<li><a href=\"/qrcode.js\"><code>/qrcode.js</code></a> "
+     "(local MIT-licensed QR generator, gzip-encoded)</li>"
+     "</ul>"
+     "<script src=\"/qrcode.js\" defer></script>"
+     "<script>"
+     "(function(){"
+     "var showError=function(msg){"
+     "var e=document.getElementById('error');"
+@@ -395,16 +411,85 @@
+     "btn.addEventListener('click',refresh);"
+     "refresh();"
+     "};"
+     "if(document.readyState==='loading'){"
+     "document.addEventListener('DOMContentLoaded',wire);"
+     "}else{wire();}"
+     "})();"
+     "</script>"
++    "<script>"
++    "(function(){"
++    "var setStatus=function(text,isError){"
++    "var el=document.getElementById('ota-status');"
++    "if(!el){return;}"
++    "el.textContent=text;"
++    "el.style.color=isError?'#a11':'';"
++    "};"
++    "var setDisabled=function(v){"
++    "var f=document.getElementById('ota-file');"
++    "var b=document.getElementById('ota-submit');"
++    "if(f){f.disabled=v;}"
++    "if(b){b.disabled=v;}"
++    "};"
++    "var submit=function(ev){"
++    "if(ev&&ev.preventDefault){ev.preventDefault();}"
++    "var f=document.getElementById('ota-file');"
++    "var file=(f&&f.files&&f.files.length>0)?f.files[0]:null;"
++    "if(!file){"
++    "setStatus('Please choose a firmware .bin file first.',true);"
++    "return;"
++    "}"
++    "if(!file.size||file.size===0){"
++    "setStatus('The selected file is empty.',true);"
++    "return;"
++    "}"
++    "setDisabled(true);"
++    "setStatus('Uploading\\u2026');"
++    // POST the raw File as the request body with Content-Type
++    // application/octet-stream. The browser streams the File
++    // directly; no multipart, no manual read, no progress bar.
++    "fetch('/api/ota',{"
++    "method:'POST',"
++    "headers:{'Content-Type':'application/octet-stream'},"
++    "body:file"
++    "}).then(function(r){"
++    "if(!r.ok){throw new Error('HTTP '+r.status);}"
++    // Let r.json() reject with its original error name (SyntaxError
++    // for malformed JSON, TypeError for a network body-read
++    // failure) so the outer catch classifies the failure by
++    // err.name.
++    "return r.json();"
++    "}).then(function(j){"
++    // Strict schema check: only the exact {ok:true,restarting:true}
++    // is accepted. Anything else is a schema failure with the
++    // controls re-enabled below, so a false success can never
++    // slip through.
++    "if(!j||j.ok!==true||j.restarting!==true){"
++    "throw new Error('unexpected response');"
++    "}"
++    // Success: keep controls disabled and tell the user the device
++    // is restarting. Do NOT re-enable controls on the success
++    // path.
++    "setStatus('Update accepted. The device is restarting.');"
++    "}).catch(function(err){"
++    "setStatus('Upload failed: '+err.message,true);"
++    "setDisabled(false);"
++    "});"
++    "};"
++    "var wire=function(){"
++    "var form=document.getElementById('ota-form');"
++    "if(!form){return;}"
++    "form.addEventListener('submit',submit);"
++    "};"
++    "if(document.readyState==='loading'){"
++    "document.addEventListener('DOMContentLoaded',wire);"
++    "}else{wire();}"
++    "})();"
++    "</script>"
+     "</html>";
+
+ // Embedded local QR generator asset (installer/vendor/qrcode.js,
+ // gzip-encoded, MIT-licensed). Defined in aliro_local_web_qrcode_asset.cpp.
+ extern "C" const unsigned char kAliroQrcodeJsGz[];
+ extern "C" const unsigned int  kAliroQrcodeJsGzLen;
+
+ // Append one JSON-escaped string into a bounded buffer. Returns the

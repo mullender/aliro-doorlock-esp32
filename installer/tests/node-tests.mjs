@@ -7970,3 +7970,356 @@ test("phase 3 task 2 state model: post-loop short_body invariant -> Abort exactl
   assert.equal(ota.calls.abort - abortsBefore, 1,
     "the invariant path Abort still counts as exactly one Abort per HTTP-layer failure");
 });
+
+// -----------------------------------------------------------------------
+// Phase 3 task 3: browser firmware-upload UI
+// -----------------------------------------------------------------------
+
+const PHASE3_TASK3_PATCH = "firmware/patches/0017-add-wifi-ota-upload-ui.patch";
+
+function phase3Task3PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE3_TASK3_PATCH}`, import.meta.url), "utf8");
+}
+
+/*
+   Extract the OTA upload IIFE from patch 0017. The IIFE is
+   anchored on 'var setDisabled=function(v)' which is unique to
+   this patch. Reconstruct post-patch state by walking both '+'
+   and ' ' lines in file order (same shape as the task-9
+   extractor), then bracket by the last "<script>" before the
+   anchor and the first "</script>" after it.
+*/
+function extractPhase3Task3UploadScript() {
+  const patch = phase3Task3PatchText();
+  const reconstructed = [];
+  for (const raw of patch.split("\n")) {
+    if (raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("@@")) continue;
+    if (raw.startsWith("diff --git ")) continue;
+    if (raw.startsWith("+")) reconstructed.push(raw.slice(1));
+    else if (raw.startsWith(" ")) reconstructed.push(raw.slice(1));
+  }
+  const anchorIdx = reconstructed.findIndex(
+    (line) => /"var setDisabled=function\(v\)\{"/.test(line));
+  assert.ok(anchorIdx > 0,
+    "expected patch 0017 to place the OTA IIFE anchored on 'var setDisabled=function(v)'");
+  let openIdx = -1;
+  for (let i = anchorIdx; i >= 0; i--) {
+    if (/^\s*"<script>"$/.test(reconstructed[i])) { openIdx = i; break; }
+  }
+  let closeIdx = -1;
+  for (let i = anchorIdx; i < reconstructed.length; i++) {
+    if (/^\s*"<\/script>"$/.test(reconstructed[i])) { closeIdx = i; break; }
+  }
+  assert.ok(openIdx > 0 && closeIdx > openIdx,
+    "expected patch 0017 to bracket the OTA IIFE with <script>...</script>");
+  const bodyLines = reconstructed.slice(openIdx + 1, closeIdx);
+  const chunks = bodyLines.map((line) => {
+    const m = line.match(/^\s*"(.*)"\s*$/);
+    if (!m) return "";
+    let s = m[1];
+    s = s.replace(/\\\\/g, "\x00__BS__\x00");
+    s = s.replace(/\\"/g, '"');
+    s = s.replace(/\\n/g, "\n");
+    s = s.replace(/\\t/g, "\t");
+    s = s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    s = s.replace(/\x00__BS__\x00/g, "\\");
+    return s;
+  });
+  return chunks.join("");
+}
+
+/*
+   Extract the entire post-patch kIndexHtml stream chunk-array from
+   patch 0017 so source-contract tests can reason about the
+   Update-firmware DOM structure and the machine-endpoint list.
+*/
+function extractPhase3Task3IndexHtmlStream() {
+  const patch = phase3Task3PatchText();
+  const chunks = [];
+  for (const raw of patch.split("\n")) {
+    if (raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("@@")) continue;
+    if (raw.startsWith("diff --git ")) continue;
+    if (!raw.startsWith("+") && !raw.startsWith(" ")) continue;
+    const line = raw.slice(1);
+    const m = line.match(/^\s*"(.*)"\s*$/);
+    if (!m) continue;
+    let s = m[1];
+    s = s.replace(/\\\\/g, "\x00__BS__\x00");
+    s = s.replace(/\\"/g, '"');
+    s = s.replace(/\\n/g, "\n");
+    s = s.replace(/\\t/g, "\t");
+    s = s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    s = s.replace(/\x00__BS__\x00/g, "\\");
+    chunks.push(s);
+  }
+  return chunks.join("");
+}
+
+test("phase 3 task 3: patch 0017 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE3_TASK3_PATCH),
+      `${id}.source_patches must include ${PHASE3_TASK3_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE3_TASK3_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only OTA-UI patch");
+});
+
+test("phase 3 task 3: patch 0017 only edits examples/door_lock/main/aliro_local_web.cpp", () => {
+  const patch = phase3Task3PatchText();
+  const paths = patch.match(/^diff --git a\/([^\s]+) /gm) || [];
+  assert.equal(paths.length, 1,
+    "patch 0017 must touch exactly one file");
+  const m = paths[0].match(/^diff --git a\/([^\s]+) /);
+  assert.equal(m[1], "examples/door_lock/main/aliro_local_web.cpp",
+    `patch 0017 must only touch aliro_local_web.cpp; saw ${m[1]}`);
+  assert.ok(!/^new file mode/m.test(patch),
+    "patch 0017 must not create new files");
+});
+
+test("phase 3 task 3: kIndexHtml gains the Update firmware section with required .bin input, submit button, warning, aria-live status", () => {
+  const html = extractPhase3Task3IndexHtmlStream();
+  assert.match(html, /<h2>Update firmware<\/h2>/,
+    "Update firmware section header must be present");
+  assert.match(html, /<form\s+id="ota-form"\s+onsubmit="return false">/,
+    "ota-form must have onsubmit='return false' so the browser never navigates");
+  assert.match(html, /<input\s+type="file"\s+id="ota-file"\s+accept="\.bin"\s+required>/,
+    "file input must accept only .bin and be required");
+  assert.match(html, /<button\s+type="submit"\s+id="ota-submit">Upload and restart<\/button>/,
+    "submit button must be 'Upload and restart' with id ota-submit");
+  assert.match(html, /<p\s+id="ota-status"\s+role="status"\s+aria-live="polite"><\/p>/,
+    "aria-live status element must be present");
+  assert.match(html, /Upload a firmware\s+<code>\.bin<\/code>\s+built for this[\s\S]{0,200}board and transport variant/,
+    "warning text must mention the board/transport variant matching requirement");
+});
+
+test("phase 3 task 3: machine-endpoint list includes POST /api/ota with the expected schema documentation", () => {
+  const html = extractPhase3Task3IndexHtmlStream();
+  assert.match(html,
+    /<li><code>POST \/api\/ota<\/code>[\s\S]{0,400}application\/octet-stream[\s\S]{0,400}\{"ok":true,"restarting":true\}[\s\S]{0,200}restarts on success[\s\S]{0,20}<\/li>/,
+    "machine-endpoint list must document POST /api/ota (octet-stream body + strict success schema + restart)");
+});
+
+test("phase 3 task 3: OTA IIFE is separate from the QR / settings / log-viewer IIFEs and posts application/octet-stream with the raw File body", () => {
+  const script = extractPhase3Task3UploadScript();
+  assert.match(script, /var setDisabled=function\(v\)\{/,
+    "IIFE must define setDisabled(v) for toggling the file input + submit button");
+  assert.match(script,
+    /fetch\('\/api\/ota',\{method:'POST',headers:\{'Content-Type':'application\/octet-stream'\},body:file\}\)/,
+    "fetch must be POST /api/ota with Content-Type: application/octet-stream and the File object as the raw body");
+  assert.equal(/FormData/.test(script), false,
+    "IIFE must not use FormData (no multipart)");
+  assert.equal(/XMLHttpRequest/.test(script), false,
+    "IIFE must not use XMLHttpRequest / progress bar");
+  assert.equal(/setInterval|setTimeout\s*\(/.test(script), false,
+    "IIFE must not poll or reconnect on a timer");
+});
+
+test("phase 3 task 3: OTA IIFE enforces strict success schema {ok:true,restarting:true} and cannot false-succeed", () => {
+  const script = extractPhase3Task3UploadScript();
+  assert.match(script, /if\(!r\.ok\)\{throw new Error\('HTTP '\+r\.status\);\}/,
+    "must throw 'HTTP <status>' on !r.ok (HTTP failure classification)");
+  assert.match(script, /return r\.json\(\);/,
+    "must call r.json() so SyntaxError / TypeError reach the outer catch");
+  assert.match(script,
+    /if\(!j\|\|j\.ok!==true\|\|j\.restarting!==true\)\{throw new Error\('unexpected response'\);\}/,
+    "must throw on any schema deviation from {ok:true,restarting:true}");
+});
+
+test("phase 3 task 3 runtime: missing file rejected with red status; NO fetch call", async () => {
+  const { formEl, fileEl, submitEl, statusEl, calls, settle } =
+    runPhase3Task3UploadScript({fetchImpl: async () => { calls.fetches++; return {ok: true}; }});
+  fileEl.files = [];              // simulate no selection
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.equal(calls.fetches, 0,
+    "missing file must NOT reach fetch");
+  assert.match(statusEl.textContent, /Please choose a firmware/i);
+  assert.equal(statusEl.style.color, "#a11", "status must be red for a validation error");
+  assert.equal(fileEl.disabled, false, "controls stay enabled after a client-side reject");
+  assert.equal(submitEl.disabled, false);
+});
+
+test("phase 3 task 3 runtime: zero-byte file rejected; NO fetch call", async () => {
+  const { formEl, fileEl, submitEl, statusEl, calls, settle } =
+    runPhase3Task3UploadScript({fetchImpl: async () => { calls.fetches++; return {ok: true}; }});
+  fileEl.files = [{name: "empty.bin", size: 0}];
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.equal(calls.fetches, 0,
+    "zero-byte file must NOT reach fetch");
+  assert.match(statusEl.textContent, /empty/i);
+  assert.equal(statusEl.style.color, "#a11");
+  assert.equal(fileEl.disabled, false);
+  assert.equal(submitEl.disabled, false);
+});
+
+test("phase 3 task 3 runtime: happy path posts app/octet-stream with the raw File body; success keeps controls disabled", async () => {
+  const captured = {};
+  const goodFile = {name: "aliro-nanoc6-wifi.bin", size: 4096};
+  const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+    fetchImpl: async (url, init) => {
+      captured.url = url;
+      captured.method = init.method;
+      captured.headers = init.headers;
+      captured.body = init.body;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ok: true, restarting: true}),
+      };
+    },
+  });
+  fileEl.files = [goodFile];
+  formEl._submit({preventDefault(){}});
+  // status should immediately show "Uploading" before await
+  assert.match(statusEl.textContent, /Uploading/i);
+  assert.equal(fileEl.disabled, true, "file input disabled while uploading");
+  assert.equal(submitEl.disabled, true, "submit disabled while uploading");
+  await settle();
+  assert.equal(captured.url, "/api/ota");
+  assert.equal(captured.method, "POST");
+  assert.equal(captured.headers["Content-Type"], "application/octet-stream");
+  assert.strictEqual(captured.body, goodFile,
+    "the raw File object must be passed as the fetch body (no FormData, no manual read)");
+  assert.match(statusEl.textContent, /Update accepted\. The device is restarting\./);
+  assert.equal(fileEl.disabled, true,
+    "on success controls stay disabled so a false success cannot be re-submitted");
+  assert.equal(submitEl.disabled, true);
+  assert.notEqual(statusEl.style.color, "#a11", "success status must not be red");
+});
+
+test("phase 3 task 3 runtime: HTTP failure (r.ok false) shows red status and re-enables controls", async () => {
+  const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+    fetchImpl: async () => ({ok: false, status: 500, json: async () => ({error: "boom"})}),
+  });
+  fileEl.files = [{name: "x.bin", size: 1024}];
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.match(statusEl.textContent, /HTTP 500/);
+  assert.equal(statusEl.style.color, "#a11");
+  assert.equal(fileEl.disabled, false, "HTTP failure must re-enable controls");
+  assert.equal(submitEl.disabled, false);
+});
+
+test("phase 3 task 3 runtime: network failure (fetch rejects with TypeError) re-enables controls; NO false success", async () => {
+  const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+    fetchImpl: async () => { throw new TypeError("Failed to fetch"); },
+  });
+  fileEl.files = [{name: "x.bin", size: 1024}];
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.match(statusEl.textContent, /Upload failed:/);
+  assert.match(statusEl.textContent, /Failed to fetch/);
+  assert.equal(statusEl.style.color, "#a11");
+  assert.equal(fileEl.disabled, false);
+  assert.equal(submitEl.disabled, false);
+});
+
+test("phase 3 task 3 runtime: JSON parse failure (SyntaxError from r.json) re-enables controls; NO false success", async () => {
+  const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => { throw new SyntaxError("unexpected token"); },
+    }),
+  });
+  fileEl.files = [{name: "x.bin", size: 1024}];
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.match(statusEl.textContent, /Upload failed:/);
+  assert.match(statusEl.textContent, /unexpected token/);
+  assert.equal(statusEl.style.color, "#a11");
+  assert.equal(fileEl.disabled, false);
+  assert.equal(submitEl.disabled, false);
+});
+
+test("phase 3 task 3 runtime: schema failure (JSON present but wrong shape) re-enables controls; NO false success", async () => {
+  const wrongResponses = [
+    {ok: true, restarting: false},
+    {ok: false, restarting: true},
+    {ok: 1, restarting: 1},                    // truthy but not === true
+    {error: "no"},
+    null,
+    {ok: true},                                 // missing restarting
+    {restarting: true},                         // missing ok
+    {ok: true, restarting: true, extra: "x"},   // extra keys are fine; MUST still succeed
+  ];
+  let idx = 0;
+  for (const body of wrongResponses) {
+    const isValid = body && body.ok === true && body.restarting === true;
+    const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+      fetchImpl: async () => ({ok: true, status: 200, json: async () => body}),
+    });
+    fileEl.files = [{name: `x${idx++}.bin`, size: 1024}];
+    formEl._submit({preventDefault(){}});
+    await settle();
+    if (isValid) {
+      assert.match(statusEl.textContent, /Update accepted/,
+        `body ${JSON.stringify(body)} matches the schema and must succeed`);
+      assert.equal(fileEl.disabled, true, "success keeps controls disabled");
+    } else {
+      assert.match(statusEl.textContent, /Upload failed:/,
+        `body ${JSON.stringify(body)} deviates from the schema and must NOT false-succeed`);
+      assert.equal(fileEl.disabled, false,
+        `schema failure for ${JSON.stringify(body)} must re-enable controls`);
+    }
+  }
+});
+
+test("phase 3 task 3 runtime: body-read TypeError (network drop mid-body) re-enables controls; NO false success", async () => {
+  const { formEl, fileEl, submitEl, statusEl, settle } = runPhase3Task3UploadScript({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => { throw new TypeError("network error"); },
+    }),
+  });
+  fileEl.files = [{name: "x.bin", size: 1024}];
+  formEl._submit({preventDefault(){}});
+  await settle();
+  assert.match(statusEl.textContent, /Upload failed:/);
+  assert.match(statusEl.textContent, /network error/);
+  assert.equal(fileEl.disabled, false);
+  assert.equal(submitEl.disabled, false);
+});
+
+/*
+   Runtime harness: extract-and-execute the OTA IIFE against a
+   fake document. Returns handles so tests can drive the form
+   submit and inspect the file input / submit button / status.
+*/
+function runPhase3Task3UploadScript({ fetchImpl }) {
+  const script = extractPhase3Task3UploadScript();
+  const calls = { fetches: 0 };
+  const fetch = async (url, init) => {
+    calls.fetches++;
+    return await fetchImpl(url, init);
+  };
+  const fileEl = { id: "ota-file", disabled: false, files: [], style: {} };
+  const submitEl = { id: "ota-submit", disabled: false, style: {} };
+  const statusEl = { id: "ota-status", textContent: "", style: {} };
+  const formEl = {
+    id: "ota-form",
+    _submit: null,
+    addEventListener(ev, h) { if (ev === "submit") this._submit = h; },
+  };
+  const elements = new Map([
+    ["ota-form", formEl],
+    ["ota-file", fileEl],
+    ["ota-submit", submitEl],
+    ["ota-status", statusEl],
+  ]);
+  const doc = {
+    readyState: "complete",
+    getElementById(id) { return elements.get(id) || null; },
+    addEventListener() {},
+  };
+  const runner = new Function("document", "fetch", "console", script);
+  runner(doc, fetch, console);
+  async function settle(rounds = 8) {
+    for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, 0));
+  }
+  return { formEl, fileEl, submitEl, statusEl, calls, settle };
+}
