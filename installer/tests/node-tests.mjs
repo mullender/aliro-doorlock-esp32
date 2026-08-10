@@ -8679,3 +8679,397 @@ test("phase 3 task 4 challenge format: produces exactly 'AUTH <64 lower-hex>'", 
   assert.equal(s, "AUTH 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
   assert.equal(s.length, 69, "challenge must be exactly 5 + 64 = 69 bytes");
 });
+
+// -----------------------------------------------------------------------
+// Phase 3 task 5: core-backed espota TCP transfer engine
+// -----------------------------------------------------------------------
+
+const PHASE3_TASK5_PATCH = "firmware/patches/0019-add-wifi-espota-transfer.patch";
+
+function phase3Task5PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE3_TASK5_PATCH}`, import.meta.url), "utf8");
+}
+
+function extractPhase3Task5NewFile(basename) {
+  const patch = phase3Task5PatchText();
+  const lines = patch.split("\n");
+  const header = `+++ b/examples/door_lock/main/${basename}`;
+  let i = lines.findIndex((line) => line === header);
+  assert.ok(i > 0,
+    `patch 0019 must add examples/door_lock/main/${basename}`);
+  const body = [];
+  for (i++; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("diff --git ") || line.startsWith("+++ b/")) break;
+    if (line.startsWith("@@")) continue;
+    if (line.startsWith("+")) body.push(line.slice(1));
+  }
+  return body.join("\n");
+}
+
+test("phase 3 task 5: patch 0019 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE3_TASK5_PATCH),
+      `${id}.source_patches must include ${PHASE3_TASK5_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE3_TASK5_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only espota-transfer patch");
+});
+
+test("phase 3 task 5: patch 0019 creates exactly two files, both under examples/door_lock/main/", () => {
+  const patch = phase3Task5PatchText();
+  const paths = patch.match(/^diff --git a\/([^\s]+) /gm) || [];
+  for (const line of paths) {
+    const m = line.match(/^diff --git a\/([^\s]+) /);
+    assert.match(m[1], /^examples\/door_lock\/main\/aliro_espota_transfer\.(h|cpp)$/,
+      `patch 0019 must only touch aliro_espota_transfer.h and .cpp; saw ${m[1]}`);
+  }
+  assert.equal((patch.match(/^new file mode 100644$/gm) || []).length, 2,
+    "patch 0019 must add exactly two new files");
+});
+
+test("phase 3 task 5: header declares AliroEspotaRunTransfer(int, const aliro_espota_invitation_t *) and required constants", () => {
+  const header = extractPhase3Task5NewFile("aliro_espota_transfer.h");
+  assert.match(header,
+    /esp_err_t\s+AliroEspotaRunTransfer\s*\(\s*int\s+sock\s*,\s*const\s+aliro_espota_invitation_t\s*\*\s*invitation\s*\)\s*;/,
+    "single transfer entry point must have the required signature");
+  assert.match(header, /kAliroEspotaTransferBufBytes\s*=\s*1460\b/,
+    "receive buffer constant must be 1460");
+  assert.match(header, /kAliroEspotaTransferMaxAckRetries\s*=\s*3\b/,
+    "ACK-retry cap must be 3");
+  assert.match(header, /kAliroEspotaTransferRxTimeoutSec\s*=\s*5\b/,
+    "bounded receive timeout constant must be 5 seconds");
+  assert.match(header, /extern\s+"C"\s*\{/, "header must expose C linkage");
+});
+
+test("phase 3 task 5: cpp uses one fixed static 1460 receive buffer and no heap", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  assert.match(cpp, /static_assert\s*\(\s*kAliroEspotaTransferBufBytes\s*==\s*1460\b/,
+    "static_assert must pin the buffer size to exactly 1460 bytes");
+  assert.match(cpp,
+    /uint8_t\s+s_rx_buf\s*\[\s*kAliroEspotaTransferBufBytes\s*\]\s*;/,
+    "s_rx_buf must be a fixed static array of kAliroEspotaTransferBufBytes bytes");
+  const code = cpp.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  for (const token of ["malloc(", "calloc(", "realloc(", "operator new", " new ", "heap_caps_"]) {
+    assert.equal(code.includes(token), false,
+      `helper cpp must not use ${token}`);
+  }
+});
+
+test("phase 3 task 5: patch introduces NO service start, no task, no socket open, no restart, no mDNS, no HTTP, no runtime caller, no auth change", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  const header = extractPhase3Task5NewFile("aliro_espota_transfer.h");
+  // Strip comments — the header prose legitimately names these
+  // as excluded (e.g. "no app_main hook", "never restarts").
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const both = stripComments(cpp) + "\n" + stripComments(header);
+  for (const token of [
+    "xTaskCreate", "vTaskDelay", "TaskFunction_t",
+    "socket(", "AF_INET", "SOCK_STREAM", "SOCK_DGRAM",
+    "bind(", "listen(", "accept(", "connect(",
+    "close(", "shutdown(",
+    "esp_restart(",
+    "esp_netif_", "esp_wifi_",
+    "mdns_",
+    "httpd_", "esp_http_server",
+    "app_main", "start_server", "stop_server",
+    "AliroLocalOtaBegin",
+    "AliroEspotaVerifyAuth", "AliroEspotaParseAuth",
+    "AliroEspotaParseInvitation", "AliroEspotaFormatChallenge",
+  ]) {
+    assert.equal(both.includes(token), false,
+      `patch 0019 must NOT introduce ${token} — helper does not start a service or open sockets`);
+  }
+});
+
+test("phase 3 task 5 ownership: invalid arguments (sock<0, null invitation, size==0) all call AliroLocalOtaAbort exactly once", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  /*
+     Reviewer ownership correction: the helper has ONE contract
+     — Begin was already called. So invalid arguments MUST call
+     AliroLocalOtaAbort exactly once before ESP_ERR_INVALID_ARG.
+  */
+  assert.match(cpp,
+    /if\s*\(\s*sock\s*<\s*0\s*\|\|\s*invitation\s*==\s*nullptr\s*\|\|\s*invitation->size\s*==\s*0\s*\)\s*\{\s*AliroLocalOtaAbort\s*\(\s*\)\s*;\s*return\s+ESP_ERR_INVALID_ARG\s*;/,
+    "invalid-arg branch must Abort exactly once then return ESP_ERR_INVALID_ARG");
+});
+
+test("phase 3 task 5 doc: header Returns section for ESP_ERR_INVALID_ARG must NOT say 'no core action'", () => {
+  const header = extractPhase3Task5NewFile("aliro_espota_transfer.h");
+  /*
+     Reviewer doc correction: an earlier draft said "invalid
+     argument (no core action)", which contradicts the single
+     ownership contract (invalid args Abort the inherited active
+     transaction). Guard against that stale phrasing so it
+     cannot return.
+  */
+  assert.equal(/no\s+core\s+action/i.test(header), false,
+    "the header must NOT contain the stale 'no core action' wording for ESP_ERR_INVALID_ARG");
+  assert.match(header,
+    /ESP_ERR_INVALID_ARG[\s\S]{0,300}inherited\s+active\s+core\s+transaction\s+is\s+aborted[\s\S]{0,80}EXACTLY\s+ONCE/,
+    "the header Returns section must state that ESP_ERR_INVALID_ARG aborts the inherited active core transaction exactly once");
+});
+
+test("phase 3 task 5 ownership: transport / MD5 failures call AliroLocalOtaAbort exactly once each; Write / Finish failures do NOT re-Abort", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  // Transport-layer failure paths must call Abort.
+  const abortAfter = (re) => new RegExp(`${re}[\\s\\S]{0,200}?AliroLocalOtaAbort\\s*\\(\\s*\\)`);
+  assert.match(cpp, abortAfter("setsockopt"),          "setsockopt failure Aborts");
+  assert.match(cpp, abortAfter("mbedtls_md5_starts"),  "md5_starts failure Aborts");
+  assert.match(cpp, abortAfter("mbedtls_md5_update"),  "md5_update failure Aborts");
+  assert.match(cpp, abortAfter("mbedtls_md5_finish"),  "md5_finish failure Aborts");
+  // ACK retry exhaustion path
+  assert.match(cpp,
+    /if\s*\(\s*last_ack_written\s*>\s*0\s*&&\s*ack_retries\s*<\s*kAliroEspotaTransferMaxAckRetries\s*\)/,
+    "ACK-retry cap uses kAliroEspotaTransferMaxAckRetries");
+  // The Write != ESP_OK branch must NOT call Abort
+  const writeBranch = cpp.match(
+    /esp_err_t\s+wr\s*=\s*AliroLocalOtaWrite[\s\S]*?if\s*\(\s*wr\s*!=\s*ESP_OK\s*\)\s*\{([\s\S]*?)\n\s{8}\}/);
+  assert.ok(writeBranch, "must find the wr != ESP_OK branch after AliroLocalOtaWrite");
+  assert.equal(/AliroLocalOtaAbort\s*\(/.test(writeBranch[1]), false,
+    "Write failure branch must NOT call AliroLocalOtaAbort");
+  // Finish != ESP_OK must NOT call Abort
+  const finishBranch = cpp.match(
+    /esp_err_t\s+fx\s*=\s*AliroLocalOtaFinish[\s\S]*?if\s*\(\s*fx\s*!=\s*ESP_OK\s*\)\s*\{([\s\S]*?)\n\s{4}\}/);
+  assert.ok(finishBranch, "must find the fx != ESP_OK branch after AliroLocalOtaFinish");
+  assert.equal(/AliroLocalOtaAbort\s*\(/.test(finishBranch[1]), false,
+    "Finish failure branch must NOT call AliroLocalOtaAbort");
+});
+
+test("phase 3 task 5 ownership: final 'OK' send failure returns ESP_FAIL without Abort and without restart", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  const okBlock = cpp.match(
+    /static\s+const\s+char\s+kOk\s*\[\s*\]\s*=\s*"OK";[\s\S]*?if\s*\(\s*!\s*send_all\s*\(\s*sock\s*,\s*kOk\s*,\s*2\s*\)\s*\)\s*\{([\s\S]*?)\}/);
+  assert.ok(okBlock, "must find the final-OK send-failure block");
+  assert.match(okBlock[1], /return\s+ESP_FAIL\s*;/,
+    "final-OK send failure must return ESP_FAIL");
+  assert.equal(/AliroLocalOtaAbort\s*\(/.test(okBlock[1]), false,
+    "final-OK send failure must NOT call AliroLocalOtaAbort");
+  assert.equal(/esp_restart/.test(okBlock[1]), false,
+    "final-OK send failure must NOT restart");
+});
+
+test("phase 3 task 5: MD5 is compared against invitation->md5 BEFORE Finish", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  // Structural match: md5_finish -> memcmp against invitation->md5 -> if match Finish, if mismatch Abort + ESP_ERR_INVALID_CRC
+  assert.match(cpp,
+    /mbedtls_md5_finish[\s\S]*?memcmp\s*\(\s*md5_out\s*,\s*invitation->md5\s*,\s*kAliroEspotaMd5Bytes\s*\)[\s\S]*?AliroLocalOtaAbort\s*\(\s*\)\s*;\s*return\s+ESP_ERR_INVALID_CRC\s*;/,
+    "MD5 mismatch must Abort + return ESP_ERR_INVALID_CRC BEFORE Finish");
+  // AliroLocalOtaFinish must appear AFTER the mismatch check
+  const finishIdx = cpp.indexOf("AliroLocalOtaFinish(");
+  const memcmpIdx = cpp.indexOf("memcmp(md5_out");
+  assert.ok(finishIdx > memcmpIdx,
+    "AliroLocalOtaFinish must be called AFTER the MD5 memcmp");
+});
+
+test("phase 3 task 5: per-chunk contract — exactly one AliroLocalOtaWrite + one MD5 update + one decimal-ACK send", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  assert.match(cpp,
+    /esp_err_t\s+wr\s*=\s*AliroLocalOtaWrite\s*\(\s*s_rx_buf\s*,\s*static_cast<size_t>\(\s*n\s*\)\s*\)\s*;/,
+    "one AliroLocalOtaWrite call per received chunk");
+  assert.match(cpp,
+    /mbedtls_md5_update\s*\(\s*&\s*md5_ctx\s*,\s*s_rx_buf\s*,\s*static_cast<size_t>\(\s*n\s*\)\s*\)/,
+    "MD5 must be updated with the same chunk");
+  assert.match(cpp,
+    /snprintf\s*\(\s*out\s*,\s*cap\s*,\s*"%zu"\s*,\s*written\s*\)/,
+    "ACK must be a plain decimal via snprintf(\"%zu\"), no delimiter");
+});
+
+test("phase 3 task 5: EINTR-safe recv wrapper and separate timeout sentinel from real errors", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  const recvBody = cpp.match(/ssize_t\s+recv_some\s*\([\s\S]*?\}\s*\}/);
+  assert.ok(recvBody, "must define recv_some wrapper");
+  assert.match(recvBody[0], /if\s*\(\s*errno\s*==\s*EINTR\s*\)\s*continue/,
+    "EINTR must be transparently retried");
+  assert.match(recvBody[0], /errno\s*==\s*EAGAIN\s*\|\|\s*errno\s*==\s*EWOULDBLOCK/,
+    "EAGAIN/EWOULDBLOCK must map to a timeout sentinel (-2)");
+});
+
+test("phase 3 task 5: send_all wrapper retries on EINTR and short sends", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  const sendBody = cpp.match(/bool\s+send_all\s*\([\s\S]*?\n\}/);
+  assert.ok(sendBody, "must define send_all wrapper");
+  assert.match(sendBody[0], /if\s*\(\s*errno\s*==\s*EINTR\s*\)\s*continue/,
+    "EINTR must be transparently retried on send");
+  assert.match(sendBody[0], /while\s*\(\s*len\s*>\s*0\s*\)/,
+    "send_all must loop until all bytes are sent");
+});
+
+test("phase 3 task 5 helper does NOT open sockets / restart / call Begin", () => {
+  const cpp = extractPhase3Task5NewFile("aliro_espota_transfer.cpp");
+  const header = extractPhase3Task5NewFile("aliro_espota_transfer.h");
+  // "close(" and "shutdown(" are already excluded by an earlier test.
+  const cppCode = cpp.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.equal(cppCode.includes("AliroLocalOtaBegin"), false,
+    "helper must NEVER call AliroLocalOtaBegin (in code, comments excluded)");
+  assert.equal(cppCode.includes("esp_restart"), false,
+    "helper must NEVER restart the device (in code, comments excluded)");
+  assert.match(header,
+    /helper never calls AliroLocalOtaBegin, never closes the\s+socket, and never restarts the device\./,
+    "the header must document the ownership boundary explicitly");
+});
+
+/*
+   Runtime state-model harness — a JS mirror that mimics the C
+   helper's control flow using a fake socket + fake OTA core.
+   Tests drive full transfer sequences, receive-timeout retry
+   loops, EOF short-body, MD5 mismatch, and final-OK failure to
+   verify counts of AliroLocalOtaAbort / AliroLocalOtaWrite /
+   AliroLocalOtaFinish across paths.
+*/
+function makeXferMock({
+    coreWriteReturn = (bytes, idx) => "ESP_OK",       // per-call function
+    coreFinishReturn = "ESP_OK",
+    md5Match = true,
+    okSendOk = true,
+} = {}) {
+  const calls = { write: [], finish: 0, abort: 0, sends: [], recvs: 0 };
+  const state = { busy: true, transactionOpen: true };
+  function ota_Write(bytes) {
+    calls.write.push(bytes.length);
+    const r = coreWriteReturn(bytes, calls.write.length - 1);
+    if (r !== "ESP_OK") { state.transactionOpen = false; state.busy = false; }
+    return r;
+  }
+  function ota_Finish() {
+    calls.finish++;
+    state.transactionOpen = false; state.busy = false;
+    return coreFinishReturn;
+  }
+  function ota_Abort() {
+    if (!state.busy) return;
+    calls.abort++;
+    state.transactionOpen = false; state.busy = false;
+  }
+  return { calls, state, ota_Write, ota_Finish, ota_Abort };
+}
+
+/*
+   Simulate the helper's transfer loop. Chunks is a list of items:
+     {n: N}        recv returns N bytes and the mock returns those
+                   bytes to Write (or bytes==Uint8Array for MD5)
+     {n: -2}       recv returns -2 (timeout)
+     {n: 0}        recv returns 0 (EOF)
+     {n: -1}       recv returns -1 (socket error)
+*/
+async function simulateTransfer(mock, invitationSize, invitationMd5, chunks,
+                                okSendOk = true) {
+  let total = 0, last_ack = 0, retries = 0;
+  const rxHex = [];
+  for (let i = 0; ; i++) {
+    if (total >= invitationSize) break;
+    if (i >= chunks.length) throw new Error("chunks exhausted");
+    const ch = chunks[i];
+    if (ch.n === -2) {
+      if (last_ack > 0 && retries < 3) {
+        retries++;
+        continue;
+      }
+      mock.ota_Abort();
+      return "ESP_ERR_TIMEOUT";
+    }
+    if (ch.n < 0) { mock.ota_Abort(); return "ESP_FAIL"; }
+    if (ch.n === 0) { mock.ota_Abort(); return "ESP_ERR_INVALID_SIZE"; }
+    const wr = mock.ota_Write(ch.bytes || new Uint8Array(ch.n));
+    if (wr !== "ESP_OK") return wr;
+    // md5 update
+    rxHex.push(ch.bytes || new Uint8Array(ch.n));
+    last_ack = ch.n;
+    retries = 0;
+    total += ch.n;
+  }
+  // Compute final md5
+  const {createHash} = await import("node:crypto");
+  const hash = createHash("md5");
+  for (const b of rxHex) hash.update(b);
+  const md5 = hash.digest();
+  if (Buffer.compare(md5, invitationMd5) !== 0) {
+    mock.ota_Abort();
+    return "ESP_ERR_INVALID_CRC";
+  }
+  const fx = mock.ota_Finish();
+  if (fx !== "ESP_OK") return fx;
+  if (!okSendOk) return "ESP_FAIL";  // final-OK send failed
+  return "ESP_OK";
+}
+
+test("phase 3 task 5 state model: happy path — invalid-args early Abort NOT reached; single-chunk transfer succeeds", async () => {
+  const mock = makeXferMock();
+  const chunk = new Uint8Array(100);
+  for (let i = 0; i < 100; i++) chunk[i] = i;
+  const md5 = createHash("md5").update(chunk).digest();
+  const r = await simulateTransfer(mock, 100, md5, [{n: 100, bytes: chunk}]);
+  assert.equal(r, "ESP_OK");
+  assert.equal(mock.calls.finish, 1);
+  assert.equal(mock.calls.abort, 0);
+  assert.equal(mock.state.busy, false);
+});
+
+test("phase 3 task 5 state model: MD5 mismatch aborts before Finish", async () => {
+  const mock = makeXferMock({md5Match: false});
+  const wrongMd5 = Buffer.from("00".repeat(16), "hex");
+  const chunk = new Uint8Array(100);
+  const r = await simulateTransfer(mock, 100, wrongMd5, [{n: 100, bytes: chunk}]);
+  assert.equal(r, "ESP_ERR_INVALID_CRC");
+  assert.equal(mock.calls.finish, 0, "Finish MUST NOT be called on MD5 mismatch");
+  assert.equal(mock.calls.abort, 1, "MD5 mismatch calls Abort exactly once");
+});
+
+test("phase 3 task 5 state model: EOF before invitation.size returns ESP_ERR_INVALID_SIZE with Abort", async () => {
+  const mock = makeXferMock();
+  const r = await simulateTransfer(mock, 1024, Buffer.alloc(16),
+                                    [{n: 500, bytes: new Uint8Array(500)}, {n: 0}]);
+  assert.equal(r, "ESP_ERR_INVALID_SIZE");
+  assert.equal(mock.calls.abort, 1);
+  assert.equal(mock.calls.finish, 0);
+});
+
+test("phase 3 task 5 state model: recv timeout before any success -> initial-timeout abort", async () => {
+  const mock = makeXferMock();
+  const r = await simulateTransfer(mock, 1024, Buffer.alloc(16), [{n: -2}]);
+  assert.equal(r, "ESP_ERR_TIMEOUT");
+  assert.equal(mock.calls.abort, 1);
+});
+
+test("phase 3 task 5 state model: recv timeout after successful chunk retries up to 3, then aborts", async () => {
+  const mock = makeXferMock();
+  const chunk = new Uint8Array(500);
+  // 500 bytes accepted, then 3 timeouts (retries), then 4th timeout -> abort
+  const chunks = [{n: 500, bytes: chunk}, {n: -2}, {n: -2}, {n: -2}, {n: -2}];
+  const r = await simulateTransfer(mock, 1024, Buffer.alloc(16), chunks);
+  assert.equal(r, "ESP_ERR_TIMEOUT");
+  assert.equal(mock.calls.abort, 1, "exactly one Abort on retry exhaustion");
+});
+
+test("phase 3 task 5 state model: Write error consumes transaction; helper does NOT re-Abort", async () => {
+  const mock = makeXferMock({coreWriteReturn: () => "ESP_ERR_INVALID_ARG"});
+  const r = await simulateTransfer(mock, 100, Buffer.alloc(16), [{n: 100, bytes: new Uint8Array(100)}]);
+  assert.equal(r, "ESP_ERR_INVALID_ARG");
+  assert.equal(mock.calls.abort, 0,
+    "helper must NOT call Abort after Write consumed the transaction");
+  assert.equal(mock.state.busy, false, "core released busy on its own");
+});
+
+test("phase 3 task 5 state model: Finish error consumes transaction; helper does NOT re-Abort", async () => {
+  const mock = makeXferMock({coreFinishReturn: "ESP_FAIL"});
+  const chunk = new Uint8Array(100);
+  const md5 = createHash("md5").update(chunk).digest();
+  const r = await simulateTransfer(mock, 100, md5, [{n: 100, bytes: chunk}]);
+  assert.equal(r, "ESP_FAIL");
+  assert.equal(mock.calls.finish, 1);
+  assert.equal(mock.calls.abort, 0,
+    "helper must NOT call Abort after Finish consumed the transaction");
+});
+
+test("phase 3 task 5 state model: final-OK send failure returns ESP_FAIL without Abort (transaction already committed)", async () => {
+  const mock = makeXferMock();
+  const chunk = new Uint8Array(100);
+  const md5 = createHash("md5").update(chunk).digest();
+  const r = await simulateTransfer(mock, 100, md5, [{n: 100, bytes: chunk}], /*okSendOk=*/false);
+  assert.equal(r, "ESP_FAIL");
+  assert.equal(mock.calls.finish, 1);
+  assert.equal(mock.calls.abort, 0,
+    "final-OK send failure must NOT trigger a stale Abort — transaction is already committed");
+});

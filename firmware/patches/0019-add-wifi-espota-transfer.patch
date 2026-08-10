@@ -1,0 +1,523 @@
+Add the core-backed espota TCP transfer engine. Pure library
+helper that consumes an already-authenticated, already-Begun
+single-transfer OTA transaction on a caller-provided connected
+TCP socket. Wi-Fi variants only (nanoc6-wifi, atoms3-lite-wifi);
+nanoc6-thread never applies, compiles, links, or exposes any of
+the code here.
+
+Compatibility reference: Arduino-esp32 3.3 ArduinoOTA
+_runUpdate loop (1460-byte chunk read -> Update.write ->
+decimal-ACK printf; ACK re-send x 3 on receive timeout; final
+"OK" + restart). This helper mirrors the wire behaviour but
+stays confined to the transfer itself.
+
+Scope, kept minimal (no UDP listener, no TCP connect, no task,
+no app_main hook, no service start, no authentication changes,
+no restart, no mDNS, no HTTP change, no runtime caller in this
+task):
+
+  * NEW main/aliro_espota_transfer.h: declares
+      esp_err_t AliroEspotaRunTransfer(int sock,
+          const aliro_espota_invitation_t *invitation);
+    plus size constants: 1460-byte buffer, ACK-retry cap 3,
+    5-second bounded rx / tx timeouts.
+
+  * NEW main/aliro_espota_transfer.cpp: implements the loop:
+      - One fixed static 1460-byte receive buffer (static_
+        assert-pinned). No heap; no per-chunk allocation.
+      - SO_RCVTIMEO / SO_SNDTIMEO applied to the caller-
+        provided socket before any recv / send.
+      - recv() wrapper: transparent EINTR retry; EAGAIN /
+        EWOULDBLOCK -> timeout sentinel; other error ->
+        -1; EOF -> 0.
+      - Per chunk: exactly one AliroLocalOtaWrite call, then a
+        streaming MD5 update, then a decimal chunk-size ACK
+        via snprintf("%zu") + send_all (no delimiter, matches
+        ArduinoOTA's client.printf("%" PRIu32, written)).
+      - Receive timeout: if a previous successful chunk
+        produced an ACK, retransmit the SAME last decimal ACK
+        without calling AliroLocalOtaWrite again, up to
+        kAliroEspotaTransferMaxAckRetries = 3.
+        Initial timeout, exhausted retries, real socket error,
+        or clean EOF before invitation->size are all failures.
+      - Final 16-byte MD5 compared to invitation->md5 BEFORE
+        AliroLocalOtaFinish; on mismatch abort with
+        ESP_ERR_INVALID_CRC.
+      - AliroLocalOtaAbort ownership rules, per assignment
+        and reviewer corrections:
+          * ONE contract: the caller ALWAYS has an active
+            AliroLocalOtaBegin transaction open before every
+            call. The later service validates inputs and does
+            NOT call this helper on validation failure. So
+            invalid arguments detected here (sock < 0,
+            invitation == nullptr, defensive-only
+            invitation->size == 0) MUST call AliroLocalOtaAbort
+            EXACTLY ONCE before returning ESP_ERR_INVALID_ARG.
+            No "no core action" path exists.
+          * Called EXACTLY ONCE on any transport-layer / MD5
+            failure while the core transaction is still open
+            (setsockopt, initial recv timeout, exhausted ACK
+            retries, real recv error, EOF short body, MD5
+            update / finish failure, ACK-send failure, final
+            MD5 mismatch).
+          * NEVER called after AliroLocalOtaWrite or
+            AliroLocalOtaFinish returns != ESP_OK: those core
+            methods already consume + release the transaction;
+            a second Abort could race with a fresh Begin.
+          * NEVER called on a Finish-success path, even if the
+            final TCP "OK" send fails. The transaction is
+            already committed; the caller decides whether to
+            restart. Return ESP_FAIL, no restart.
+      - Helper never calls AliroLocalOtaBegin, never closes the
+        socket, and never restarts the device.
+
+  * WIRE patch 0019 into nanoc6-wifi and atoms3-lite-wifi
+    source_patches in firmware/variants.json.
+    nanoc6-thread source_patches is unchanged.
+
+Explicit non-goals for this patch: no UDP listener, no TCP
+connect, no task, no app_main hook, no service start, no
+authentication changes, no restart, no mDNS, no HTTP change,
+no runtime caller, no cJSON, no new runtime dependency, no
+partition change, no CMakeLists.txt change (SRC_DIRS "."
+already picks up main/ .cpp files on Wi-Fi variants).
+
+diff --git a/examples/door_lock/main/aliro_espota_transfer.h b/examples/door_lock/main/aliro_espota_transfer.h
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_transfer.h
+@@ -0,0 +1,145 @@
++/*
++   Core-backed espota TCP transfer engine for the Aliro door-lock
++   reader firmware. Compiled and linked only on the Wi-Fi variants
++   (nanoc6-wifi and atoms3-lite-wifi); the Thread variant never
++   applies, compiles, or links this module.
++
++   Scope, and only this scope: a pure library helper that consumes
++   an already-authenticated, already-Begun single-transfer OTA
++   transaction. It runs the wire protocol against a connected TCP
++   socket the caller passes in. It opens no sockets, spawns no
++   tasks, hooks into no app_main, starts no service, changes no
++   authentication, does not restart the device, and does not
++   touch mDNS or HTTP.
++
++   A later patch will supply a UDP invitation listener + TCP
++   receiver task that calls this helper after authentication.
++
++   Concurrency: single-caller-per-transaction. The core's busy
++   guard is already held when this helper runs.
++*/
++
++#pragma once
++
++#include <esp_err.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "aliro_espota_protocol.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Sizes.
++enum {
++    /*
++       One TCP MSS on a typical ESP-IDF Wi-Fi stack. The ArduinoOTA
++       3.3 reference uses exactly the same static 1460-byte buffer.
++       No heap; no per-chunk allocation.
++    */
++    kAliroEspotaTransferBufBytes      = 1460,
++    /*
++       Number of times a chunk-size ACK is re-sent on receive
++       timeout after a successful write, matching the ArduinoOTA
++       reference. No further receive attempts are made on the
++       retry path; the helper only retransmits the last ACK.
++    */
++    kAliroEspotaTransferMaxAckRetries = 3,
++    /*
++       Bounded per-recv and per-send socket timeouts, in seconds.
++       The receive timeout is what drives the ACK-retry decision;
++       the send timeout bounds each ACK / final "OK" send.
++    */
++    kAliroEspotaTransferRxTimeoutSec  = 5,
++    kAliroEspotaTransferTxTimeoutSec  = 5,
++};
++
++/*
++   Run the espota body transfer over an already-connected TCP
++   socket. The caller has ALREADY:
++     * completed authentication (typically via
++       AliroEspotaVerifyAuth), and
++     * successfully called AliroLocalOtaBegin(invitation->size).
++
++   This helper CONSUMES that active core transaction. On every
++   return path from this helper the core's shared busy guard has
++   been released — either by successful Finish (return ESP_OK
++   after "OK" send), or by Abort here (HTTP-layer failures
++   listed below), or by Write / Finish themselves on their own
++   errors (this helper never re-Aborts after a core-method
++   error).
++
++   Ownership rules for AliroLocalOtaAbort inside this helper:
++
++     * Called EXACTLY ONCE, before returning, when the core
++       transaction is still open and one of the following
++       transport-layer failures occurs:
++         - setsockopt on the caller-provided socket fails
++         - streaming MD5 setup fails
++         - receive timeout when no successful ACK has been sent
++           yet (initial timeout)
++         - receive timeout after the ACK-retry cap
++         - real recv() error other than EINTR / EAGAIN
++         - clean EOF before invitation->size bytes are received
++         - streaming MD5 update fails
++         - ACK send fails after a successful Write
++         - streaming MD5 finalise fails
++         - final 16-byte MD5 does not match invitation->md5
++
++     * NEVER called after AliroLocalOtaWrite or
++       AliroLocalOtaFinish returns != ESP_OK: those core methods
++       already consume the transaction and release the shared
++       busy guard, and a second Abort could race with a fresh
++       Begin from another caller (see aliro_local_ota
++       ownership).
++
++     * NEVER called on a Finish success path, even if the final
++       TCP "OK" send fails. The transaction is already committed
++       and the boot partition is set; the caller decides whether
++       to reboot separately. The helper returns ESP_FAIL in that
++       case.
++
++   The helper has ONE contract: the caller has ALWAYS successfully
++   called AliroLocalOtaBegin(invitation->size) before every call.
++   The later service is responsible for validating its inputs and
++   for NOT calling this helper when validation fails. Because the
++   helper always inherits an active transaction, any invalid
++   argument detected here (sock < 0, invitation == nullptr, or a
++   defensive-only invitation->size == 0) must NOT leak a busy
++   transaction: the helper calls AliroLocalOtaAbort EXACTLY ONCE
++   and then returns ESP_ERR_INVALID_ARG.
++
++   The helper never calls AliroLocalOtaBegin, never closes the
++   socket, and never restarts the device. Later service code
++   owns those actions.
++
++   Returns:
++     * ESP_OK               on success (transfer complete, MD5
++                            matched, Finish succeeded, final
++                            "OK" sent fully)
++     * ESP_ERR_INVALID_ARG  invalid argument — the inherited
++                            active core transaction is aborted
++                            EXACTLY ONCE before this return
++                            (single ownership contract; no
++                            "no-core-action" path exists)
++     * ESP_ERR_TIMEOUT      receive timeout (initial or after
++                            ACK-retry cap); Aborted
++     * ESP_ERR_INVALID_SIZE clean EOF before invitation->size;
++                            Aborted
++     * ESP_ERR_INVALID_CRC  final MD5 mismatch; Aborted
++     * ESP_FAIL             other transport / crypto failure;
++                            Aborted (except a final "OK" send
++                            failure after Finish success, which
++                            returns ESP_FAIL WITHOUT Abort — the
++                            transaction is already committed)
++     * pass-through esp_err_t from AliroLocalOtaWrite /
++       AliroLocalOtaFinish on their own failures; NO extra Abort
++       (those core methods already consumed the transaction)
++*/
++esp_err_t AliroEspotaRunTransfer(int sock,
++                                 const aliro_espota_invitation_t *invitation);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/examples/door_lock/main/aliro_espota_transfer.cpp b/examples/door_lock/main/aliro_espota_transfer.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_transfer.cpp
+@@ -0,0 +1,284 @@
++/*
++   Core-backed espota TCP transfer engine. Wi-Fi variants only
++   (nanoc6-wifi, atoms3-lite-wifi); the Thread variant never
++   applies, compiles, or links this file.
++
++   Compatibility reference: Arduino-esp32 3.3 ArduinoOTA
++   _runUpdate loop (chunk read -> Update.write -> decimal-ACK
++   printf, ACK re-send x 3 on receive timeout, final "OK" +
++   restart). This helper mirrors the wire behaviour but stays
++   confined to the transfer itself: no socket open / close,
++   no restart, and it never calls AliroLocalOtaBegin.
++
++   State ownership is documented in aliro_espota_transfer.h.
++   In short:
++     * Transport-layer / MD5 failure with the core transaction
++       still open -> AliroLocalOtaAbort exactly once.
++     * AliroLocalOtaWrite or AliroLocalOtaFinish returning an
++       error consumes the transaction itself; the helper does
++       NOT re-Abort.
++     * A failed final "OK" send after Finish success returns
++       ESP_FAIL WITHOUT Abort and WITHOUT restart; the
++       transaction is already committed.
++*/
++
++#include "aliro_espota_transfer.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++
++#include <esp_err.h>
++#include <esp_log.h>
++
++#include <mbedtls/md5.h>
++
++#include "aliro_local_ota.h"
++
++namespace {
++
++const char *TAG = "aliro_espota_xfer";
++
++/*
++   Fixed static receive buffer. Exactly 1460 bytes: one TCP MSS
++   on a typical ESP-IDF Wi-Fi stack, same as the ArduinoOTA
++   reference. No heap; no per-chunk allocation.
++*/
++static_assert(kAliroEspotaTransferBufBytes == 1460,
++              "espota receive buffer must be exactly 1460 bytes");
++uint8_t s_rx_buf[kAliroEspotaTransferBufBytes];
++
++/*
++   Apply per-socket receive and send timeouts so recv() returns
++   EAGAIN / EWOULDBLOCK on a stalled peer and send() cannot block
++   forever. Returns true on success.
++*/
++bool set_socket_timeouts(int sock) {
++    struct timeval rxto = { kAliroEspotaTransferRxTimeoutSec, 0 };
++    struct timeval txto = { kAliroEspotaTransferTxTimeoutSec, 0 };
++    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rxto, sizeof(rxto)) != 0) {
++        return false;
++    }
++    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &txto, sizeof(txto)) != 0) {
++        return false;
++    }
++    return true;
++}
++
++/*
++   Send exactly `len` bytes; retry on EINTR and on partial
++   sends. Returns true on complete send, false on error (bounded
++   by SO_SNDTIMEO).
++*/
++bool send_all(int sock, const void *buf, size_t len) {
++    const uint8_t *p = static_cast<const uint8_t *>(buf);
++    while (len > 0) {
++        ssize_t n = send(sock, p, len, 0);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            return false;
++        }
++        if (n == 0) {
++            return false;
++        }
++        p   += static_cast<size_t>(n);
++        len -= static_cast<size_t>(n);
++    }
++    return true;
++}
++
++/*
++   Receive at most `cap` bytes into `buf`.
++   Returns:
++     n >= 1  bytes received
++     0       clean EOF
++    -1       real socket error (not EINTR / EAGAIN)
++    -2       receive timeout (EAGAIN / EWOULDBLOCK)
++   EINTR is retried transparently.
++*/
++ssize_t recv_some(int sock, void *buf, size_t cap) {
++    while (true) {
++        ssize_t n = recv(sock, buf, cap, 0);
++        if (n >= 0) return n;
++        if (errno == EINTR) continue;
++        if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
++        return -1;
++    }
++}
++
++/*
++   Format the espota decimal chunk-size ACK. Mirrors
++   ArduinoOTA's client.printf("%" PRIu32, written) — no
++   delimiter, no leading zeros, no sign. Returns the number of
++   ASCII bytes written, or -1 on overflow.
++*/
++int format_ack(size_t written, char *out, size_t cap) {
++    int n = snprintf(out, cap, "%zu", written);
++    if (n <= 0 || static_cast<size_t>(n) >= cap) return -1;
++    return n;
++}
++
++}  // namespace
++
++esp_err_t AliroEspotaRunTransfer(int sock,
++                                 const aliro_espota_invitation_t *invitation) {
++    /*
++       Ownership contract (single form): the caller ALWAYS has
++       an active AliroLocalOtaBegin transaction open when
++       calling this helper. Therefore any invalid argument
++       detected here MUST NOT leak a busy transaction — call
++       AliroLocalOtaAbort exactly once before returning. The
++       later service is responsible for validating inputs and
++       for NOT calling this helper when its own validation
++       fails; this branch is only defensive.
++    */
++    if (sock < 0 || invitation == nullptr ||
++        invitation->size == 0) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    if (!set_socket_timeouts(sock)) {
++        ESP_LOGE(TAG, "setsockopt timeouts failed: errno=%d", errno);
++        AliroLocalOtaAbort();
++        return ESP_FAIL;
++    }
++
++    mbedtls_md5_context md5_ctx;
++    mbedtls_md5_init(&md5_ctx);
++    if (mbedtls_md5_starts(&md5_ctx) != 0) {
++        mbedtls_md5_free(&md5_ctx);
++        AliroLocalOtaAbort();
++        return ESP_FAIL;
++    }
++
++    size_t total_read       = 0;
++    size_t last_ack_written = 0;
++    int    ack_retries      = 0;
++
++    while (total_read < invitation->size) {
++        size_t want = invitation->size - total_read;
++        if (want > sizeof(s_rx_buf)) {
++            want = sizeof(s_rx_buf);
++        }
++        ssize_t n = recv_some(sock, s_rx_buf, want);
++
++        if (n == -2) {
++            /*
++               Receive timeout. If a previous successful write
++               produced an ACK, retransmit that same decimal
++               ACK (mirrors ArduinoOTA's Try[N]: <written>
++               path). Do NOT call AliroLocalOtaWrite here — the
++               helper only retransmits the last ACK. Cap at
++               kAliroEspotaTransferMaxAckRetries.
++            */
++            if (last_ack_written > 0 &&
++                ack_retries < kAliroEspotaTransferMaxAckRetries) {
++                char ack[16];
++                int alen = format_ack(last_ack_written, ack, sizeof(ack));
++                if (alen < 0 ||
++                    !send_all(sock, ack, static_cast<size_t>(alen))) {
++                    mbedtls_md5_free(&md5_ctx);
++                    AliroLocalOtaAbort();
++                    return ESP_ERR_TIMEOUT;
++                }
++                ack_retries++;
++                continue;
++            }
++            mbedtls_md5_free(&md5_ctx);
++            AliroLocalOtaAbort();
++            return ESP_ERR_TIMEOUT;
++        }
++        if (n < 0) {
++            mbedtls_md5_free(&md5_ctx);
++            AliroLocalOtaAbort();
++            return ESP_FAIL;
++        }
++        if (n == 0) {
++            /*
++               Clean EOF before invitation->size — the peer
++               closed. Treat as short body.
++            */
++            mbedtls_md5_free(&md5_ctx);
++            AliroLocalOtaAbort();
++            return ESP_ERR_INVALID_SIZE;
++        }
++
++        /*
++           Single AliroLocalOtaWrite call per received chunk.
++           On core failure, AliroLocalOtaWrite already consumed
++           the transaction and released the busy guard; do NOT
++           call AliroLocalOtaAbort here (would race with a fresh
++           Begin from another caller).
++        */
++        esp_err_t wr = AliroLocalOtaWrite(s_rx_buf, static_cast<size_t>(n));
++        if (wr != ESP_OK) {
++            mbedtls_md5_free(&md5_ctx);
++            return wr;
++        }
++
++        // Update the streaming MD5 AFTER a successful Write.
++        if (mbedtls_md5_update(&md5_ctx, s_rx_buf,
++                               static_cast<size_t>(n)) != 0) {
++            mbedtls_md5_free(&md5_ctx);
++            AliroLocalOtaAbort();
++            return ESP_FAIL;
++        }
++
++        // Send the decimal chunk-size ACK (no delimiter).
++        char ack[16];
++        int alen = format_ack(static_cast<size_t>(n), ack, sizeof(ack));
++        if (alen < 0 ||
++            !send_all(sock, ack, static_cast<size_t>(alen))) {
++            mbedtls_md5_free(&md5_ctx);
++            AliroLocalOtaAbort();
++            return ESP_FAIL;
++        }
++
++        last_ack_written = static_cast<size_t>(n);
++        ack_retries      = 0;
++        total_read      += static_cast<size_t>(n);
++    }
++
++    // Received exactly invitation->size bytes. Finalise the
++    // streaming MD5 and compare BEFORE Finish so a mismatched
++    // image never reaches esp_ota_set_boot_partition.
++    uint8_t md5_out[kAliroEspotaMd5Bytes];
++    if (mbedtls_md5_finish(&md5_ctx, md5_out) != 0) {
++        mbedtls_md5_free(&md5_ctx);
++        AliroLocalOtaAbort();
++        return ESP_FAIL;
++    }
++    mbedtls_md5_free(&md5_ctx);
++
++    if (memcmp(md5_out, invitation->md5, kAliroEspotaMd5Bytes) != 0) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_CRC;
++    }
++
++    /*
++       Finish consumes / releases the transaction on ANY return,
++       so a Finish failure must NOT be followed by Abort.
++    */
++    esp_err_t fx = AliroLocalOtaFinish();
++    if (fx != ESP_OK) {
++        return fx;
++    }
++
++    /*
++       Only now send the final espota "OK" response. If the send
++       itself fails, return ESP_FAIL but do NOT restart and do
++       NOT Abort: the transaction is already committed and the
++       boot partition is set. The caller decides what to do
++       (log + close socket + optionally restart at a later
++       stage).
++    */
++    static const char kOk[] = "OK";
++    if (!send_all(sock, kOk, 2)) {
++        return ESP_FAIL;
++    }
++
++    return ESP_OK;
++}

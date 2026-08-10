@@ -86,7 +86,8 @@
         "firmware/patches/0015-add-wifi-ota-core.patch",
         "firmware/patches/0016-add-wifi-ota-http-route.patch",
         "firmware/patches/0017-add-wifi-ota-upload-ui.patch",
-        "firmware/patches/0018-add-wifi-espota-protocol.patch"
+        "firmware/patches/0018-add-wifi-espota-protocol.patch",
+        "firmware/patches/0019-add-wifi-espota-transfer.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -145,7 +146,8 @@
         "firmware/patches/0015-add-wifi-ota-core.patch",
         "firmware/patches/0016-add-wifi-ota-http-route.patch",
         "firmware/patches/0017-add-wifi-ota-upload-ui.patch",
-        "firmware/patches/0018-add-wifi-espota-protocol.patch"
+        "firmware/patches/0018-add-wifi-espota-protocol.patch",
+        "firmware/patches/0019-add-wifi-espota-transfer.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
