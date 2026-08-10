@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Build the Aliro NanoC6 release image against a
-# pinned esp-matter checkout.
+# Build the Aliro release image for one variant against a pinned
+# esp-matter checkout.
 #
 # The script does NOT touch the shared ~/Development/esp-matter checkout.
 # It expects a caller-supplied clean source tree at ESP_MATTER_SRC that
 # is checked out at the pinned commit (a git-archive extract is fine).
 #
 # Usage:
-#   scripts/build_release.sh [--source-check]
+#   scripts/build_release.sh [--source-check] [--variant <id>]
 #
 # Options:
 #   --source-check    apply and validate source patches, run the parser
 #                     test, clean the source tree, and exit without idf.py
+#   --variant <id>    build variant id; default nanoc6-thread. Values come
+#                     from firmware/variants.json.
 #
 # Required environment:
 #   ESP_MATTER_SRC   absolute path to a clean esp-matter source tree,
@@ -20,51 +22,124 @@
 #                    unless --source-check is set.
 #
 # Optional environment:
-#   TAG              release tag; default aliro-c6-v0.0.5-devkit
+#   TAG              release tag; default aliro-v0.0.6-devkit. The variant
+#                    is appended to per-artifact file names by
+#                    scripts/prepare_release.sh.
 #   ESP_MATTER_REVISION
 #                    required when ESP_MATTER_SRC is a git archive
 #
 # Outputs:
 #   $ESP_MATTER_SRC/examples/door_lock/build/              build tree
 #   $ESP_MATTER_SRC/examples/door_lock/build/door_lock.bin app image
-#
-# The merged 4 MB factory image and its .sha256 sidecar are produced by
-# scripts/prepare_release.sh, which consumes the outputs of this script.
 
 set -euo pipefail
 
 : "${ESP_MATTER_SRC:?set to absolute path of a clean esp-matter source tree}"
 
-SOURCE_CHECK_ONLY=0
-if [[ "$#" -gt 1 ]]; then
-  echo "usage: $0 [--source-check]" >&2
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VARIANTS_JSON="$REPO_ROOT/firmware/variants.json"
+if [[ ! -f "$VARIANTS_JSON" ]]; then
+  echo "error: variants config not found at $VARIANTS_JSON" >&2
   exit 2
 fi
-case "${1:-}" in
-  "") ;;
-  --source-check) SOURCE_CHECK_ONLY=1 ;;
-  *) echo "usage: $0 [--source-check]" >&2; exit 2 ;;
-esac
+
+SOURCE_CHECK_ONLY=0
+VARIANT_ID="nanoc6-thread"
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --source-check) SOURCE_CHECK_ONLY=1; shift ;;
+    --variant) VARIANT_ID="${2:?--variant requires a value}"; shift 2 ;;
+    --variant=*) VARIANT_ID="${1#--variant=}"; shift ;;
+    -h|--help) sed -n '1,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "usage: $0 [--source-check] [--variant <id>]" >&2; exit 2 ;;
+  esac
+done
 if [[ "$SOURCE_CHECK_ONLY" == "0" ]]; then
   : "${IDF_PATH:?ESP-IDF not exported. source \$IDF_PATH/export.sh first}"
 fi
 
+# Default TAG matches the last legacy release so scripts/prepare_release.sh
+# (which still keys on aliro-c6-v0.0.5-devkit) keeps working for the
+# nanoc6-thread variant. Set TAG=aliro-v0.0.6-devkit for a matrix release.
 TAG="${TAG:-aliro-c6-v0.0.5-devkit}"
-PINNED_ESP_MATTER="85c76a1788c5b70b4b0811734af8616dda15e7ac"
-PINNED_CONNECTEDHOMEIP="efefc94fee39d8d1fbbc3c27b9d7fc9025095887"
+
+# Read the pinned esp-matter revision, connectedhomeip revision, and
+# variant record from firmware/variants.json.
+VARIANT_JSON="$(python3 - "$VARIANTS_JSON" "$VARIANT_ID" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    data = json.load(source)
+variant_id = sys.argv[2]
+variants = data.get("variants", {})
+if variant_id not in variants:
+    print(f"error: unknown variant '{variant_id}'", file=sys.stderr)
+    print(f"       known variants: {', '.join(sorted(variants))}", file=sys.stderr)
+    sys.exit(2)
+entry = variants[variant_id]
+entry["_esp_matter_pin"] = data.get("esp_matter_pin", "")
+entry["_connectedhomeip_pin"] = data.get("connectedhomeip_pin", "")
+entry["_release_tag_pattern"] = data.get("release_tag_pattern", "")
+print(json.dumps(entry))
+PY
+)"
+
+# Extract needed fields into shell variables.
+eval "$(VARIANT_JSON="$VARIANT_JSON" python3 - <<'PY'
+import json, os, shlex
+entry = json.loads(os.environ["VARIANT_JSON"])
+keys = [
+    "id",
+    "project_name",
+    "chip",
+    "chip_family",
+    "flash_size",
+    "transport",
+    "base_sdkconfig",
+    "base_sdkconfig_source",
+    "release_overlay",
+    "board_config_header",
+    "partition_layout_id",
+    "partition_table_sha256",
+    "_esp_matter_pin",
+    "_connectedhomeip_pin",
+    "_release_tag_pattern",
+]
+for key in keys:
+    value = entry.get(key, "")
+    if value is None:
+        value = ""
+    print(f'VARIANT_{key.upper().lstrip("_")}={shlex.quote(str(value))}')
+patches = entry.get("source_patches", [])
+print("VARIANT_SOURCE_PATCHES=(" + " ".join(shlex.quote(str(p)) for p in patches) + ")")
+dep_patches = entry.get("dependency_patches", [])
+print("VARIANT_DEPENDENCY_PATCHES=(" + " ".join(shlex.quote(str(p)) for p in dep_patches) + ")")
+PY
+)"
+
+PINNED_ESP_MATTER="$VARIANT_ESP_MATTER_PIN"
+PINNED_CONNECTEDHOMEIP="$VARIANT_CONNECTEDHOMEIP_PIN"
+
+if [[ ! "$TAG" =~ $VARIANT_RELEASE_TAG_PATTERN ]]; then
+  echo "error: invalid Aliro release tag: $TAG" >&2
+  echo "       expected pattern: $VARIANT_RELEASE_TAG_PATTERN" >&2
+  exit 2
+fi
+# Accept the legacy `aliro-c6-v` and the matrix `aliro-v` prefixes.
+FIRMWARE_VERSION="${TAG#aliro-c6-v}"
+FIRMWARE_VERSION="${FIRMWARE_VERSION#aliro-v}"
+if [[ "$FIRMWARE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+  FIRMWARE_VERSION_NUMBER="${BASH_REMATCH[3]}"
+else
+  echo "error: could not read patch number from $FIRMWARE_VERSION" >&2
+  exit 2
+fi
+if [[ "${#FIRMWARE_VERSION}" -gt 31 ]]; then
+  echo "error: firmware version exceeds the 31-character app descriptor limit: $FIRMWARE_VERSION" >&2
+  exit 2
+fi
 
 if [[ ! -f "$ESP_MATTER_SRC/examples/door_lock/sdkconfig.esp32c6.aliro" ]]; then
   echo "error: $ESP_MATTER_SRC does not look like an esp-matter tree" >&2
-  exit 2
-fi
-if [[ ! "$TAG" =~ ^aliro-c6-v([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
-  echo "error: invalid Aliro release tag: $TAG" >&2
-  exit 2
-fi
-FIRMWARE_VERSION="${TAG#aliro-c6-v}"
-FIRMWARE_VERSION_NUMBER="${BASH_REMATCH[3]}"
-if [[ "${#FIRMWARE_VERSION}" -gt 31 ]]; then
-  echo "error: firmware version exceeds the 31-character app descriptor limit: $FIRMWARE_VERSION" >&2
   exit 2
 fi
 
@@ -98,21 +173,23 @@ if [[ "$CONNECTEDHOMEIP_REVISION" != "$PINNED_CONNECTEDHOMEIP" ]]; then
   exit 2
 fi
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OVERLAY="$REPO_ROOT/firmware/overlay/sdkconfig.release.nanoc6"
-SOURCE_PATCHES=(
-  "$REPO_ROOT/firmware/patches/0001-print-onboarding-codes.patch"
-  "$REPO_ROOT/firmware/patches/0002-advertise-aliro-credentials-only.patch"
-  "$REPO_ROOT/firmware/patches/0003-add-nanoc6-rgb-feedback.patch"
-  "$REPO_ROOT/firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch"
-  "$REPO_ROOT/firmware/patches/0006-add-aliro-settings.patch"
-  "$REPO_ROOT/firmware/patches/0007-toggle-lock-on-aliro-tap.patch"
-)
-DEPENDENCY_PATCHES=(
-  "$REPO_ROOT/firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
-)
+OVERLAY="$REPO_ROOT/$VARIANT_RELEASE_OVERLAY"
+SOURCE_PATCHES=()
+for rel in "${VARIANT_SOURCE_PATCHES[@]}"; do
+  SOURCE_PATCHES+=("$REPO_ROOT/$rel")
+done
+DEPENDENCY_PATCHES=()
+for rel in "${VARIANT_DEPENDENCY_PATCHES[@]}"; do
+  DEPENDENCY_PATCHES+=("$REPO_ROOT/$rel")
+done
+BOARD_CONFIG_HEADER="$REPO_ROOT/$VARIANT_BOARD_CONFIG_HEADER"
+
 if [[ ! -f "$OVERLAY" ]]; then
   echo "error: overlay not found at $OVERLAY" >&2
+  exit 2
+fi
+if [[ -n "$VARIANT_BOARD_CONFIG_HEADER" && ! -f "$BOARD_CONFIG_HEADER" ]]; then
+  echo "error: board config header not found at $BOARD_CONFIG_HEADER" >&2
   exit 2
 fi
 for PROJECT_PATCH in "${SOURCE_PATCHES[@]}" "${DEPENDENCY_PATCHES[@]}"; do
@@ -123,16 +200,23 @@ for PROJECT_PATCH in "${SOURCE_PATCHES[@]}" "${DEPENDENCY_PATCHES[@]}"; do
 done
 
 APP_DIR="$ESP_MATTER_SRC/examples/door_lock"
-OVERLAY_LOCAL="$APP_DIR/sdkconfig.release.nanoc6"
+OVERLAY_LOCAL="$APP_DIR/$(basename "$OVERLAY")"
+BOARD_CONFIG_LOCAL="$APP_DIR/main/aliro_board_config.h"
+BASE_CONFIG_LOCAL="$APP_DIR/$VARIANT_BASE_SDKCONFIG"
+BASE_CONFIG_STAGED=0
 APPLIED_PATCHES=()
 OVERLAY_COPIED=0
+BOARD_CONFIG_COPIED=0
 
 cleanup() {
-  # Restore the pristine example directory by removing artifacts the
-  # build created (except build/, which is what the caller wants).
-  # The overlay copy is ours; safe to delete.
   if [[ "$OVERLAY_COPIED" == "1" && -f "$OVERLAY_LOCAL" ]]; then
     command rm -f "$OVERLAY_LOCAL"
+  fi
+  if [[ "$BOARD_CONFIG_COPIED" == "1" && -f "$BOARD_CONFIG_LOCAL" ]]; then
+    command rm -f "$BOARD_CONFIG_LOCAL"
+  fi
+  if [[ "$BASE_CONFIG_STAGED" == "1" && -f "$BASE_CONFIG_LOCAL" ]]; then
+    command rm -f "$BASE_CONFIG_LOCAL"
   fi
   local patch_index
   for ((patch_index = ${#APPLIED_PATCHES[@]} - 1; patch_index >= 0; patch_index--)); do
@@ -144,16 +228,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# For variants whose base sdkconfig lives outside esp-matter (currently
+# only atoms3-lite-wifi), stage the base config into the example dir so
+# SDKCONFIG_DEFAULTS resolves it relative to the app directory. Refuse
+# to overwrite an existing file so a caller-owned config is never lost.
+if [[ "$VARIANT_BASE_SDKCONFIG_SOURCE" != "upstream" ]]; then
+  BASE_SOURCE="$REPO_ROOT/$VARIANT_BASE_SDKCONFIG_SOURCE"
+  if [[ ! -f "$BASE_SOURCE" ]]; then
+    echo "error: base sdkconfig source not found at $BASE_SOURCE" >&2
+    exit 2
+  fi
+  if [[ -e "$BASE_CONFIG_LOCAL" ]]; then
+    echo "error: refusing to overwrite existing $BASE_CONFIG_LOCAL" >&2
+    exit 2
+  fi
+  cp "$BASE_SOURCE" "$BASE_CONFIG_LOCAL"
+  BASE_CONFIG_STAGED=1
+fi
+
+# Copy the variant board config header into the source tree. Refuse to
+# overwrite an existing file. Do this BEFORE patch application so
+# patches that include it can rely on it being present.
+if [[ -n "$VARIANT_BOARD_CONFIG_HEADER" ]]; then
+  if [[ -e "$BOARD_CONFIG_LOCAL" ]]; then
+    echo "error: refusing to overwrite existing $BOARD_CONFIG_LOCAL" >&2
+    exit 2
+  fi
+  cp "$BOARD_CONFIG_HEADER" "$BOARD_CONFIG_LOCAL"
+  BOARD_CONFIG_COPIED=1
+fi
+
 if [[ -e "$OVERLAY_LOCAL" ]]; then
   echo "error: refusing to overwrite existing $OVERLAY_LOCAL" >&2
   exit 2
 fi
 
-# Apply each audited project delta in file-name order. The reverse
-# dry-run detects an existing patch. --forward stops patch from changing
-# direction during this check. Add the patch to the cleanup list only
-# after both dry-runs pass, but before the real apply. Cleanup can then
-# reverse a partial real apply without changing caller-owned source.
+# Apply each audited project delta in file-name order.
 for SOURCE_PATCH in "${SOURCE_PATCHES[@]}"; do
   if patch --batch --reverse --forward --dry-run -V none -r /dev/null -p1 -d "$ESP_MATTER_SRC" \
       < "$SOURCE_PATCH" >/dev/null 2>&1; then
@@ -197,8 +307,8 @@ validate_aliro_feature_map() {
     echo "error: USR validation does not accept the ALIRO feature" >&2
     return 2
   fi
-  if ! grep -Fq 'CONFIG_ENABLE_ALIRO_OVER_NFC=y' "$APP_DIR/sdkconfig.esp32c6.aliro"; then
-    echo "error: the Aliro release config does not enable Aliro over NFC" >&2
+  if ! grep -Fq 'CONFIG_ENABLE_ALIRO_OVER_NFC=y' "$APP_DIR/$VARIANT_BASE_SDKCONFIG"; then
+    echo "error: the Aliro base config does not enable Aliro over NFC" >&2
     return 2
   fi
 
@@ -223,8 +333,10 @@ validate_nanoc6_nfc_feedback() {
   local m5nfc_source="$APP_DIR/managed_components/m5nfc/m5nfc.cpp"
   local dependency_lock="$APP_DIR/dependencies.lock"
   local required_delegate_text=(
-    'kStatusLedPowerPin = GPIO_NUM_19'
-    'kStatusLedDataPin = GPIO_NUM_20'
+    'kStatusLedDataPin = static_cast<gpio_num_t>(ALIRO_BOARD_RGB_DATA_GPIO)'
+    'kStatusLedPowerPin = static_cast<gpio_num_t>(ALIRO_BOARD_RGB_POWER_GPIO)'
+    '#include "aliro_board_config.h"'
+    '#if ALIRO_BOARD_HAS_RGB_POWER'
     'strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB'
     'strip_config.led_model = LED_MODEL_WS2812'
     'QueueHandle_t g_status_led_queue = nullptr'
@@ -339,6 +451,8 @@ validate_aliro_settings() {
     'kSettingsSchemaVersion = 1'
     'esp_app_get_description()->version'
     'ALIRO/1 STATUS firmware=%s protocol=1'
+    'variant=%s transport=%s'
+    'ALIRO_VARIANT_ID, ALIRO_TRANSPORT_ID'
     'esp_matter::attribute::update(g_door_lock_endpoint_id, DoorLock::Id'
     'xTaskCreate(SerialTask, "aliro_serial"'
   )
@@ -347,7 +461,11 @@ validate_aliro_settings() {
       'set(PROJECT_VER "0.0.5-devkit")' \
       'set(PROJECT_VER_NUMBER 5)' \
       'set(PROJECT_VER "${CLI_PROJECT_VER}")' \
-      'set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")'; do
+      'set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")' \
+      'set(CLI_ALIRO_VARIANT_ID "nanoc6-thread")' \
+      'set(CLI_ALIRO_TRANSPORT_ID "thread")' \
+      'add_compile_definitions(ALIRO_VARIANT_ID="${CLI_ALIRO_VARIANT_ID}")' \
+      'add_compile_definitions(ALIRO_TRANSPORT_ID="${CLI_ALIRO_TRANSPORT_ID}")'; do
     if ! grep -Fq "$required_text" "$cmake_source"; then
       echo "error: project version source is missing: $required_text" >&2
       return 2
@@ -425,7 +543,7 @@ validate_aliro_settings
 validate_aliro_tap_toggle
 
 if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
-  echo "=== Source patch check complete; idf.py was not run ==="
+  echo "=== Source patch check complete for variant $VARIANT_ID; idf.py was not run ==="
   exit 0
 fi
 
@@ -445,12 +563,14 @@ if [[ -f "$ESP_MATTER_SRC/export.sh" ]]; then
   . "$ESP_MATTER_SRC/export.sh"
 fi
 
-echo "=== set-target esp32c6 with layered defaults ==="
+echo "=== set-target $VARIANT_CHIP with layered defaults (variant=$VARIANT_ID) ==="
 idf.py \
   -D CLI_PROJECT_VER="$FIRMWARE_VERSION" \
   -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
-  -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6" \
-  set-target esp32c6
+  -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
+  -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
+  -D SDKCONFIG_DEFAULTS="$VARIANT_BASE_SDKCONFIG;$(basename "$OVERLAY")" \
+  set-target "$VARIANT_CHIP"
 
 # Managed components exist only after dependency resolution. Apply their
 # audited patch now and include it in reverse-order cleanup.
@@ -477,6 +597,8 @@ echo "=== build ==="
 idf.py \
   -D CLI_PROJECT_VER="$FIRMWARE_VERSION" \
   -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
+  -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
+  -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
   build
 
 echo "=== size ==="
@@ -486,6 +608,7 @@ echo
 echo "Build complete."
 echo "  APP_DIR       = $APP_DIR"
 echo "  build/        = $APP_DIR/build"
+echo "  variant       = $VARIANT_ID"
 echo "  target tag    = $TAG"
 echo
-echo "Next: scripts/prepare_release.sh $APP_DIR/build $TAG"
+echo "Next: scripts/prepare_release.sh $APP_DIR/build --variant $VARIANT_ID [--tag $TAG]"

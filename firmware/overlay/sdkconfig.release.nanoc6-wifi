@@ -1,0 +1,41 @@
+# Release overlay for the nanoc6-wifi variant (M5Stack NanoC6, Matter
+# over Wi-Fi).
+#
+# Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. The base
+# supplies the Aliro-over-NFC, BLE peripheral, mbedTLS, and 4 MB
+# partition settings. This overlay swaps the transport from Thread to
+# Wi-Fi and keeps every other Aliro-related base setting.
+#
+# The build script passes:
+#   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6-wifi"
+# so the entries below override any conflicting values from the base.
+
+# --- Board buttons and LED owner ---------------------------------------
+# Identical to the nanoc6-thread overlay. The NanoC6 exposes one user
+# button on GPIO 9 (active-low, shared with the ROM BOOT strap). The
+# on-board RGB LED belongs to the audited Aliro source patch, so the
+# BSP LED driver stays off.
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=9
+CONFIG_BSP_BUTTON_1_LEVEL=0
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console ------------------------------------------------
+# The NanoC6 USB-C connector is wired to the ESP32-C6 USB Serial/JTAG
+# controller. Make that controller the primary bidirectional console.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- Transport: Wi-Fi station on, OpenThread off -----------------------
+# The base config enables OpenThread and disables the Wi-Fi station.
+# Invert both here for a Matter-over-Wi-Fi build. Matter commissioning
+# still runs over BLE; the phone supplies the Wi-Fi credentials.
+CONFIG_ENABLE_WIFI_STATION=y
+CONFIG_OPENTHREAD_ENABLED=n
+
+# --- Do NOT enable the ESP Web Tools Improv wire ----------------------
+# Improv would let the browser flasher push Wi-Fi credentials directly.
+# The Aliro flow commissions through Matter over BLE only, so keep the
+# Improv wire off in firmware and manifest.
+# (No CONFIG option needs to be set; leaving the default off is enough.
+#  This comment records the intentional choice.)

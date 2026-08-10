@@ -303,6 +303,10 @@ class FakeProtocolMonitor extends EventTarget {
 const VALID_STATUS = {
   firmware: "0.0.4-devkit",
   protocol: 1,
+  // Phase 1A parser fills these when the device omits them (legacy 0.0.5
+  // and older). Newer firmware announces the actual variant/transport.
+  variant: "nanoc6-thread",
+  transport: "thread",
   auto_relock_seconds: 10,
   success_rgb: "#00ff00",
   success_ms: 750,
@@ -1215,6 +1219,77 @@ test("Aliro protocol parses complete status and error lines", () => {
   assert.equal(parseAliroProtocolLine(`${line} future_field=1  `).type, "status");
 });
 
+test("Aliro protocol parses additive variant and transport fields", () => {
+  const base = "ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500";
+
+  // Legacy firmware (pre-Phase-1) does not emit variant/transport.
+  // The parser fills the legacy defaults so the caller can still
+  // distinguish variants.
+  const legacy = parseAliroProtocolLine(base);
+  assert.equal(legacy.type, "status");
+  assert.equal(legacy.status.variant, "nanoc6-thread");
+  assert.equal(legacy.status.transport, "thread");
+
+  const wifi = parseAliroProtocolLine(`${base} variant=nanoc6-wifi transport=wifi`);
+  assert.equal(wifi.type, "status");
+  assert.equal(wifi.status.variant, "nanoc6-wifi");
+  assert.equal(wifi.status.transport, "wifi");
+
+  const atoms3 = parseAliroProtocolLine(`${base} variant=atoms3-lite-wifi transport=wifi`);
+  assert.equal(atoms3.status.variant, "atoms3-lite-wifi");
+
+  // Invalid variant / transport values are rejected so the caller
+  // never surfaces a garbage identifier.
+  assert.equal(
+    parseAliroProtocolLine(`${base} variant=BAD transport=wifi`).type,
+    "invalid-status",
+  );
+  assert.equal(
+    parseAliroProtocolLine(`${base} variant=nanoc6-wifi transport=Wi_Fi`).type,
+    "invalid-status",
+  );
+});
+
+test("firmware variants.json shape stays coherent", () => {
+  const variants = JSON.parse(
+    readFileSync(new URL("../../firmware/variants.json", import.meta.url), "utf8"),
+  );
+  const required = [
+    "id", "project_name", "chip", "chip_family", "transport",
+    "base_sdkconfig", "base_sdkconfig_source", "release_overlay",
+    "source_patches", "dependency_patches", "board_config_header",
+    "nfc_sda_gpio", "nfc_scl_gpio", "rgb_data_gpio", "has_rgb_power_pin",
+  ];
+  const seenProjectNames = new Set();
+  for (const [variantId, entry] of Object.entries(variants.variants || {})) {
+    for (const key of required) {
+      assert.ok(entry[key] !== undefined,
+        `variant ${variantId} is missing required field ${key}`);
+    }
+    assert.equal(entry.id, variantId, `variant ${variantId} id must match its key`);
+    assert.ok(!seenProjectNames.has(entry.project_name),
+      `project_name ${entry.project_name} is reused across variants`);
+    seenProjectNames.add(entry.project_name);
+    if (entry.has_rgb_power_pin) {
+      assert.equal(typeof entry.rgb_power_gpio, "number",
+        `${variantId} claims a power pin but rgb_power_gpio is not a number`);
+    } else {
+      assert.equal(entry.rgb_power_gpio, null,
+        `${variantId} has no power pin, so rgb_power_gpio must be null`);
+    }
+    // Both NanoC6 variants share the same NFC unit wiring.
+    assert.equal(entry.nfc_sda_gpio, 2, `${variantId} NFC SDA should be GPIO 2`);
+    assert.equal(entry.nfc_scl_gpio, 1, `${variantId} NFC SCL should be GPIO 1`);
+  }
+  // Phase 1A ships exactly these three variants.
+  assert.deepEqual(
+    Object.keys(variants.variants || {}).sort(),
+    ["atoms3-lite-wifi", "nanoc6-thread", "nanoc6-wifi"],
+  );
+});
+
 test("Aliro protocol builds safe GET and partial SET requests", () => {
   assert.equal(buildGetRequest(), "ALIRO/1 GET");
   assert.equal(buildSetRequest({
@@ -1943,6 +2018,9 @@ test("installer page includes all live monitor controls", () => {
 
 test("firmware source checks require conditional tap-to-lock behavior", () => {
   const script = readFileSync(new URL("../../scripts/build_release.sh", import.meta.url), "utf8");
+  const variants = JSON.parse(
+    readFileSync(new URL("../../firmware/variants.json", import.meta.url), "utf8"),
+  );
 
   assert.match(script, /DoorLock::Attributes::LockState::Get\(door_lock_endpoint_id, lock_state\)/);
   assert.match(script, /lock_state\.Value\(\) == DoorLock::DlLockState::kLocked/);
@@ -1952,7 +2030,14 @@ test("firmware source checks require conditional tap-to-lock behavior", () => {
   assert.match(script, /auto_relock_seconds != 0/);
   assert.match(script, /BoltLockMgr\(\)\.Lock\(door_lock_endpoint_id/);
   assert.match(script, /BoltLockMgr\(\)\.Unlock\(door_lock_endpoint_id/);
-  assert.match(script, /0007-toggle-lock-on-aliro-tap\.patch/);
+  // Every variant must apply the tap-toggle patch. Read the list from the
+  // SSOT so this check tracks the variant matrix instead of a stale literal.
+  for (const [variantId, entry] of Object.entries(variants.variants || {})) {
+    assert.ok(
+      (entry.source_patches || []).includes("firmware/patches/0007-toggle-lock-on-aliro-tap.patch"),
+      `variant ${variantId} must include the tap-toggle patch`,
+    );
+  }
 });
 
 test("README and installer link to each other", () => {

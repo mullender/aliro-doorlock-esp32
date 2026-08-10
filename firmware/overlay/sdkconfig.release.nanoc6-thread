@@ -1,4 +1,5 @@
-# Release overlay for the M5Stack NanoC6 devkit build.
+# Release overlay for the nanoc6-thread variant (M5Stack NanoC6, Matter
+# over Thread).
 #
 # Layered on top of examples/door_lock/sdkconfig.esp32c6.aliro. Only the
 # NanoC6-specific deltas from that base live here. The base supplies
@@ -7,7 +8,7 @@
 # this project changes on top of the stock aliro config.
 #
 # The build script passes:
-#   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"
+#   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6-thread"
 # so the entries below override any conflicting values from the base.
 
 # --- Single button on GPIO 9, active-low --------------------------------

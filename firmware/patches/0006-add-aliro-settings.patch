@@ -2,7 +2,7 @@ diff --git a/examples/door_lock/CMakeLists.txt b/examples/door_lock/CMakeLists.t
 index efc0ba7..b363c39 100644
 --- a/examples/door_lock/CMakeLists.txt
 +++ b/examples/door_lock/CMakeLists.txt
-@@ -8,7 +8,15 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
+@@ -8,7 +8,23 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
      message(FATAL_ERROR "Please set ESP_MATTER_PATH to the path of esp-matter repo")
  endif(NOT DEFINED ENV{ESP_MATTER_PATH})
  
@@ -18,6 +18,14 @@ index efc0ba7..b363c39 100644
 +else()
 +    set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")
 +endif()
++if(NOT DEFINED CLI_ALIRO_VARIANT_ID)
++    set(CLI_ALIRO_VARIANT_ID "nanoc6-thread")
++endif()
++if(NOT DEFINED CLI_ALIRO_TRANSPORT_ID)
++    set(CLI_ALIRO_TRANSPORT_ID "thread")
++endif()
++add_compile_definitions(ALIRO_VARIANT_ID="${CLI_ALIRO_VARIANT_ID}")
++add_compile_definitions(ALIRO_TRANSPORT_ID="${CLI_ALIRO_TRANSPORT_ID}")
  
  set(ESP_MATTER_PATH $ENV{ESP_MATTER_PATH})
 diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
@@ -444,7 +452,7 @@ new file mode 100644
 index 0000000..d548556
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_settings.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,258 @@
 +#include "aliro_settings.h"
 +
 +#include <esp_app_desc.h>
@@ -550,10 +558,12 @@ index 0000000..d548556
 +    const AliroSettingsSnapshot settings = AliroSettingsGet();
 +    printf("ALIRO/1 STATUS firmware=%s protocol=1 auto_relock_seconds=%" PRIu32
 +           " success_rgb=%06" PRIX32 " failure_rgb=%06" PRIX32 " other_rgb=%06" PRIX32
-+           " success_ms=%" PRIu32 " failure_ms=%" PRIu32 " other_ms=%" PRIu32 "\n",
++           " success_ms=%" PRIu32 " failure_ms=%" PRIu32 " other_ms=%" PRIu32
++           " variant=%s transport=%s\n",
 +           esp_app_get_description()->version, settings.auto_relock_seconds, settings.success_rgb,
 +           settings.failure_rgb, settings.other_rgb,
-+           settings.success_ms, settings.failure_ms, settings.other_ms);
++           settings.success_ms, settings.failure_ms, settings.other_ms,
++           ALIRO_VARIANT_ID, ALIRO_TRANSPORT_ID);
 +    fflush(stdout);
 +}
 +

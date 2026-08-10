@@ -1,0 +1,96 @@
+diff --git a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+--- a/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
++++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
+@@ -16,6 +16,7 @@
+ #include <freertos/semphr.h>
+ #include <freertos/task.h>
+ #include <led_strip.h>
++#include "aliro_board_config.h"
+ #include <m5nfc.h>
+ #include <nvs.h>
+
+@@ -48,8 +49,26 @@
+ const ESP32Config::Key kAliroSigningKey = { ESP32Config::kConfigNamespace_ChipConfig, "aliro-priv-key" };
+ namespace {
+
+-constexpr gpio_num_t kStatusLedPowerPin = GPIO_NUM_19;
+-constexpr gpio_num_t kStatusLedDataPin = GPIO_NUM_20;
++// The board_config header supplies ALIRO_BOARD_ID, the RGB data pin,
++// and (if the board has a power-enable rail) ALIRO_BOARD_HAS_RGB_POWER +
++// ALIRO_BOARD_RGB_POWER_GPIO. The defaults below match the NanoC6 wiring
++// so a source-only build without the copy still compiles.
++#ifndef ALIRO_BOARD_RGB_DATA_GPIO
++#define ALIRO_BOARD_RGB_DATA_GPIO 20
++#endif
++#ifndef ALIRO_BOARD_HAS_RGB_POWER
++#define ALIRO_BOARD_HAS_RGB_POWER 1
++#endif
++#if ALIRO_BOARD_HAS_RGB_POWER && !defined(ALIRO_BOARD_RGB_POWER_GPIO)
++#define ALIRO_BOARD_RGB_POWER_GPIO 19
++#endif
++#ifndef ALIRO_BOARD_ID
++#define ALIRO_BOARD_ID "nanoc6"
++#endif
++constexpr gpio_num_t kStatusLedDataPin = static_cast<gpio_num_t>(ALIRO_BOARD_RGB_DATA_GPIO);
++#if ALIRO_BOARD_HAS_RGB_POWER
++constexpr gpio_num_t kStatusLedPowerPin = static_cast<gpio_num_t>(ALIRO_BOARD_RGB_POWER_GPIO);
++#endif
+ constexpr uint32_t kStatusLedTaskStackSize = 3072;
+ constexpr UBaseType_t kStatusLedTaskPriority = 3;
+ constexpr uint8_t kSelectHeader[] = { 0x00, 0xA4, 0x04, 0x00, 0x09 };
+@@ -191,18 +210,22 @@
+         (void)led_strip_del(g_status_led);
+         g_status_led = nullptr;
+     }
++#if ALIRO_BOARD_HAS_RGB_POWER
+     (void)gpio_set_level(kStatusLedPowerPin, 0);
++#endif
+ }
+
+ esp_err_t InitStatusLed()
+ {
++    esp_err_t err = ESP_OK;
++#if ALIRO_BOARD_HAS_RGB_POWER
+     gpio_config_t power_config = {};
+     power_config.pin_bit_mask = 1ULL << kStatusLedPowerPin;
+     power_config.mode = GPIO_MODE_OUTPUT;
+     power_config.pull_up_en = GPIO_PULLUP_DISABLE;
+     power_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+     power_config.intr_type = GPIO_INTR_DISABLE;
+-    esp_err_t err = gpio_config(&power_config);
++    err = gpio_config(&power_config);
+     if (err != ESP_OK) {
+         return err;
+     }
+@@ -210,6 +233,7 @@
+     if (err != ESP_OK) {
+         return err;
+     }
++#endif
+
+     led_strip_config_t strip_config = {};
+     strip_config.strip_gpio_num = kStatusLedDataPin;
+@@ -224,7 +248,9 @@
+     rmt_config.flags.with_dma = false;
+     err = led_strip_new_rmt_device(&strip_config, &rmt_config, &g_status_led);
+     if (err != ESP_OK) {
++#if ALIRO_BOARD_HAS_RGB_POWER
+         (void)gpio_set_level(kStatusLedPowerPin, 0);
++#endif
+         return err;
+     }
+
+@@ -238,8 +264,12 @@
+         CleanupStatusLed();
+         return ESP_ERR_NO_MEM;
+     }
+-    ESP_LOGI("Aliro", "NanoC6 RGB status LED initialized on GPIO %d (power GPIO %d)", kStatusLedDataPin,
+-             kStatusLedPowerPin);
++#if ALIRO_BOARD_HAS_RGB_POWER
++    ESP_LOGI("Aliro", "%s RGB status LED initialized on GPIO %d (power GPIO %d)", ALIRO_BOARD_ID,
++             kStatusLedDataPin, kStatusLedPowerPin);
++#else
++    ESP_LOGI("Aliro", "%s RGB status LED initialized on GPIO %d", ALIRO_BOARD_ID, kStatusLedDataPin);
++#endif
+     return ESP_OK;
+ }

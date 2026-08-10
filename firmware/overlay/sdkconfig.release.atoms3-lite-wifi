@@ -1,0 +1,35 @@
+# Release overlay for the atoms3-lite-wifi variant (M5Stack AtomS3
+# Lite, Matter over Wi-Fi).
+#
+# Layered on top of firmware/base/sdkconfig.esp32s3.aliro. The base is
+# supplied by this repository because the pinned esp-matter checkout
+# has no sdkconfig.esp32s3.aliro. The base already enables Aliro over
+# NFC, Wi-Fi station, BLE peripheral, mbedTLS trimming, and the 4 MB
+# partition layout.
+#
+# The build script passes:
+#   -D SDKCONFIG_DEFAULTS="sdkconfig.esp32s3.aliro;sdkconfig.release.atoms3-lite-wifi"
+# so the entries below override any conflicting values from the base.
+
+# --- Board button ------------------------------------------------------
+# The AtomS3 Lite front button is on GPIO 41, active-low.
+CONFIG_BSP_BUTTONS_NUM=1
+CONFIG_BSP_BUTTON_1_TYPE_GPIO=y
+CONFIG_BSP_BUTTON_1_GPIO=41
+CONFIG_BSP_BUTTON_1_LEVEL=0
+
+# --- No BSP LEDs -------------------------------------------------------
+# The AtomS3 Lite carries an on-board WS2812 that the audited Aliro
+# source patch drives directly. Zero LEDs disables only the BSP LED
+# owner.
+CONFIG_BSP_LEDS_NUM=0
+
+# --- Native USB console ------------------------------------------------
+# The AtomS3 Lite USB-C connector is wired to the ESP32-S3 USB
+# Serial/JTAG controller. Make that controller the primary
+# bidirectional console.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- Do NOT enable the ESP Web Tools Improv wire ----------------------
+# Matter commissioning runs over BLE only and supplies the Wi-Fi
+# credentials. Leave Improv off in the firmware and in the manifest.

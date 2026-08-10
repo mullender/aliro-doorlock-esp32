@@ -12,6 +12,13 @@ const SETTING_KEYS = [
   "other_ms",
 ];
 
+// STATUS extension. Firmware built before Phase 1 does not print these
+// fields. Treat a missing variant as the legacy nanoc6-thread build.
+const LEGACY_VARIANT_ID = "nanoc6-thread";
+const LEGACY_TRANSPORT_ID = "thread";
+const VARIANT_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const TRANSPORT_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
 function parseInteger(value, name, maximum) {
   if (!/^\d+$/.test(value)) throw new Error(`${name} must be a whole number.`);
   const parsed = Number(value);
@@ -43,6 +50,13 @@ function parseFields(text) {
   return fields;
 }
 
+function parseIdentifier(value, name, pattern) {
+  if (typeof value !== "string" || !pattern.test(value)) {
+    throw new Error(`${name} must be a lowercase kebab-case identifier.`);
+  }
+  return value;
+}
+
 function validateStatus(fields) {
   const required = ["firmware", "protocol", ...SETTING_KEYS];
   for (const key of required) {
@@ -52,9 +66,19 @@ function validateStatus(fields) {
   if (!parseDevkitVersion(fields.firmware)) {
     throw new Error("The firmware version is not a semantic devkit version.");
   }
+  // Variant and transport are additive fields. Pre-Phase-1 firmware
+  // does not print them; treat that as the legacy nanoc6-thread build.
+  const variant = Object.hasOwn(fields, "variant")
+    ? parseIdentifier(fields.variant, "variant", VARIANT_ID_PATTERN)
+    : LEGACY_VARIANT_ID;
+  const transport = Object.hasOwn(fields, "transport")
+    ? parseIdentifier(fields.transport, "transport", TRANSPORT_ID_PATTERN)
+    : LEGACY_TRANSPORT_ID;
   return {
     firmware: fields.firmware,
     protocol: 1,
+    variant,
+    transport,
     auto_relock_seconds: parseInteger(
       fields.auto_relock_seconds,
       "auto_relock_seconds",
@@ -143,4 +167,6 @@ export const __internals = {
   MAX_AUTO_RELOCK_SECONDS,
   MAX_LED_DURATION_MS,
   SETTING_KEYS,
+  LEGACY_VARIANT_ID,
+  LEGACY_TRANSPORT_ID,
 };

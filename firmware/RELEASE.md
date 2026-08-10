@@ -1,19 +1,36 @@
-# Aliro NanoC6 release build
+# Aliro release build
 
 This document explains how to build the current devkit release from
 the pinned sources below.
+
+## Variant matrix
+
+`firmware/variants.json` is the single source of truth for the variant
+list. Phase 1 ships three variants under one matrix release tag
+`aliro-vX.Y.Z-devkit`:
+
+| Variant id           | Chip     | Board                | Transport | Base sdkconfig                                       |
+|----------------------|----------|----------------------|-----------|------------------------------------------------------|
+| `nanoc6-thread`      | ESP32-C6 | M5Stack NanoC6       | Thread    | `sdkconfig.esp32c6.aliro` (from esp-matter)          |
+| `nanoc6-wifi`        | ESP32-C6 | M5Stack NanoC6       | Wi-Fi     | `sdkconfig.esp32c6.aliro` (from esp-matter)          |
+| `atoms3-lite-wifi`   | ESP32-S3 | M5Stack AtomS3 Lite  | Wi-Fi     | `firmware/base/sdkconfig.esp32s3.aliro` (this repo)  |
+
+The Wi-Fi overlays keep Aliro over NFC on, turn Wi-Fi station on, and
+turn OpenThread off (where applicable). BLE stays on for Matter
+commissioning. No overlay enables Improv Wi-Fi; the phone supplies the
+Wi-Fi credentials over BLE.
 
 ## Pins
 
 | Component | Value |
 |---|---|
-| Target board | M5Stack NanoC6 (ESP32-C6FH4, 4 MB flash) |
 | Firmware source | `esp-matter/examples/door_lock` |
 | esp-matter commit | `85c76a1788c5b70b4b0811734af8616dda15e7ac` |
 | connectedhomeip commit | `efefc94fee39d8d1fbbc3c27b9d7fc9025095887` |
 | ESP-IDF version | `5.5.4` (tag `v5.5.4`) |
-| Release tag | `aliro-c6-v0.0.5-devkit` |
-| Merged image size | 4 MiB (4 194 304 bytes), padded with `0xFF` |
+| Matrix release tag | `aliro-vX.Y.Z-devkit` |
+| Legacy release tag | `aliro-c6-v0.0.5-devkit` (nanoc6-thread only) |
+| Flash size | 4 MB per variant, padded with `0xFF` |
 
 The build never modifies the shared `~/Development/esp-matter` checkout.
 It uses a clean source snapshot created from a `git archive` of the
@@ -21,11 +38,15 @@ pinned commit, with `connectedhomeip/connectedhomeip` provided as a
 symlink into the shared checkout (which already has the correct
 submodule pins and mirrored blobs).
 
-## Release overlay
+## Release overlays
 
-`firmware/overlay/sdkconfig.release.nanoc6` holds only the NanoC6
-deltas from the stock `sdkconfig.esp32c6.aliro`. Six settings, all
-verified against esp-matter `85c76a1`:
+Each variant has its own release overlay. Only the deltas from that
+variant's base sdkconfig live in the overlay; the base file supplies
+every other Aliro, transport, mbedTLS, and partition setting.
+
+- `firmware/overlay/sdkconfig.release.nanoc6-thread` — legacy NanoC6
+  Thread build. Six settings, all verified against esp-matter
+  `85c76a1`:
 
 - `CONFIG_BSP_BUTTONS_NUM=1`
 - `CONFIG_BSP_BUTTON_1_TYPE_GPIO=y`
@@ -39,6 +60,14 @@ verified against esp-matter `85c76a1`:
 The stock `sdkconfig.esp32c6.aliro` supplies every other setting:
 Thread MTD, BLE peripheral, Wi-Fi station off, mbedTLS trimming,
 Aliro-over-NFC on, and the 4 MB partition layout.
+
+- `firmware/overlay/sdkconfig.release.nanoc6-wifi` — NanoC6 Wi-Fi
+  build. Same BSP pin settings plus `CONFIG_ENABLE_WIFI_STATION=y` and
+  `CONFIG_OPENTHREAD_ENABLED=n` to swap the transport.
+- `firmware/overlay/sdkconfig.release.atoms3-lite-wifi` — AtomS3 Lite
+  Wi-Fi build. Uses the AtomS3 Lite front button on GPIO 41 and the
+  same native USB console; layered on `firmware/base/sdkconfig.esp32s3.aliro`
+  which enables Wi-Fi and Aliro over NFC for the ESP32-S3 target.
 
 The build script applies the audited patches in `firmware/patches/`.
 It applies source patches before dependency resolution and the managed
@@ -96,6 +125,17 @@ CRC-A. The lock updates this identifier when Matter sets or restores
 the reader configuration. It clears the identifier when Matter clears
 the reader configuration.
 
+## Board pin map
+
+`firmware/board_config/nanoc6.h` and `firmware/board_config/atoms3_lite.h`
+capture the per-board NFC unit pins, RGB data pin, and (where present)
+RGB power-enable pin. The build script copies the correct header into
+the source tree as `main/aliro_board_config.h` before it applies the
+patches. The NanoC6 uses NFC SDA GPIO 2 / SCL GPIO 1 and drives its
+on-board WS2812 through data GPIO 20 with power on GPIO 19. The AtomS3
+Lite uses the same NFC pins (Grove header) and drives its WS2812 from
+GPIO 35 with no separate power-enable pin.
+
 ## Serial settings protocol
 
 Version 0.0.4 adds the `ALIRO/1` line protocol on the native USB serial
@@ -124,8 +164,13 @@ The firmware emits one status line when serial input starts, after `GET`,
 and after a successful `SET`:
 
 ```
-ALIRO/1 STATUS firmware=0.0.5-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000
+ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 auto_relock_seconds=5 success_rgb=00FF00 failure_rgb=FF0000 other_rgb=0000FF success_ms=1000 failure_ms=1000 other_ms=1000 variant=nanoc6-thread transport=thread
 ```
+
+The trailing `variant` and `transport` fields are additive Phase 1
+extensions. Old firmware (pre-0.0.6) does not print them, and the
+installer treats a missing `variant` as the legacy `nanoc6-thread`
+build. Protocol number stays `1`.
 
 The firmware returns `ALIRO/1 ERROR code=<code>` for a rejected command.
 The protocol defines `bad_request`, `unknown_key`, `invalid_value`,
@@ -164,28 +209,41 @@ connectedhomeip checkout before it starts the build.
 . ~/Development/esp-idf/export.sh
 export ESP_MATTER_SRC=/absolute/path/to/clean/esp-matter/snapshot
 export ESP_MATTER_REVISION=85c76a1788c5b70b4b0811734af8616dda15e7ac
-scripts/build_release.sh                       # build only
-scripts/build_release.sh --source-check        # source and parser checks only
-scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
+# --- one variant at a time ---
+scripts/build_release.sh --variant nanoc6-thread                    # build only
+scripts/build_release.sh --source-check --variant nanoc6-thread     # source and parser checks only
+scripts/build_release.sh --source-check --variant nanoc6-wifi
+scripts/build_release.sh --source-check --variant atoms3-lite-wifi
 ```
+
+The `--variant` argument defaults to `nanoc6-thread`. Phase 1A ships
+per-variant source validation. Actual per-variant builds and packaging
+land in Phase 1B along with the matrix release tag `aliro-vX.Y.Z-devkit`.
+Until Phase 1B, `scripts/prepare_release.sh` continues to package the
+legacy `aliro-c6-*` assets for the `nanoc6-thread` variant unchanged.
 
 `build_release.sh`:
 
-1. Applies source patches 0001 through 0004, then 0006 and 0007, to the
-   clean source tree.
-2. Checks that the Door Lock FeatureMap is `0x2100` (`USR | ALIRO`).
-3. Checks the settings and tap-toggle source contracts, then compiles and
-   runs the host parser test.
-4. Copies the overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
-5. Runs `idf.py set-target esp32c6` with the version from `TAG` and
-   `SDKCONFIG_DEFAULTS="sdkconfig.esp32c6.aliro;sdkconfig.release.nanoc6"`.
-6. Applies patch 0005 after `idf.py` fetches the managed components.
-7. Checks the ECP frame, GroupIdentifier mapping, NFC activation order,
+1. Reads the variant record from `firmware/variants.json`.
+2. Copies the per-board pin header from `firmware/board_config/<board>.h`
+   into `$ESP_MATTER_SRC/examples/door_lock/main/aliro_board_config.h`
+   so patch 0008 can include it.
+3. Applies source patches 0001 through 0004, then 0006, 0007, and 0008,
+   to the clean source tree.
+4. Checks that the Door Lock FeatureMap is `0x2100` (`USR | ALIRO`).
+5. Checks the settings, board-pin, and tap-toggle source contracts, then
+   compiles and runs the host parser test.
+6. Copies the variant overlay into `$ESP_MATTER_SRC/examples/door_lock/`.
+7. Runs `idf.py set-target <chip>` with the version from `TAG`, the
+   variant's `CLI_ALIRO_VARIANT_ID` and `CLI_ALIRO_TRANSPORT_ID`, and
+   the layered `SDKCONFIG_DEFAULTS`.
+8. Applies patch 0005 after `idf.py` fetches the managed components.
+9. Checks the ECP frame, GroupIdentifier mapping, NFC activation order,
    RGB pins, and result mapping.
-8. Runs `idf.py build` with the same version values.
-9. Prints `idf.py size` for the audit.
-10. Removes the temporary overlay and all patches in reverse order
-   on exit.
+10. Runs `idf.py build` with the same version values.
+11. Prints `idf.py size` for the audit.
+12. Removes the temporary overlay, board header, and all patches in
+    reverse order on exit.
 
 `prepare_release.sh`:
 
@@ -206,6 +264,13 @@ scripts/prepare_release.sh <build-dir> [<tag>] # package + sha256
    package run keeps the prior complete artifact set.
 
 ## Artifacts
+
+Phase 1A does NOT change the release artifact contract. The
+`nanoc6-thread` variant still ships as `aliro-c6-vX.Y.Z-devkit-*`
+files. Phase 1B replaces the tag with the matrix `aliro-vX.Y.Z-devkit`
+and adds per-variant asset names like
+`aliro-v0.0.6-devkit-nanoc6-wifi-factory.bin` under a single GitHub
+Release.
 
 ```
 artifacts/aliro-c6-v0.0.5-devkit/
