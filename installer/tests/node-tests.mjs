@@ -2982,6 +2982,334 @@ test("runPrepare refuses to point at the repository artifacts tree", () => {
   });
 });
 
+// --- scripts/assemble_release.py fixture tests ---
+// These tests build a synthetic three-variant asset tree that matches
+// scripts/prepare_release.sh's output layout, run the assembler
+// against it, and cover the valid path plus five fail-closed cases.
+// Every negative test also asserts that the assembler wrote nothing to
+// the output directory.
+
+const ASSEMBLE_SCRIPT = new URL("../../scripts/assemble_release.py", import.meta.url).pathname;
+const APPROVED_PARTITION_SHA =
+  "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421";
+
+// Build a synthetic factory image that satisfies every assembler check:
+// 4 MiB total, padded with 0xFF, real partition bytes at 0xC000 whose
+// SHA-256 matches the approved hash, real app bytes embedded at 0x20000.
+function buildFactoryImage(partitionBytes, appBytes, flashSize = 4 * 1024 * 1024) {
+  const image = Buffer.alloc(flashSize, 0xff);
+  partitionBytes.copy(image, 0xC000);
+  appBytes.copy(image, 0x20000);
+  return image;
+}
+
+// Build a partition-table blob whose SHA-256 matches the approved
+// nanoc6 value. Real partition-table bytes are not needed for the
+// assembler's checks; only the SHA at 0xC000 matters. We forge a
+// blob whose hash equals APPROVED_PARTITION_SHA by cheating: the
+// tests patch variants.json to accept whatever bytes we choose. That
+// preserves the assembler's real check semantics.
+function forgePartitionBytes() {
+  return Buffer.alloc(0xC00, 0x00);
+}
+
+function forgePartitionSha(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function writePackage(pkgDir, tag, variant, projectName, chip, flashSize,
+                      appBytes, partitionBytes) {
+  mkdirSync(pkgDir, { recursive: true });
+  const stem = `${tag}-${variant}`;
+  const factoryName = `${stem}-factory.bin`;
+  const appName = `${stem}-app.bin`;
+  const factory = buildFactoryImage(partitionBytes, appBytes);
+  const factoryPath = path.join(pkgDir, factoryName);
+  const appPath = path.join(pkgDir, appName);
+  writeFileSync(factoryPath, factory);
+  writeFileSync(appPath, appBytes);
+  const factorySha = createHash("sha256").update(factory).digest("hex");
+  const appSha = createHash("sha256").update(appBytes).digest("hex");
+  writeFileSync(`${factoryPath}.sha256`, `${factorySha}  ${factoryName}\n`);
+  writeFileSync(`${appPath}.sha256`, `${appSha}  ${appName}\n`);
+  const firmwareVersion = tag.replace(/^aliro-v/, "");
+  writeFileSync(path.join(pkgDir, `${stem}-manifest.txt`),
+`# ${tag} ${variant} factory image manifest
+tag: ${tag}
+variant: ${variant}
+project_name: ${projectName}
+project_version: ${firmwareVersion}
+chip: ${chip}
+flash_size: ${flashSize}
+size: ${factory.length} bytes
+sha256: ${factorySha}
+`);
+  return { factoryPath, appPath, factorySha, appSha, factoryName, appName };
+}
+
+// Build a full three-variant asset tree. All variants use the same
+// forged partition bytes (SHA-256 patched in variants.json by
+// withForgedPartitionForAllVariants) so the smoke path can exercise
+// every check without three real firmware builds.
+function buildMatrixTree(tag, assetsRoot, partitionBytes) {
+  const tagRoot = path.join(assetsRoot, tag);
+  mkdirSync(tagRoot, { recursive: true });
+  const configs = [
+    ["nanoc6-thread",    "aliro-nanoc6-thread",    "esp32c6", "4MB"],
+    ["nanoc6-wifi",      "aliro-nanoc6-wifi",      "esp32c6", "4MB"],
+    ["atoms3-lite-wifi", "aliro-atoms3-lite-wifi", "esp32s3", "4MB"],
+  ];
+  const packages = {};
+  for (const [variant, projectName, chip, flashSize] of configs) {
+    const pkg = writePackage(
+      path.join(tagRoot, variant),
+      tag, variant, projectName, chip, flashSize,
+      Buffer.alloc(0x10000, 0x41), // 64 KiB fake app
+      partitionBytes,
+    );
+    packages[variant] = pkg;
+  }
+  return packages;
+}
+
+// Patch variants.json so all three variants accept the forged
+// partition SHA-256, then run the callback and restore.
+function withForgedPartitionForAllVariants(bytes, callback) {
+  const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
+  const originalVariants = readFileSync(variantsPath, "utf8");
+  const forgedHash = createHash("sha256").update(bytes).digest("hex");
+  const patched = JSON.parse(originalVariants);
+  for (const variantId of ["nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"]) {
+    patched.variants[variantId].partition_table_sha256 = forgedHash;
+  }
+  writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+  try {
+    return callback(variantsPath.pathname, forgedHash);
+  } finally {
+    writeFileSync(variantsPath, originalVariants);
+  }
+}
+
+function runAssemble({ tag, variantsPath, assetsRoot, outDir }) {
+  try {
+    const stdout = execFileSync("python3", [
+      ASSEMBLE_SCRIPT,
+      "--tag", tag,
+      "--variants", variantsPath,
+      "--assets", assetsRoot,
+      "--out", outDir,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    return { status: 0, stdout, stderr: "" };
+  } catch (error) {
+    return {
+      status: typeof error.status === "number" ? error.status : -1,
+      stdout: error.stdout?.toString() || "",
+      stderr: error.stderr?.toString() || String(error),
+    };
+  }
+}
+
+test("assemble_release.py publishes a full three-variant matrix release", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath,
+        assetsRoot,
+        outDir,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const files = readdirSync(outDir).sort();
+      const expected = [];
+      for (const variant of ["nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"]) {
+        expected.push(`aliro-v0.0.6-devkit-${variant}-app.bin`);
+        expected.push(`aliro-v0.0.6-devkit-${variant}-app.bin.sha256`);
+        expected.push(`aliro-v0.0.6-devkit-${variant}-factory.bin`);
+        expected.push(`aliro-v0.0.6-devkit-${variant}-factory.bin.sha256`);
+        expected.push(`manifest-${variant}.json`);
+        expected.push(`manifest-update-${variant}.json`);
+      }
+      assert.deepEqual(files, expected.sort(),
+        "output must contain exactly the expected per-variant assets and manifests");
+
+      // Factory manifest: auto-erase and one part at offset 0.
+      for (const variant of ["nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"]) {
+        const factoryManifest = JSON.parse(readFileSync(
+          path.join(outDir, `manifest-${variant}.json`), "utf8"));
+        assert.equal(factoryManifest.version, "aliro-v0.0.6-devkit");
+        assert.equal(factoryManifest.new_install_prompt_erase, false,
+          `${variant} factory manifest must auto-erase (new_install_prompt_erase=false)`);
+        assert.equal(factoryManifest.builds.length, 1);
+        assert.equal(factoryManifest.builds[0].parts.length, 1);
+        assert.equal(factoryManifest.builds[0].parts[0].offset, 0);
+        assert.match(factoryManifest.builds[0].parts[0].path,
+          new RegExp(`^aliro-v0\\.0\\.6-devkit-${variant}-factory\\.bin$`));
+
+        // Update manifest: keep-setup and two parts at approved OTA offsets.
+        const updateManifest = JSON.parse(readFileSync(
+          path.join(outDir, `manifest-update-${variant}.json`), "utf8"));
+        assert.equal(updateManifest.new_install_prompt_erase, true,
+          `${variant} update manifest must set new_install_prompt_erase=true so the guard fires`);
+        assert.deepEqual(
+          updateManifest.builds[0].parts.map((p) => p.offset).sort((a, b) => a - b),
+          [0x20000, 0x200000],
+          `${variant} update manifest must write app at both approved OTA offsets`,
+        );
+      }
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py fails closed on a missing package", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      // Remove one required file from nanoc6-thread.
+      rmSync(path.join(assetsRoot, "aliro-v0.0.6-devkit", "nanoc6-thread",
+        "aliro-v0.0.6-devkit-nanoc6-thread-app.bin"));
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath, assetsRoot, outDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /nanoc6-thread: missing required package file/);
+      assert.equal(existsSync(outDir), false, "no output directory may be created");
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py fails closed on a bad sidecar", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      const sidecar = path.join(assetsRoot, "aliro-v0.0.6-devkit", "nanoc6-wifi",
+        "aliro-v0.0.6-devkit-nanoc6-wifi-factory.bin.sha256");
+      writeFileSync(sidecar, `0000000000000000000000000000000000000000000000000000000000000000  aliro-v0.0.6-devkit-nanoc6-wifi-factory.bin\n`);
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath, assetsRoot, outDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /nanoc6-wifi: factory sidecar/);
+      assert.equal(existsSync(outDir), false);
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py fails closed on bad identity", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      const manifest = path.join(assetsRoot, "aliro-v0.0.6-devkit", "atoms3-lite-wifi",
+        "aliro-v0.0.6-devkit-atoms3-lite-wifi-manifest.txt");
+      const text = readFileSync(manifest, "utf8")
+        .replace(/^project_name:.*$/m, "project_name: door_lock");
+      writeFileSync(manifest, text);
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath, assetsRoot, outDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /atoms3-lite-wifi: manifest 'project_name' is 'door_lock'/);
+      assert.equal(existsSync(outDir), false);
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py fails closed on a bad partition slice", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      // Corrupt bytes at 0xC000 in nanoc6-thread's factory image so its
+      // embedded partition SHA no longer matches the approved hash.
+      const factory = path.join(assetsRoot, "aliro-v0.0.6-devkit", "nanoc6-thread",
+        "aliro-v0.0.6-devkit-nanoc6-thread-factory.bin");
+      const buf = Buffer.from(readFileSync(factory));
+      buf.fill(0xAA, 0xC000, 0xC000 + 0xC00);
+      writeFileSync(factory, buf);
+      // Regenerate the factory sidecar so the assembler passes the
+      // sidecar check and reaches the partition-slice check.
+      const factorySha = createHash("sha256").update(buf).digest("hex");
+      writeFileSync(`${factory}.sha256`,
+        `${factorySha}  aliro-v0.0.6-devkit-nanoc6-thread-factory.bin\n`);
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath, assetsRoot, outDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /nanoc6-thread: embedded partition SHA .* != approved/);
+      assert.equal(existsSync(outDir), false);
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py fails closed on a bad embedded app slice", () => {
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outDir = path.join(mkdtempSync(path.join(tmpdir(), "assemble-out-")), "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      // Corrupt the embedded app at 0x20000 in the factory image
+      // without touching the standalone app.bin. Regenerate the
+      // factory sidecar so we reach the embedded-app check.
+      const factory = path.join(assetsRoot, "aliro-v0.0.6-devkit", "nanoc6-wifi",
+        "aliro-v0.0.6-devkit-nanoc6-wifi-factory.bin");
+      const buf = Buffer.from(readFileSync(factory));
+      buf.fill(0xBB, 0x20000, 0x20000 + 0x100);
+      writeFileSync(factory, buf);
+      const factorySha = createHash("sha256").update(buf).digest("hex");
+      writeFileSync(`${factory}.sha256`,
+        `${factorySha}  aliro-v0.0.6-devkit-nanoc6-wifi-factory.bin\n`);
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath, assetsRoot, outDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /nanoc6-wifi: embedded app SHA .* != standalone app SHA/);
+      assert.equal(existsSync(outDir), false);
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
 test("README and installer link to each other", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
