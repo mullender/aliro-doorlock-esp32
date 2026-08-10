@@ -9,7 +9,9 @@ authentication, no settings changes):
   * MODIFY main/aliro_local_web.h: declare
       esp_err_t AliroLocalWebLogInit(void);
     which app_main calls exactly once at boot to install the log
-    sink.
+    sink. The header prose reflects the implementation: the ring
+    lock is a statically initialised portMUX with no runtime
+    construction, so this entry point always returns ESP_OK.
 
   * MODIFY main/aliro_local_web.cpp: add a static 16 KiB ring
     (s_log_ring), a portMUX spinlock (s_log_lock,
@@ -72,9 +74,9 @@ diff --git a/examples/door_lock/main/aliro_local_web.h b/examples/door_lock/main
 +   ring lock, and never calls ESP_LOG or allocates.
 +
 +   Call this as the very first line of app_main so most boot lines
-+   land in the ring. Idempotent on repeat calls. Returns non-ESP_OK
-+   only if the internal mutex could not be created; the caller must
-+   treat that as non-fatal.
++   land in the ring. Idempotent on repeat calls. The ring lock is a
++   statically initialised portMUX (no runtime construction), so this
++   entry point always returns ESP_OK.
 +*/
 +esp_err_t AliroLocalWebLogInit(void);
 +
