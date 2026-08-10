@@ -18,6 +18,15 @@ build-file change):
 
   * NEW main/aliro_espota_protocol.cpp: implements the parsers
     and the auth verifier:
+      - The mbedtls/constant_time.h include is WRAPPED in a
+        local extern "C" { ... } block because the pinned
+        ESP-IDF header omits its own extern "C" guard. Without
+        the wrap the C++ compiler would name-mangle
+        mbedtls_ct_memcmp to _Z17mbedtls_ct_memcmpPKvS0_j and
+        the link would fail against the mbedtls library's
+        plain C symbol. The other mbedtls headers (sha256.h,
+        pkcs5.h, platform_util.h) already carry their own
+        extern "C" guards and stay unwrapped.
       - Invitation "<cmd> <port> <size> <32-hex md5>\n":
           command byte compared as a strict byte-string "0 " so
           "100" (filesystem), leading-zero variants and any
@@ -196,7 +205,7 @@ diff --git a/examples/door_lock/main/aliro_espota_protocol.cpp b/examples/door_l
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_espota_protocol.cpp
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,318 @@
 +/*
 +   Arduino-espota protocol parser + challenge / response
 +   authentication for the Aliro door-lock reader firmware.
@@ -216,7 +225,15 @@ new file mode 100644
 +
 +#include <string.h>
 +
++// mbedtls/constant_time.h in the pinned ESP-IDF has no extern
++// "C" guard, so its mbedtls_ct_memcmp declaration would be name-
++// mangled by C++ (_Z17mbedtls_ct_memcmpPKvS0_j). Wrap only this
++// include in extern "C" so the call resolves to the plain C
++// symbol that the mbedtls library actually exports. The other
++// mbedtls headers wrap their own declarations already.
++extern "C" {
 +#include <mbedtls/constant_time.h>
++}
 +#include <mbedtls/md.h>
 +#include <mbedtls/pkcs5.h>
 +#include <mbedtls/platform_util.h>

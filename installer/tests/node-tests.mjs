@@ -8421,6 +8421,21 @@ test("phase 3 task 4: verifier uses PBKDF2-HMAC-SHA256 with 10000 iterations, co
     "kAliroEspotaPbkdf2Iters constant must be 10000 in the header");
   assert.match(cpp, /kAliroEspotaPbkdf2Iters\b/,
     "verifier must reference kAliroEspotaPbkdf2Iters (never a raw literal)");
+  /*
+     Correction 1: the pinned ESP-IDF mbedtls/constant_time.h has
+     no extern "C" guard, so unwrapped inclusion inside a C++ TU
+     mangles mbedtls_ct_memcmp to _Z17mbedtls_ct_memcmpPKvS0_j and
+     the link fails against the plain C symbol the library
+     exports. The include must be wrapped in a local extern "C"
+     block. This test proves the wrap is present in code (not
+     just in a comment).
+  */
+  const code = cpp
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.match(code,
+    /extern\s+"C"\s*\{\s*#include\s*<mbedtls\/constant_time\.h>\s*\}/,
+    "the mbedtls/constant_time.h include must be wrapped in extern \"C\" { ... } so mbedtls_ct_memcmp keeps C linkage");
   assert.match(cpp, /MBEDTLS_MD_SHA256/,
     "PBKDF2 must be requested with MBEDTLS_MD_SHA256");
   assert.match(cpp, /mbedtls_ct_memcmp\s*\(\s*expected\s*,\s*auth->response\s*,\s*kAliroEspotaResponseBytes\s*\)/,
