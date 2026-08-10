@@ -18,6 +18,10 @@ import {
 } from "../js/boot-parser.js";
 import { createSetupFlow } from "../js/setup-flow.js";
 import { configureInstallButtons } from "../js/install-controller.js";
+import {
+  attachUpdateDialogGuard,
+  patchUpdateDialogShadow,
+} from "../js/update-dialog-guard.js";
 import { createSerialMonitor } from "../js/serial-monitor.js";
 import { createDeviceSettings } from "../js/device-settings.js";
 import {
@@ -88,12 +92,9 @@ class FakeControl extends EventTarget {
 }
 
 class FakeInstallButton extends EventTarget {
-  constructor(eraseFirst) {
+  constructor() {
     super();
-    this.attributes = new Map([
-      ["erase-first", String(eraseFirst)],
-      ["inert", ""],
-    ]);
+    this.attributes = new Map([["inert", ""]]);
     this.activator = new FakeControl();
     this.activator.disabled = true;
     this.inert = true;
@@ -140,6 +141,127 @@ function fakeSerialPort({ openError } = {}) {
     },
     async close() { this.closeCalls += 1; },
     async setSignals(value) { this.signalCalls.push(value); },
+  };
+}
+
+// Yields each queued chunk on its own read pass, then keeps subsequent reads
+// pending. Used to drive parseMatterOnboardingCodes and the install
+// controller's status capture through separate reader lifecycles.
+function twoPassSerialPort(chunks) {
+  const writes = [];
+  const queue = [...chunks];
+  const writable = new WritableStream({
+    write(value) { writes.push(new TextDecoder().decode(value)); },
+  });
+  const readable = new ReadableStream({
+    async pull(controller) {
+      if (queue.length) {
+        controller.enqueue(queue.shift());
+      } else {
+        await new Promise(() => {});
+      }
+    },
+  });
+  return { readable, writable, writes };
+}
+
+function createFakeElement(tagName) {
+  const attrs = new Map();
+  return {
+    tagName: tagName.toUpperCase(),
+    textContent: "",
+    setAttribute(name, value) { attrs.set(name, String(value ?? "")); },
+    getAttribute(name) { return attrs.get(name) ?? null; },
+    hasAttribute(name) { return attrs.has(name); },
+  };
+}
+
+function matchesSelector(node, selector) {
+  const attributeMatch = selector.match(/^([a-z][\w-]*)?(?:\[([\w-]+)\])?$/i);
+  if (!attributeMatch) return false;
+  const [, tag, attr] = attributeMatch;
+  if (tag && node.tagName !== tag.toUpperCase()) return false;
+  if (attr && !node.hasAttribute?.(attr)) return false;
+  return true;
+}
+
+function createFakeDocument() {
+  const body = {
+    children: [],
+    _listeners: new Set(),
+    appendChild(node) {
+      body.children.push(node);
+      for (const listener of body._listeners) listener([{ addedNodes: [node], removedNodes: [] }]);
+      return node;
+    },
+    removeChild(node) {
+      body.children = body.children.filter((child) => child !== node);
+      for (const listener of body._listeners) listener([{ addedNodes: [], removedNodes: [node] }]);
+      return node;
+    },
+    contains(node) { return body.children.includes(node); },
+  };
+  class FakeMutationObserver {
+    constructor(callback) { this._callback = callback; this._connected = false; }
+    observe(target) {
+      if (target !== body) return;
+      body._listeners.add(this._callback);
+      this._connected = true;
+    }
+    disconnect() {
+      if (this._connected) body._listeners.delete(this._callback);
+      this._connected = false;
+    }
+  }
+  return {
+    body,
+    MutationObserver: FakeMutationObserver,
+    contains(node) { return body.contains(node); },
+    createDialog({ manifestPath }) {
+      const shadow = fakeShadowRoot({
+        "ew-checkbox": [{
+          tagName: "EW-CHECKBOX",
+          checked: true,
+          disabled: false,
+        }],
+      });
+      return {
+        tagName: "EWT-INSTALL-DIALOG",
+        manifestPath,
+        shadowRoot: shadow,
+      };
+    },
+  };
+}
+
+function fakeShadowRoot(seededTemplates) {
+  const children = [];
+  for (const [selector, entries] of Object.entries(seededTemplates)) {
+    for (const template of entries) {
+      const node = { ...template };
+      const attrs = new Map();
+      if (selector.includes("[")) {
+        const attr = selector.match(/\[([\w-]+)\]/)?.[1];
+        if (attr) attrs.set(attr, "");
+      }
+      node.setAttribute = (name, value) => attrs.set(name, String(value ?? ""));
+      node.getAttribute = (name) => attrs.get(name) ?? null;
+      node.hasAttribute = (name) => attrs.has(name);
+      children.push(node);
+    }
+  }
+  return {
+    _children: children,
+    querySelector(selector) {
+      return children.find((node) => matchesSelector(node, selector)) ?? null;
+    },
+    querySelectorAll(selector) {
+      return children.filter((node) => matchesSelector(node, selector));
+    },
+    appendChild(node) { children.push(node); return node; },
+    ownerDocument: {
+      createElement: createFakeElement,
+    },
   };
 }
 
@@ -648,111 +770,77 @@ test("commissioned guidance maps services and combines Apple instructions", () =
   assert.match(elements.fabricList.innerHTML, /0x1384/);
 });
 
-test("installer buttons force safe erase modes", () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
+test("installer buttons enable and clear their inert state", () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   const setupFlow = {
-    handleInstallResult() {},
     begin: () => new AbortController().signal,
     finish() {},
     finishPreservedUpdate() {},
   };
   configureInstallButtons({ factoryButton, updateButton, setupFlow });
-  assert.equal(factoryButton.eraseFirst, true);
-  assert.equal(updateButton.eraseFirst, false);
   assert.equal(factoryButton.inert, false);
   assert.equal(updateButton.inert, false);
   assert.equal(factoryButton.activator.disabled, false);
   assert.equal(updateButton.activator.disabled, false);
+  assert.equal(factoryButton.getAttribute("inert"), null);
+  assert.equal(updateButton.getAttribute("inert"), null);
 });
 
-test("installer page declares disabled fail-closed policies", () => {
+test("installer page starts install buttons disabled and inert", () => {
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
   assert.match(html,
-    /id="update-button"[\s\S]*?erase-first="false"[\s\S]*?inert>[\s\S]*?<button slot="activate" disabled>/);
+    /id="update-button"[\s\S]*?inert>[\s\S]*?<button slot="activate" disabled>/);
   assert.match(html,
-    /id="factory-button"[\s\S]*?erase-first="true"[\s\S]*?inert>[\s\S]*?<button slot="activate" disabled>/);
+    /id="factory-button"[\s\S]*?inert>[\s\S]*?<button slot="activate" disabled>/);
+  // The installer no longer carries fork-only APIs: the erase-first
+  // attribute is unused by upstream ESP Web Tools and has been removed.
+  assert.doesNotMatch(html, /erase-first=/);
 });
 
-test("installer buttons stay disabled when a policy declaration is wrong", () => {
-  const factoryButton = new FakeInstallButton(false);
-  const updateButton = new FakeInstallButton(false);
-  const setupFlow = {
-    handleInstallResult() {},
-    begin: () => new AbortController().signal,
-    finish() {},
-    finishPreservedUpdate() {},
-  };
-  assert.throws(() => configureInstallButtons({ factoryButton, updateButton, setupFlow }));
-  assert.equal(factoryButton.inert, true);
-  assert.equal(updateButton.inert, true);
-  assert.equal(factoryButton.activator.disabled, true);
-  assert.equal(updateButton.activator.disabled, true);
-});
-
-test("install-result events use visible mode-specific state", () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
-  const calls = [];
-  const setupFlow = {
-    handleInstallResult: (...args) => calls.push(args),
-    begin: () => new AbortController().signal,
-    finish() {},
-    finishPreservedUpdate() {},
-  };
-  configureInstallButtons({ factoryButton, updateButton, setupFlow });
-  factoryButton.dispatchEvent(new CustomEvent("install-result", {
-    detail: { status: "cancelled", reason: "port-picker" },
-  }));
-  updateButton.dispatchEvent(new CustomEvent("install-result", {
-    detail: { status: "error", error: "write_failed", message: "Write failed" },
-  }));
-  assert.equal(calls[0][0], "factory");
-  assert.equal(calls[0][1].status, "cancelled");
-  assert.equal(calls[1][0], "update");
-  assert.equal(calls[1][1].status, "error");
-});
-
-test("factory post-flash parses codes but update post-flash does not", async () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
+test("factory post-flash reads setup codes with the passed serial port", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   let parseCount = 0;
+  let capturedPort = null;
+  let capturedOpts = null;
   let factoryFinished;
-  let updateFinished;
+  let updatePreserved = false;
+  const abortController = new AbortController();
   const setupFlow = {
-    handleInstallResult() {},
-    begin: () => new AbortController().signal,
+    begin: () => abortController.signal,
     finish: (result) => { factoryFinished = result; },
-    finishPreservedUpdate: (result, target) => { updateFinished = { result, target }; },
+    finishPreservedUpdate: () => { updatePreserved = true; },
   };
   configureInstallButtons({
     factoryButton,
     updateButton,
     setupFlow,
-    parseCodes: async () => {
+    parseCodes: async (port, opts) => {
       parseCount += 1;
+      capturedPort = port;
+      capturedOpts = opts;
       return { ok: true, mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" };
     },
   });
 
-  await factoryButton.onPostFlash({});
+  const port = { readable: {} };
+  await factoryButton.onPostFlash(port);
   assert.equal(parseCount, 1);
+  assert.equal(capturedPort, port);
+  assert.equal(capturedOpts.signal, abortController.signal);
+  assert.equal(capturedOpts.requestReemit, false);
   assert.equal(factoryFinished.ok, true);
+  assert.equal(updatePreserved, false);
 
-  await updateButton.onPostFlash({});
+  await updateButton.onPostFlash(port);
   assert.equal(parseCount, 1);
-  assert.equal(updateFinished, undefined);
-
-  updateButton.dispatchEvent(new CustomEvent("install-result", {
-    detail: { status: "success", chipFamily: "ESP32-C6", version: "test" },
-  }));
-  assert.equal(updateFinished.result.version, "test");
-  assert.equal(updateFinished.target, updateButton);
+  assert.equal(updatePreserved, true);
 });
 
-test("factory terminal success keeps pairing data from post-flash", async () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
+test("factory post-flash populates the QR panel through setup flow", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   const { flow, elements } = fakeFlow();
   configureInstallButtons({
     factoryButton,
@@ -766,67 +854,343 @@ test("factory terminal success keeps pairing data from post-flash", async () => 
     }),
   });
 
-  await factoryButton.onPostFlash({});
-  const readyStatus = elements.status.textContent;
-  factoryButton.dispatchEvent(new CustomEvent("install-result", {
-    detail: { status: "success", chipFamily: "ESP32-C6", version: "test" },
-  }));
-
+  await factoryButton.onPostFlash({ readable: {} });
   assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
   assert.equal(elements.qrCaption.textContent, "MT:Y.K9042C00KA0648G00");
-  assert.equal(elements.status.textContent, readyStatus);
 });
 
-test("update terminal success sets the final status after post-flash", async () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
+test("update post-flash sets the preserved-update status", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   const { flow, elements } = fakeFlow();
   configureInstallButtons({ factoryButton, updateButton, setupFlow: flow });
   flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
 
-  await updateButton.onPostFlash({});
-  assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
-  updateButton.dispatchEvent(new CustomEvent("install-result", {
-    detail: { status: "success", chipFamily: "ESP32-C6", version: "test" },
-  }));
-
+  await updateButton.onPostFlash({ readable: {} });
   assert.equal(elements.pairing.getAttribute("aria-hidden"), "true");
   assert.equal(elements.status.textContent,
     "Update complete. Setup data was kept. Wait for the lock to reconnect to Matter and Thread.");
 });
 
-test("flash cancel and error clear setup codes", () => {
-  for (const result of [
-    { status: "cancelled", reason: "port-picker" },
-    { status: "error", error: "write_failed", message: "Write failed" },
-  ]) {
-    const { flow, elements, eventTarget } = fakeFlow();
-    flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
-    let detail;
-    const eventName = result.status === "cancelled" ? "install-cancel" : "install-error";
-    eventTarget.addEventListener(eventName, (event) => { detail = event.detail; });
-    flow.handleInstallResult("factory", result, eventTarget);
-    assert.equal(elements.pairing.getAttribute("aria-hidden"), "true");
-    assert.equal(flow.getCurrent().mt, null);
-    assert.equal("mt" in detail, false);
-    assert.equal("manualCode" in detail, false);
-  }
-});
-
-test("preserved update hides pairing data and emits no secrets", () => {
+test("factory post-flash surfaces parser failures without leaking codes", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   const { flow, elements } = fakeFlow();
-  const updateTarget = new EventTarget();
-  let detail;
-  updateTarget.addEventListener("install-update-complete", (event) => { detail = event.detail; });
   flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
-  flow.finishPreservedUpdate({ chipFamily: "ESP32-C6", version: "test" }, updateTarget);
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: flow,
+    logger: { log() {}, error() {} },
+    parseCodes: async () => { throw new Error("boom"); },
+  });
+
+  await factoryButton.onPostFlash({ readable: {} });
   assert.equal(elements.pairing.getAttribute("aria-hidden"), "true");
   assert.equal(flow.getCurrent().mt, null);
-  assert.deepEqual(detail, {
-    installMode: "update",
-    chipFamily: "ESP32-C6",
-    version: "test",
+  assert.match(elements.status.textContent, /serial read failed/i);
+});
+
+test("preserved update hides pairing data and emits an update-complete event", () => {
+  const { flow, elements, eventTarget } = fakeFlow();
+  let detail;
+  eventTarget.addEventListener("install-update-complete", (event) => { detail = event.detail; });
+  flow.showPairing("MT:Y.K9042C00KA0648G00", "34970112332");
+  flow.finishPreservedUpdate();
+  assert.equal(elements.pairing.getAttribute("aria-hidden"), "true");
+  assert.equal(flow.getCurrent().mt, null);
+  assert.deepEqual(detail, { installMode: "update" });
+});
+
+test("update-dialog guard forces keep-setup on the ASK_ERASE render", () => {
+  const shadowRoot = fakeShadowRoot({
+    "ew-checkbox": [{
+      tagName: "EW-CHECKBOX",
+      checked: true,
+      disabled: false,
+    }],
   });
+  assert.equal(patchUpdateDialogShadow(shadowRoot), true);
+  const checkbox = shadowRoot.querySelector("ew-checkbox");
+  assert.equal(checkbox.checked, false);
+  assert.equal(checkbox.disabled, true);
+  const style = shadowRoot.querySelector("style[data-aliro-update-guard]");
+  assert.ok(style);
+  assert.match(style.textContent, /label\.formfield \{ display: none/);
+
+  // A second pass never appends a duplicate style tag.
+  assert.equal(patchUpdateDialogShadow(shadowRoot), true);
+  assert.equal(shadowRoot.querySelectorAll("style[data-aliro-update-guard]").length, 1);
+});
+
+test("update-dialog guard is a no-op before the erase step renders", () => {
+  const shadowRoot = fakeShadowRoot({});
+  assert.equal(patchUpdateDialogShadow(shadowRoot), false);
+  assert.ok(shadowRoot.querySelector("style[data-aliro-update-guard]"));
+});
+
+test("attachUpdateDialogGuard scopes patches by dialog manifestPath", async () => {
+  const doc = createFakeDocument();
+  const updateManifest = "./manifest-update.json";
+  attachUpdateDialogGuard({
+    updateManifestPath: updateManifest,
+    doc,
+    observerFactory: doc.MutationObserver,
+  });
+
+  const factoryDialog = doc.createDialog({ manifestPath: "./manifest.json" });
+  doc.body.appendChild(factoryDialog);
+  assert.equal(factoryDialog.shadowRoot.querySelectorAll("style[data-aliro-update-guard]").length, 0);
+  assert.equal(factoryDialog.shadowRoot.querySelector("ew-checkbox").disabled, false);
+  doc.body.removeChild(factoryDialog);
+
+  const updateDialog = doc.createDialog({ manifestPath: updateManifest });
+  doc.body.appendChild(updateDialog);
+  assert.equal(updateDialog.shadowRoot.querySelectorAll("style[data-aliro-update-guard]").length, 1);
+  assert.equal(updateDialog.shadowRoot.querySelector("ew-checkbox").disabled, true);
+  assert.equal(updateDialog.shadowRoot.querySelector("ew-checkbox").checked, false);
+});
+
+test("attachUpdateDialogGuard ignores a Factory dialog opened after a canceled Update", async () => {
+  const doc = createFakeDocument();
+  const updateManifest = "./manifest-update.json";
+  attachUpdateDialogGuard({
+    updateManifestPath: updateManifest,
+    doc,
+    observerFactory: doc.MutationObserver,
+  });
+
+  const updateDialog = doc.createDialog({ manifestPath: updateManifest });
+  doc.body.appendChild(updateDialog);
+  assert.equal(updateDialog.shadowRoot.querySelector("ew-checkbox").disabled, true);
+  doc.body.removeChild(updateDialog);
+
+  const factoryDialog = doc.createDialog({ manifestPath: "./manifest.json" });
+  doc.body.appendChild(factoryDialog);
+  assert.equal(
+    factoryDialog.shadowRoot.querySelectorAll("style[data-aliro-update-guard]").length,
+    0,
+    "factory dialog must never be patched",
+  );
+  assert.equal(factoryDialog.shadowRoot.querySelector("ew-checkbox").disabled, false);
+  assert.equal(factoryDialog.shadowRoot.querySelector("ew-checkbox").checked, true);
+});
+
+test("factory callback populates device settings and releases both stream locks", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const settingsCalls = [];
+  const deviceSettings = {
+    applyStatus(status) { settingsCalls.push(status); },
+  };
+  const bootLog = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  const statusLine = new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500\n",
+  );
+  const port = twoPassSerialPort([bootLog, statusLine]);
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    deviceSettings,
+    logger: { log() {}, error() {} },
+    attachDialogGuard: () => {},
+    statusTimeoutMs: 200,
+  });
+
+  await factoryButton.onPostFlash(port);
+
+  assert.equal(settingsCalls.length, 1);
+  assert.equal(settingsCalls[0].firmware, "0.0.4-devkit");
+  assert.equal(settingsCalls[0].auto_relock_seconds, 10);
+  assert.equal(port.readable.locked, false);
+  assert.equal(port.writable.locked, false);
+});
+
+test("factory callback still releases locks when settings capture times out", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const settingsCalls = [];
+  const deviceSettings = { applyStatus(status) { settingsCalls.push(status); } };
+  const bootLog = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  const port = twoPassSerialPort([bootLog]);
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    deviceSettings,
+    logger: { log() {}, error() {} },
+    attachDialogGuard: () => {},
+    statusTimeoutMs: 30,
+  });
+
+  await factoryButton.onPostFlash(port);
+
+  assert.equal(settingsCalls.length, 0);
+  assert.equal(port.readable.locked, false);
+  assert.equal(port.writable.locked, false);
+  assert.deepEqual(port.writes, [`${buildGetRequest()}\n`]);
+});
+
+test("captureDeviceStatus reads a STATUS enqueued right after GET", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const settingsCalls = [];
+  const writes = [];
+  let readerRequested = false;
+  let streamController;
+  const readable = new ReadableStream({
+    start(controller) { streamController = controller; },
+  });
+  const writable = new WritableStream({
+    write(chunk) {
+      writes.push(new TextDecoder().decode(chunk));
+      // The device sends STATUS the instant it receives GET.
+      streamController.enqueue(new TextEncoder().encode(
+        "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+        "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+        "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500\n",
+      ));
+      readerRequested = true;
+    },
+  });
+  const port = { readable, writable };
+
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    deviceSettings: { applyStatus(s) { settingsCalls.push(s); } },
+    parseCodes: async () => ({ ok: true, mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" }),
+    logger: { log() {}, error() {} },
+    attachDialogGuard: () => {},
+    statusTimeoutMs: 300,
+  });
+
+  await factoryButton.onPostFlash(port);
+
+  assert.deepEqual(writes, [`${buildGetRequest()}\n`]);
+  assert.equal(readerRequested, true);
+  assert.equal(settingsCalls.length, 1);
+  assert.equal(settingsCalls[0].firmware, "0.0.4-devkit");
+  assert.equal(readable.locked, false);
+  assert.equal(writable.locked, false);
+});
+
+test("captureDeviceStatus timeout releases the lock without canceling the stream", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  let streamController;
+  const readable = new ReadableStream({
+    start(controller) { streamController = controller; },
+    cancel() { readable._cancelled = true; },
+  });
+  const writes = [];
+  const writable = new WritableStream({
+    write(chunk) { writes.push(new TextDecoder().decode(chunk)); },
+  });
+  const port = { readable, writable };
+
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    deviceSettings: { applyStatus() {} },
+    parseCodes: async () => ({ ok: true, mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" }),
+    logger: { log() {}, error() {} },
+    attachDialogGuard: () => {},
+    statusTimeoutMs: 20,
+  });
+
+  await factoryButton.onPostFlash(port);
+
+  assert.deepEqual(writes, [`${buildGetRequest()}\n`]);
+  assert.equal(readable.locked, false);
+  assert.notEqual(readable._cancelled, true);
+  // A later reader can still read from the stream.
+  streamController.enqueue(new TextEncoder().encode("later bytes"));
+  const laterReader = readable.getReader();
+  const laterResult = await laterReader.read();
+  assert.equal(laterResult.done, false);
+  assert.equal(new TextDecoder().decode(laterResult.value), "later bytes");
+  laterReader.releaseLock();
+});
+
+test("older ESP Web Tools that ignores onPostFlash falls back to the serial monitor", async () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    parseCodes: async () => ({ ok: true, mt: "MT:Y.K9042C00KA0648G00", manualCode: "34970112332" }),
+    attachDialogGuard: () => {},
+  });
+  assert.equal(typeof factoryButton.onPostFlash, "function");
+  assert.equal(typeof updateButton.onPostFlash, "function");
+
+  const serialPort = fakeSerialPort();
+  const monitorElements = fakeMonitorElements();
+  const settingsElements = fakeSettingsElements();
+  const { flow, elements } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial: new FakeSerial([], [serialPort]),
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+  const settings = createDeviceSettings({
+    elements: settingsElements,
+    serialMonitor: monitor,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ version: "0.0.4-devkit" }) }),
+  });
+
+  await nextTask();
+  await nextTask();
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n" +
+    "ALIRO/1 STATUS firmware=0.0.4-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500\n",
+  ));
+  await nextTask();
+
+  assert.equal(elements.pairing.getAttribute("aria-hidden"), "false");
+  assert.equal(settingsElements.panel.hidden, false);
+  assert.equal(settingsElements.installed.textContent, "0.0.4-devkit");
+
+  settings.destroy();
+  await monitor.destroy();
 });
 
 test("Aliro protocol parses complete status and error lines", () => {
@@ -991,6 +1355,61 @@ test("settings writes wait for confirmation and recover from errors", async () =
   serialMonitor.dispatchEvent(new CustomEvent("serial-disconnected"));
   assert.equal(elements.panel.hidden, true);
   assert.equal(elements.apply.disabled, true);
+  settings.destroy();
+});
+
+test("applyStatus shows values read-only and refuses submit until reconnect", async () => {
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({
+    elements,
+    serialMonitor,
+    fetchImpl: async () => ({ json: async () => ({ version: "0.0.4-devkit" }) }),
+  });
+  await nextTask();
+
+  settings.applyStatus(VALID_STATUS);
+  assert.equal(elements.panel.hidden, false);
+  assert.equal(elements.installed.textContent, "0.0.4-devkit");
+  assert.equal(elements.successMs.value, "750");
+  assert.equal(elements.apply.disabled, true, "Apply must stay disabled while read-only");
+  assert.match(elements.result.textContent, /Values read from the flash callback/);
+
+  elements.form.dispatchEvent(new Event("submit", { cancelable: true }));
+  await nextTask();
+  assert.match(elements.result.textContent, /Use Connect device above/);
+  assert.equal(serialMonitor.writes.length, 0, "no SET line is sent while read-only");
+
+  settings.destroy();
+});
+
+test("serial-connected clears the read-only lock and reopens the settings for editing", async () => {
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({
+    elements,
+    serialMonitor,
+    fetchImpl: async () => ({ json: async () => ({ version: "0.0.4-devkit" }) }),
+  });
+  await nextTask();
+
+  settings.applyStatus(VALID_STATUS);
+  assert.equal(elements.apply.disabled, true);
+
+  serialMonitor.dispatchEvent(new CustomEvent("serial-connected"));
+  await nextTask();
+  assert.equal(elements.apply.disabled, false, "Apply becomes usable after the monitor claims the port");
+  assert.equal(elements.result.textContent, "");
+  assert.deepEqual(serialMonitor.writes, ["ALIRO/1 GET"]);
+
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: { ...VALID_STATUS, success_ms: 751 },
+  }));
+  elements.successMs.value = "752";
+  elements.form.dispatchEvent(new Event("submit", { cancelable: true }));
+  await nextTask();
+  assert.equal(serialMonitor.writes[1], "ALIRO/1 SET success_ms=752");
+
   settings.destroy();
 });
 
@@ -1443,8 +1862,8 @@ test("serial monitor reports permission and concurrent-reader failures", async (
 });
 
 test("an install click releases the monitor before the installer can continue", async () => {
-  const factoryButton = new FakeInstallButton(true);
-  const updateButton = new FakeInstallButton(false);
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
   let active = true;
   let releaseCount = 0;
   const serialMonitor = {
@@ -1457,7 +1876,6 @@ test("an install click releases the monitor before the installer can continue", 
     },
   };
   const setupFlow = {
-    handleInstallResult() {},
     begin: () => new AbortController().signal,
     finish() {},
     finishPreservedUpdate() {},
@@ -1576,4 +1994,38 @@ test("installer page keeps connection at the top and logs at the bottom", () => 
   assert.ok(logs < resetButton);
   assert.ok(resetButton < serialLog);
   assert.ok(serialLog < footer);
+});
+
+// The update-dialog guard reaches into ESP Web Tools' private DOM. It is
+// pinned to PR 733 commit cf6936234a6a37a5028bd2e39eca899bed8a0cd9. This
+// invariant test locks the vendor source contract (manifestPath forwarding,
+// ASK_ERASE state, label.formfield/ew-checkbox in that render, and the
+// _startInstall(checkbox.checked) call) so CI fails before deploy if the
+// pin or its DOM layout drifts.
+test("pinned esp-web-tools source keeps the update-dialog guard's contract", () => {
+  const vendorRoot = new URL("../vendor/esp-web-tools/", import.meta.url);
+  const installDialog = readFileSync(new URL("src/install-dialog.ts", vendorRoot), "utf8");
+  const connectTs = readFileSync(new URL("src/connect.ts", vendorRoot), "utf8");
+  const installButton = readFileSync(new URL("src/install-button.ts", vendorRoot), "utf8");
+  const postFlash = readFileSync(new URL("src/post-flash.ts", vendorRoot), "utf8");
+
+  assert.match(connectTs,
+    /el\.manifestPath\s*=\s*button\.manifest\s*\|\|\s*button\.getAttribute\("manifest"\)!/,
+    "connect.ts must forward manifestPath from the button to the dialog");
+  assert.match(installDialog, /"ASK_ERASE"/,
+    "install-dialog.ts must still declare the ASK_ERASE state");
+  assert.match(installDialog, /_renderAskErase\s*\(\)/,
+    "install-dialog.ts must still render the ASK_ERASE step");
+  assert.match(installDialog, /<label class="formfield">/,
+    "the ASK_ERASE render must still emit a label.formfield row");
+  assert.match(installDialog, /<ew-checkbox\b/,
+    "the ASK_ERASE render must still contain an ew-checkbox");
+  assert.match(installDialog,
+    /this\._startInstall\(\s*checkbox\.checked\s*\)/,
+    "the ASK_ERASE Next handler must still call _startInstall(checkbox.checked)");
+  assert.match(installButton,
+    /public\s+onPostFlash\?/,
+    "install-button.ts must still declare the PR 733 onPostFlash field");
+  assert.match(postFlash, /export const runPostFlash\b/,
+    "post-flash.ts must still export runPostFlash");
 });

@@ -16,7 +16,10 @@ installer/
     boot-parser.js    (Phase 4b) parses CHIP:SVR: lines from serial
     device-protocol.js parses Aliro status and builds GET and SET requests
     device-settings.js controls the settings and firmware version UI
-    install-controller.js fixes erase policy and handles install results
+    install-controller.js wires the post-flash callback, captures ALIRO STATUS,
+                          and installs the update-dialog erase guard
+    update-dialog-guard.js patches the ESP Web Tools install dialog's open
+                          shadow root so Update always keeps setup
     serial-monitor.js owns the live Web Serial monitor and port cleanup
     setup-flow.js     controls pairing, update, error, and cancel UI state
   vendor/
@@ -93,31 +96,46 @@ localhost. If access is denied, allow serial access for the site and select
   v2.0.4, MIT licensed. Same version used by `mullender/HomeKey-ESP32`.
   Zero runtime dependencies. Checked in directly (not fetched at build)
   so the installer runs from Pages with no CDN dependency.
-- **`vendor/esp-web-tools/`** — added in Phase 4a as a git submodule
-  pointing to `mullender/esp-web-tools` on branch
-  `homekey-post-install-hook`. The deployed page loads only this pinned,
-  same-origin build. It has no CDN fallback.
+- **`vendor/esp-web-tools/`** — git submodule pointing to
+  `mullender/esp-web-tools` on branch `feat/awaited-post-flash-callback`.
+  The branch carries only PR 733 (an awaited `onPostFlash` callback) on
+  top of upstream `esphome/esp-web-tools` main. The deployed page loads
+  only this pinned, same-origin build. It has no CDN fallback.
 
 ## Install modes
 
 The page offers two separate ESP Web Tools buttons:
 
-- **Update firmware — keep setup** uses `manifest-update.json`. Its button
-  declares `erase-first="false"` in HTML. Use it only for a device that was
-  previously installed from this repository with the approved
-  `esp32c6-door-lock-4mb-v1` partition layout. The update keeps Matter
-  fabrics, Thread credentials, and Aliro reader configuration.
-- **Factory install — erase everything** uses `manifest.json`. Its button
-  declares `erase-first="true"` in HTML. Use it for a first install, recovery,
-  or any device that does not use the approved layout.
+- **Update firmware — keep setup** uses `manifest-update.json`. Its
+  manifest sets `new_install_prompt_erase: true`, so ESP Web Tools shows
+  the ASK_ERASE step. The installer patches only that dialog's open
+  shadow root (see `installer/js/update-dialog-guard.js`) to hide the
+  erase checkbox and force the keep-setup path. Update therefore always
+  keeps Matter fabrics, Thread credentials, and Aliro reader
+  configuration. Use Update only for a device that was previously
+  installed from this repository with the approved
+  `esp32c6-door-lock-4mb-v1` partition layout.
+- **Factory install — erase everything** uses `manifest.json`. Its
+  manifest sets `new_install_prompt_erase: false`, so ESP Web Tools
+  auto-erases the entire flash. The Factory dialog is not patched. Use
+  Factory install for a first install, recovery, or any device that
+  does not use the approved layout.
 
-The pinned ESP Web Tools fork enforces each declared erase policy. An
-app-only manifest cannot erase the device. Before a preserving update writes
-data, the fork reads and hashes the connected device's partition table. The
-hash must match the approved layout. During each install, esptool-js checks
-each write block and its acknowledgement. The installer then resets the
-device. For a factory install, the captured boot log and QR code confirm the
-complete install flow.
+After a successful flash, PR 733's `onPostFlash` callback receives the
+open serial port. The Factory path reads the boot log for the Matter
+setup codes, then sends one `ALIRO/1 GET` and reads a single timed
+`ALIRO/1 STATUS` line. On timeout the reader releases its lock without
+canceling the stream, so ESP Web Tools' own Improv init (or a later
+monitor connection) can attach a fresh reader. Settings captured this
+way populate the panel **read-only**: Apply stays disabled and submit
+is refused until the serial monitor at the top of the page emits
+`serial-connected` — the browser page never edits over a port it does
+not own. Click **Connect device** to reclaim the port and edit
+settings. The Update path marks setup preserved. When the callback
+does not fire (for example, a deployed build without PR 733), the
+serial monitor re-parses both codes and settings from the live boot
+log — the same UI path, and settings are immediately writable because
+the monitor owns the port.
 
 ## Device settings protocol
 

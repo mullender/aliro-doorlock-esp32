@@ -35,6 +35,11 @@ export function createDeviceSettings({
   let latestVersion = null;
   let latestLoaded = false;
   let destroyed = false;
+  // Post-flash values arrive on the ESP Web Tools port before the serial
+  // monitor claims the device. We render them read-only until the monitor
+  // emits `serial-connected` so the user cannot submit changes over a
+  // port they do not own.
+  let readOnly = false;
 
   function setResult(message, state = "") {
     elements.result.textContent = message;
@@ -47,7 +52,7 @@ export function createDeviceSettings({
   }
 
   function setFormBusy(busy) {
-    elements.apply.disabled = busy || !currentStatus;
+    elements.apply.disabled = busy || !currentStatus || readOnly;
     elements.form.setAttribute?.("aria-busy", String(busy));
   }
 
@@ -160,6 +165,11 @@ export function createDeviceSettings({
   }
 
   function onConnected() {
+    if (readOnly) {
+      readOnly = false;
+      setResult("");
+      setFormBusy(false);
+    }
     if (!currentStatus) {
       elements.panel.hidden = true;
       pendingValues = null;
@@ -187,6 +197,13 @@ export function createDeviceSettings({
 
   async function onSubmit(event) {
     event.preventDefault();
+    if (readOnly) {
+      setResult(
+        "These values were read from the flash callback. Use Connect device above to take ownership before you save settings.",
+        "error",
+      );
+      return;
+    }
     if (!currentStatus) {
       setResult("Connect the device and wait for its status before you save settings.", "error");
       return;
@@ -251,6 +268,15 @@ export function createDeviceSettings({
 
   return {
     loadLatestVersion,
+    applyStatus(status) {
+      if (destroyed || !status) return;
+      readOnly = true;
+      onStatus({ detail: status });
+      setResult(
+        "Values read from the flash callback. Use Connect device above to save changes.",
+      );
+      setFormBusy(false);
+    },
     destroy() {
       destroyed = true;
       clearConfirmationTimer();

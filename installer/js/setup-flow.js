@@ -200,32 +200,7 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     return false;
   }
 
-  function handleInstallResult(mode, result, target) {
-    currentInstallMode = mode;
-    if (result?.status === "success") return;
-
-    abortController?.abort();
-    abortController = null;
-    hidePairing();
-    elements.cancel.hidden = true;
-    elements.retry.hidden = false;
-    if (result?.status === "cancelled") {
-      elements.status.textContent = "Install canceled. No firmware was written.";
-      dispatch("install-cancel", { installMode: mode, reason: result.reason }, target);
-      return;
-    }
-
-    elements.status.textContent = result?.message
-      ? `Install failed: ${result.message}`
-      : "Install failed. Reconnect the device and try again.";
-    dispatch("install-error", {
-      installMode: mode,
-      error: result?.error,
-      message: result?.message,
-    }, target);
-  }
-
-  function finishPreservedUpdate(result = {}, target) {
+  function finishPreservedUpdate() {
     currentInstallMode = "update";
     abortController?.abort();
     abortController = null;
@@ -234,11 +209,7 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     elements.retry.hidden = true;
     elements.status.textContent =
       "Update complete. Setup data was kept. Wait for the lock to reconnect to Matter and Thread.";
-    dispatch("install-update-complete", {
-      installMode: "update",
-      chipFamily: result.chipFamily,
-      version: result.version,
-    }, target);
+    dispatch("install-update-complete", { installMode: "update" });
     return true;
   }
 
@@ -259,7 +230,6 @@ export function createSetupFlow({ elements, renderQRCode, eventTarget, scrollPai
     showPairing,
     showCommissioned,
     hidePairing,
-    handleInstallResult,
     finishPreservedUpdate,
   };
 }

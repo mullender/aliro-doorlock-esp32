@@ -355,14 +355,14 @@
     a different layout, or if you are not certain, you must use Factory
     install below.
   </p>
-  <p>This update keeps Matter fabrics, Thread credentials, and Aliro reader
-    configuration.</p>
+  <p>This update always keeps Matter fabrics, Thread credentials, and Aliro
+    reader configuration. The installer forces the keep-setup choice in the
+    ESP Web Tools dialog.</p>
   <div class="install-row" id="update-action">
     <esp-web-install-button
       manifest="./manifest-update.json"
       id="update-button"
       data-install-mode="update"
-      erase-first="false"
       inert>
       <button slot="activate" disabled>Update firmware — keep setup</button>
       <button slot="unsupported">
@@ -400,7 +400,6 @@
       manifest="./manifest.json"
       id="factory-button"
       data-install-mode="factory"
-      erase-first="true"
       inert>
       <button slot="activate" disabled>Factory install — erase everything</button>
       <button slot="unsupported">
@@ -417,7 +416,11 @@
 <div class="setup-result">
   <div class="setup-status" id="setup-status" role="status" aria-live="polite">
     Choose Update to keep setup on an approved layout. Choose Factory install
-    for a first install, recovery, or a different layout.
+    for a first install, recovery, or a different layout. Settings captured
+    from the flash callback are read-only — use Connect device above to
+    reclaim the port before you edit them. If the pairing panel or settings
+    do not appear after a Factory install, Connect device also reads them
+    from the live boot log.
   </div>
   <button type="button" id="cancel-code-read" hidden>Cancel code read</button>
   <button type="button" id="retry-install" hidden>Reload and retry</button>
@@ -564,7 +567,13 @@ tabs.forEach(t => t.addEventListener("click", () => {
 }));
 
 customElements.whenDefined("esp-web-install-button").then(() => {
-  configureInstallButtons({ factoryButton, updateButton, setupFlow, serialMonitor });
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow,
+    serialMonitor,
+    deviceSettings,
+  });
 });
 
 window.addEventListener("pagehide", () => {

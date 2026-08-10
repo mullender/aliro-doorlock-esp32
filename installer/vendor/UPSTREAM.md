@@ -3,63 +3,90 @@
 ## `esp-web-tools/`
 
 Git submodule pointing at `mullender/esp-web-tools`, branch
-`homekey-post-install-hook`. Base is the upstream `10.4.0` release tag,
-plus focused install-lifecycle and safety patches.
+`feat/awaited-post-flash-callback`. This branch carries a single commit on
+top of upstream `esphome/esp-web-tools` main:
+[PR 733](https://github.com/esphome/esp-web-tools/pull/733) — an awaited
+`onPostFlash` callback. No other custom commits are carried.
 
 - **Upstream repository:** `https://github.com/esphome/esp-web-tools`
 - **Fork:** `https://github.com/mullender/esp-web-tools`
-- **Fork branch:** `homekey-post-install-hook`
-- **Upstream base:** tag `10.4.0`
-- **Patch summary:** awaited `onPostFlash`, typed terminal results,
-  declarative erase policy, preflight flash checks, app-only erase
-  rejection, and connection locking.
+- **Fork branch:** `feat/awaited-post-flash-callback`
+- **Upstream base:** `esphome/esp-web-tools` main at commit
+  `4b1ef27` (parent of PR 733)
+- **Patch summary:** one commit — the PR 733 awaited `onPostFlash`
+  callback that passes the reopened `SerialPort` to a user function
+  before Improv initialization.
 
 ## Submodule state
 
-The fork repository and the `homekey-post-install-hook` branch exist. This
-repository pins the submodule to commit
-`21e9cdcbd7a43244a016b56550ae2b2b1015986a`. The deploy workflow builds that
-commit and serves it from the same origin as the installer.
+This repository pins the submodule to PR 733 commit
+`cf6936234a6a37a5028bd2e39eca899bed8a0cd9`. The deploy workflow builds
+that commit and serves it from the same origin as the installer.
 
-The terminal order is fixed: completed flash, reopened serial port,
-awaited `onPostFlash`, then one `install-result`. A rejected callback
-produces `post_flash_failed` and does not produce success.
+The installer uses only the standard ESP Web Tools APIs plus PR 733's
+`onPostFlash`. All previous fork-only APIs — `eraseFirst` attribute
+enforcement, `install-result` events, `flash_checks` manifest arrays,
+declarative connection policies, and terminal-result events — have been
+removed from this project.
 
-The fork also supports a generic `flash_checks` manifest array. Each
-entry has `offset`, `size`, and `sha256`. All checks must pass before
-the first erase or write.
+## Pin-dependent DOM handling
+
+`installer/js/update-dialog-guard.js` reaches into the ESP Web Tools
+install-dialog's open shadow root to force the keep-setup path for the
+Update button:
+
+- It watches `document.body` for a newly added `ewt-install-dialog`
+  whose `manifestPath` exactly matches the Update button's `manifest`
+  attribute. Dialogs from any other button — including a Factory
+  dialog opened after a canceled Update picker — are never touched.
+- It injects a scoped `<style data-aliro-update-guard>` hiding
+  `label.formfield` (the erase checkbox row).
+- It sets `ew-checkbox.checked = false` and `ew-checkbox.disabled = true`
+  on the `ASK_ERASE` render, so the dialog's own Next-button handler
+  reads a false checkbox and calls the keep-setup install path.
+
+The guard's contract with the vendor source is asserted by the
+*"pinned esp-web-tools source keeps the update-dialog guard's contract"*
+node test in `installer/tests/node-tests.mjs`: CI fails before deploy
+if the pin drifts or the private DOM layout changes.
+
+## Post-flash settings capture
+
+`installer/js/install-controller.js` uses the PR 733 `onPostFlash` port
+to send one `ALIRO/1 GET` then run a single timed reader. On timeout
+it calls `reader.releaseLock()` (never `reader.cancel()`), so the
+`ReadableStream` stays open for ESP Web Tools' Improv init and for a
+later serial-monitor connection. Values captured this way are shown
+read-only in the settings panel until the serial monitor emits
+`serial-connected` — the page never edits settings over a port it does
+not own.
 
 ## Upstream PR
 
-- **Issue:** to be filed on `esphome/esp-web-tools` after Phase 4b lands.
-  Frame the callback, terminal result, policy, and flash-check APIs as
-  generic installer safety features, not Matter features.
-- **PR:** to follow the issue, using the fork branch verbatim.
-- **State:** not filed yet.
+- **PR:** [esphome/esp-web-tools#733](https://github.com/esphome/esp-web-tools/pull/733)
+  ("Add an awaited post-flash callback").
+- **State:** filed against `esphome/esp-web-tools`; not yet merged.
 
-Record the upstream issue and PR URLs here when they exist:
+## Transition plan
 
-- Issue: <TODO>
-- PR: <TODO>
-- Merged in: <TODO — target upstream version if merged>
-
-## Transition plan (post-Phase 4)
-
-- **If the upstream PR merges into a released version (say `10.5.0`):**
-  drop the submodule and the Node build step from
+- **If PR 733 merges into a released version (say `10.5.0`):** drop the
+  submodule and the Node build step from
   `.github/workflows/deploy-installer.yml`. Replace the local script
-  reference with a single `<script>` tag at unpkg pinned to the exact
-  merged version. Do NOT re-adopt the moving `@10` tag.
-- **If declined or in flight:** keep the fork vendored. Review upstream
-  releases quarterly and rebase the callback patch as needed. Update
-  the "Upstream base" note here on every rebase.
+  reference with a single `<script>` tag at unpkg pinned to that exact
+  version. Do NOT re-adopt the moving `@10` tag.
+- **If declined or in flight:** keep the vendored PR 733 branch. Review
+  upstream releases quarterly and rebase the single PR 733 commit as
+  needed.
 
 ## Why vendor at all
 
 - ESP Web Tools 10.4.0 has no public post-install completion event.
 - The library's Improv Wi-Fi flow does exactly what the callback would
-  do (reopen port, run initialisation), so the shape is proven; the
-  patch just generalises it.
+  do (reopen port, run initialisation), so the shape is proven; PR 733
+  generalises it into a callback.
 - Loading from unpkg with the moving `@10` tag was silently at risk of
-  an upstream minor release changing behaviour under our feet — see
-  the pairing plan's Main Constraint #1.
+  an upstream minor release changing behaviour under our feet.
+- When `onPostFlash` is unavailable in a deployed build, the serial
+  monitor reconnect path re-parses setup codes from the live boot log
+  and populates the same UI — see `installer/js/install-controller.js`
+  and `installer/js/serial-monitor.js`.

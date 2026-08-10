@@ -7,10 +7,12 @@
 # Access-Control-Allow-Origin), so this workflow downloads the verified
 # binaries and serves them from the same Pages origin.
 #
-# Also: this repo vendors a fork of esp-web-tools under
-# installer/vendor/esp-web-tools (git submodule). The workflow builds
-# it (npm ci + script/build) and copies dist/web/ into _site/vendor/dist/
-# so the installer HTML references a local, patched copy of the library.
+# Also: this repo vendors esp-web-tools under
+# installer/vendor/esp-web-tools (git submodule). The vendored branch
+# carries only PR 733 (awaited onPostFlash callback) on top of upstream
+# esphome/esp-web-tools main. The workflow builds it (npm ci +
+# script/build) and copies dist/web/ into _site/vendor/dist/ so the
+# installer HTML references a local, PR-733-patched copy of the library.
 #
 # Triggers:
 #   - release: published (tag prefix aliro-c6-*)
@@ -179,11 +181,6 @@ jobs:
                   "version": "unreleased",
                   "new_install_prompt_erase": True,
                   "new_install_improv_wait_time": 0,
-                  "flash_checks": [{
-                      "offset": 0xC000,
-                      "size": 0xC00,
-                      "sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
-                  }],
                   "builds": [],
               }
               with open("_site/manifest-update.json", "w") as f:
@@ -349,11 +346,6 @@ jobs:
               "version": tag,
               "new_install_prompt_erase": True,
               "new_install_improv_wait_time": 0,
-              "flash_checks": [{
-                  "offset": 0xC000,
-                  "size": 0xC00,
-                  "sha256": expected_partition_sha,
-              }],
               "builds": [{
                   "chipFamily": "ESP32-C6",
                   "parts": [

@@ -42,9 +42,8 @@ function makeFlow() {
   return { flow, elements, eventTarget };
 }
 
-function makeInstallButton(eraseFirst) {
+function makeInstallButton() {
   const element = document.createElement("div");
-  element.setAttribute("erase-first", String(eraseFirst));
   element.setAttribute("inert", "");
   element.inert = true;
   const activator = document.createElement("button");
@@ -95,33 +94,31 @@ export async function runSetupFlowTests(container) {
   }
 
   {
-    const factoryButton = makeInstallButton(true);
-    const updateButton = makeInstallButton(false);
+    const factoryButton = makeInstallButton();
+    const updateButton = makeInstallButton();
     const { flow } = makeFlow();
     configureInstallButtons({ factoryButton, updateButton, setupFlow: flow });
-    const ok = factoryButton.eraseFirst === true && updateButton.eraseFirst === false &&
-      !factoryButton.inert && !updateButton.inert &&
+    const ok = !factoryButton.inert && !updateButton.inert &&
       !factoryButton.querySelector("button").disabled &&
       !updateButton.querySelector("button").disabled;
-    count(report(container, "installer buttons force safe erase modes", ok));
+    count(report(container, "installer buttons enable and clear their inert state", ok));
   }
 
   {
-    const { flow, elements } = makeFlow();
-    const updateTarget = document.createElement("div");
+    const { flow, elements, eventTarget } = makeFlow();
     let detail;
-    updateTarget.addEventListener("install-update-complete", (event) => { detail = event.detail; });
+    eventTarget.addEventListener("install-update-complete", (event) => { detail = event.detail; });
     flow.showPairing(pair.mt, pair.manualCode);
-    flow.finishPreservedUpdate({ chipFamily: "ESP32-C6", version: "test" }, updateTarget);
+    flow.finishPreservedUpdate();
     const ok = elements.pairing.getAttribute("aria-hidden") === "true" &&
-      flow.getCurrent().mt === null && detail?.version === "test" &&
+      flow.getCurrent().mt === null && detail?.installMode === "update" &&
       !("mt" in detail) && !("manualCode" in detail);
     count(report(container, "preserved update clears pairing data and emits no secrets", ok));
   }
 
   {
-    const factoryButton = makeInstallButton(true);
-    const updateButton = makeInstallButton(false);
+    const factoryButton = makeInstallButton();
+    const updateButton = makeInstallButton();
     const { flow, elements } = makeFlow();
     configureInstallButtons({
       factoryButton,
@@ -129,14 +126,10 @@ export async function runSetupFlowTests(container) {
       setupFlow: flow,
       parseCodes: async () => ({ ok: true, kind: "success", ...pair }),
     });
-    await factoryButton.onPostFlash({});
-    const readyStatus = elements.status.textContent;
-    factoryButton.dispatchEvent(new CustomEvent("install-result", {
-      detail: { status: "success", chipFamily: "ESP32-C6", version: "test" },
-    }));
+    await factoryButton.onPostFlash({ readable: {} });
     const ok = elements.pairing.getAttribute("aria-hidden") === "false" &&
-      elements.qrCaption.textContent === pair.mt && elements.status.textContent === readyStatus;
-    count(report(container, "factory terminal success keeps post-flash pairing data", ok));
+      elements.qrCaption.textContent === pair.mt;
+    count(report(container, "factory post-flash populates the QR panel with the parsed pair", ok));
   }
 
   {
@@ -156,20 +149,16 @@ export async function runSetupFlowTests(container) {
   }
 
   {
-    const factoryButton = makeInstallButton(true);
-    const updateButton = makeInstallButton(false);
+    const factoryButton = makeInstallButton();
+    const updateButton = makeInstallButton();
     const { flow, elements } = makeFlow();
     configureInstallButtons({ factoryButton, updateButton, setupFlow: flow });
     flow.showPairing(pair.mt, pair.manualCode);
-    await updateButton.onPostFlash({});
-    const pairingStayedVisible = elements.pairing.getAttribute("aria-hidden") === "false";
-    updateButton.dispatchEvent(new CustomEvent("install-result", {
-      detail: { status: "success", chipFamily: "ESP32-C6", version: "test" },
-    }));
-    const ok = pairingStayedVisible && elements.pairing.getAttribute("aria-hidden") === "true" &&
+    await updateButton.onPostFlash({ readable: {} });
+    const ok = elements.pairing.getAttribute("aria-hidden") === "true" &&
       elements.status.textContent ===
         "Update complete. Setup data was kept. Wait for the lock to reconnect to Matter and Thread.";
-    count(report(container, "update terminal success owns the final status", ok));
+    count(report(container, "update post-flash sets the final preserved-update status", ok));
   }
 
   return { pass, fail };
