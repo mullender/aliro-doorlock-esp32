@@ -41,11 +41,15 @@ function clearButtonManifest(button) {
   button.removeAttribute?.("manifest");
 }
 
-function guardInstallClick(activator, serialMonitor, releaseWindow) {
-  if (!serialMonitor) return;
+function attachActivationGuard(activator, serialMonitor, { onActivate, releaseWindow } = {}) {
   let releasing = false;
   activator.addEventListener("click", (event) => {
-    if (!serialMonitor.isActive()) return;
+    // Runs on every click even when the monitor is inactive so that
+    // side effects like the Factory fail-closed of preserving-update
+    // eligibility always hold — including when releaseForInstall
+    // never runs and when onPostFlash never runs.
+    onActivate?.();
+    if (!serialMonitor?.isActive()) return;
     event.preventDefault();
     event.stopPropagation();
     if (releasing) return;
@@ -262,7 +266,23 @@ export function configureInstallButtons({
     setupFlow.finishPreservedUpdate();
   };
 
-  guardInstallClick(factoryActivator, serialMonitor, releaseWindow);
-  guardInstallClick(updateActivator, serialMonitor, releaseWindow);
+  // Factory activation is fail-closed on preserving-update: it clears
+  // the update host, its manifest, and the dialog guard the moment the
+  // user commits to the flow, so a factory install of a different
+  // variant or transport can never re-use the prior update target.
+  // This holds regardless of monitor state (active or not) and
+  // regardless of whether onPostFlash ever runs (dialog cancel, flash
+  // failure). Factory clicks do NOT open the release window, so any
+  // serial-disconnected they cause still fail-closes the update button
+  // (which is redundant with the immediate disable, and therefore safe).
+  attachActivationGuard(factoryActivator, serialMonitor, {
+    onActivate: disableUpdateTarget,
+  });
+  // Update activation is the only path that opens the release window,
+  // so the intentional serial release preserves the exact update
+  // manifest for the required second click.
+  attachActivationGuard(updateActivator, serialMonitor, {
+    releaseWindow,
+  });
   enableButton(factoryButton, factoryActivator);
 }

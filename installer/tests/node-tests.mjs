@@ -4294,6 +4294,183 @@ test("factory post-flash pre-clears prior eligibility when the captured STATUS i
     "the prior variant's dialog guard must be disconnected");
 });
 
+// Correction 3: Factory activation must always fail-closed on
+// preserving-update eligibility (inert update host, cleared manifest,
+// detached dialog guard) — regardless of monitor state and regardless
+// of whether onPostFlash ever runs. Only Update opens the release
+// window; Factory does not, so its intentional release does NOT
+// suppress the fail-closed disable.
+
+test("factory activation with active monitor clears preserving-update eligibility immediately", async () => {
+  const serialPort = fakeSerialPort();
+  const serial = new FakeSerial([serialPort]);
+  const monitorElements = fakeMonitorElements();
+  const { flow } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial,
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor: monitor,
+    attachDialogGuard,
+  });
+
+  assert.equal(await monitor.connect(), true);
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00ff00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500 " +
+    "variant=atoms3-lite-wifi transport=wifi\n",
+  ));
+  await nextTask();
+  assert.equal(updateButton.inert, false, "eligible STATUS un-inerts the update");
+  assert.equal(updateButton.manifest, "manifest-update-atoms3-lite-wifi.json");
+  assert.deepEqual(attaches, ["manifest-update-atoms3-lite-wifi.json"]);
+  assert.equal(disconnects.length, 0);
+
+  // Grab the release promise the Factory click will trigger. The
+  // click fires synchronously; onActivate must have already fired
+  // before the release runs, so the assertion below immediately
+  // after click captures the fail-closed state.
+  const originalRelease = monitor.releaseForInstall.bind(monitor);
+  let releasePromise = null;
+  monitor.releaseForInstall = () => {
+    releasePromise = originalRelease();
+    return releasePromise;
+  };
+
+  factoryButton.activator.click();
+  // Synchronous fail-closed: the update host is inert with no manifest
+  // BEFORE the release completes and BEFORE any dialog opens.
+  assert.equal(updateButton.inert, true,
+    "factory click must inert the update immediately");
+  assert.equal(updateButton.manifest ?? null, null,
+    "factory click must clear the update manifest immediately");
+  assert.deepEqual(disconnects, ["manifest-update-atoms3-lite-wifi.json"],
+    "factory click must detach the update dialog guard immediately");
+
+  // Now let the release complete. The intentional serial-disconnected
+  // must NOT re-enable the update (release window is Update-only).
+  assert.ok(releasePromise, "factory click must call releaseForInstall on active monitor");
+  await releasePromise;
+  await nextTask();
+  assert.equal(updateButton.inert, true,
+    "factory release completion must not restore the update host");
+  assert.equal(updateButton.manifest ?? null, null,
+    "factory release completion must not restore any manifest");
+});
+
+test("factory activation with inactive monitor still clears preserving-update eligibility", () => {
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  // A FakeProtocolMonitor never claims a port, so isActive() is falsy
+  // and releaseForInstall is never called. Factory must still fail-
+  // closed on preserving-update.
+  serialMonitor.isActive = () => false;
+  serialMonitor.releaseForInstall = () => {
+    throw new Error("releaseForInstall must not run when the monitor is inactive");
+  };
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor,
+    attachDialogGuard,
+  });
+
+  // A prior eligible STATUS enabled the update host.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-wifi", "wifi"),
+  }));
+  assert.equal(updateButton.inert, false);
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-wifi.json");
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-wifi.json"]);
+  assert.equal(disconnects.length, 0);
+
+  // The Factory activator is enabled at boot. A click with an inactive
+  // monitor skips releaseForInstall but still must clear the update.
+  factoryButton.activator.click();
+  assert.equal(updateButton.inert, true,
+    "factory click must inert the update even without a monitor release");
+  assert.equal(updateButton.manifest ?? null, null,
+    "factory click must clear the manifest even without a monitor release");
+  assert.deepEqual(disconnects, ["manifest-update-nanoc6-wifi.json"],
+    "factory click must detach the update dialog guard even without a monitor release");
+});
+
+test("factory activation clears eligibility even when onPostFlash never runs (user cancel or flash failure)", () => {
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  serialMonitor.isActive = () => false;
+  serialMonitor.releaseForInstall = () => { throw new Error("not called"); };
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor,
+    attachDialogGuard,
+  });
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.equal(updateButton.inert, false);
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-thread.json");
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-thread.json"]);
+
+  // User clicks Factory. In this scenario the user cancels the dialog
+  // or the flash fails, so factoryButton.onPostFlash is NEVER invoked.
+  // The immediate fail-closed on click is the only guarantee that
+  // the update host does not stay enabled with a stale manifest.
+  factoryButton.activator.click();
+  assert.equal(updateButton.inert, true);
+  assert.equal(updateButton.manifest ?? null, null);
+  assert.deepEqual(disconnects, ["manifest-update-nanoc6-thread.json"]);
+
+  // Confirm onPostFlash was NOT triggered.
+  assert.equal(factoryButton.activator.disabled, false,
+    "factory activator must be re-enabled after the sync path completes");
+});
+
 // Correction 2 finding 3: manifest-path-only freshness lets an older
 // A response overwrite a newer A response after an A→B→A sequence.
 // Each fetch now captures a monotonic request generation and drops
