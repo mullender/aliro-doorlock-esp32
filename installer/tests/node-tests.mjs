@@ -2145,6 +2145,55 @@ test("variant overlays honor transport exclusivity and disable Improv", () => {
   }
 });
 
+test("each variant has a unique CMake project name in variants.json", () => {
+  const variants = JSON.parse(
+    readFileSync(new URL("../../firmware/variants.json", import.meta.url), "utf8"),
+  );
+  const expected = {
+    "nanoc6-thread": "aliro-nanoc6-thread",
+    "nanoc6-wifi": "aliro-nanoc6-wifi",
+    "atoms3-lite-wifi": "aliro-atoms3-lite-wifi",
+  };
+  const seen = new Set();
+  for (const [variantId, entry] of Object.entries(variants.variants || {})) {
+    assert.equal(entry.project_name, expected[variantId],
+      `variant ${variantId} project_name must be ${expected[variantId]}`);
+    assert.ok(!seen.has(entry.project_name),
+      `project_name ${entry.project_name} is reused across variants`);
+    seen.add(entry.project_name);
+  }
+});
+
+test("patch 0006 wires CLI_ALIRO_PROJECT_NAME into ESP-IDF project()", () => {
+  const patch = readFileSync(
+    new URL("../../firmware/patches/0006-add-aliro-settings.patch", import.meta.url),
+    "utf8",
+  );
+
+  // The CMakeLists.txt hunk must gate CLI_ALIRO_PROJECT_NAME on a default,
+  // pass it as a compile-time identifier if desired, and rename the
+  // ESP-IDF project() call to consume it.
+  assert.match(patch, /if\(NOT DEFINED CLI_ALIRO_PROJECT_NAME\)/);
+  assert.match(patch, /set\(CLI_ALIRO_PROJECT_NAME "aliro-nanoc6-thread"\)/);
+  assert.match(patch, /\+project\(\$\{CLI_ALIRO_PROJECT_NAME\}\)/);
+  // And the pristine literal must be removed.
+  assert.match(patch, /-project\(door_lock\)/);
+});
+
+test("build_release.sh forwards VARIANT_PROJECT_NAME to idf.py and rejects the pristine project name", () => {
+  const script = readFileSync(new URL("../../scripts/build_release.sh", import.meta.url), "utf8");
+  // Both idf.py invocations (set-target and build) must pass the CLI define.
+  const forwards = [...script.matchAll(/-D CLI_ALIRO_PROJECT_NAME="\$VARIANT_PROJECT_NAME"/g)];
+  assert.ok(forwards.length >= 2,
+    `build_release.sh must pass CLI_ALIRO_PROJECT_NAME to both idf.py calls (found ${forwards.length})`);
+  // The source-check validator must fail if the patched tree still has
+  // the pristine project(door_lock) literal.
+  assert.match(script, /patched CMakeLists\.txt still names project\(door_lock\)/);
+  // The validator must require the CMake CLI setup and the project() rewrite.
+  assert.match(script, /set\(CLI_ALIRO_PROJECT_NAME "aliro-nanoc6-thread"\)/);
+  assert.match(script, /project\(\$\{CLI_ALIRO_PROJECT_NAME\}\)/);
+});
+
 test("README and installer link to each other", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");

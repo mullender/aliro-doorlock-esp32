@@ -2,10 +2,10 @@ diff --git a/examples/door_lock/CMakeLists.txt b/examples/door_lock/CMakeLists.t
 index efc0ba7..b363c39 100644
 --- a/examples/door_lock/CMakeLists.txt
 +++ b/examples/door_lock/CMakeLists.txt
-@@ -8,7 +8,23 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
+@@ -6,8 +6,27 @@
      message(FATAL_ERROR "Please set ESP_MATTER_PATH to the path of esp-matter repo")
  endif(NOT DEFINED ENV{ESP_MATTER_PATH})
- 
+
 -set(PROJECT_VER "1.0")
 -set(PROJECT_VER_NUMBER 1)
 +if(NOT DEFINED CLI_PROJECT_VER)
@@ -24,10 +24,23 @@ index efc0ba7..b363c39 100644
 +if(NOT DEFINED CLI_ALIRO_TRANSPORT_ID)
 +    set(CLI_ALIRO_TRANSPORT_ID "thread")
 +endif()
++if(NOT DEFINED CLI_ALIRO_PROJECT_NAME)
++    set(CLI_ALIRO_PROJECT_NAME "aliro-nanoc6-thread")
++endif()
 +add_compile_definitions(ALIRO_VARIANT_ID="${CLI_ALIRO_VARIANT_ID}")
 +add_compile_definitions(ALIRO_TRANSPORT_ID="${CLI_ALIRO_TRANSPORT_ID}")
- 
+
  set(ESP_MATTER_PATH $ENV{ESP_MATTER_PATH})
+ set(MATTER_SDK_PATH ${ESP_MATTER_PATH}/connectedhomeip/connectedhomeip)
+@@ -21,7 +40,7 @@
+     "${ESP_MATTER_PATH}/components"
+     ${extra_components_dirs_append})
+
+-project(door_lock)
++project(${CLI_ALIRO_PROJECT_NAME})
+
+ # WARNING: This is just an example for using key for decrypting the encrypted OTA image
+ # Please do not use it as is.
 diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
 index 283d5c3..7effa9e 100644
 --- a/examples/door_lock/main/app_main.cpp
@@ -42,14 +55,14 @@ index 283d5c3..7effa9e 100644
  #endif
 @@ -145,7 +146,10 @@ extern "C" void app_main()
      esp_err_t err = ESP_OK;
- 
+
      /* Initialize the ESP NVS layer */
 -    nvs_flash_init();
 +    err = nvs_flash_init();
 +    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialize NVS: %s", esp_err_to_name(err)));
 +    err = AliroSettingsInit();
 +    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialize Aliro settings: %s", esp_err_to_name(err)));
- 
+
  #if CONFIG_PM_ENABLE
      esp_pm_config_t pm_config = {
 @@ -181,6 +185,7 @@ extern "C" void app_main()
@@ -58,13 +71,13 @@ index 283d5c3..7effa9e 100644
 -    cluster::door_lock::attribute::create_auto_relock_time(door_lock_cluster, 5);
 +    const AliroSettingsSnapshot settings = AliroSettingsGet();
 +    cluster::door_lock::attribute::create_auto_relock_time(door_lock_cluster, settings.auto_relock_seconds);
- 
+
      door_lock_endpoint_id = endpoint::get_id(endpoint);
      ESP_LOGI(TAG, "Door lock created with endpoint_id %d", door_lock_endpoint_id);
 @@ -210,6 +215,9 @@ extern "C" void app_main()
      /* do nothing now */
      door_lock_init();
- 
+
 +    err = AliroSettingsStartSerial(door_lock_endpoint_id);
 +    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Aliro serial input: %s", esp_err_to_name(err)));
 +
@@ -77,14 +90,14 @@ index 59d44da..4794321 100644
 +++ b/examples/door_lock/main/lock/aliro_door_lock_delegate.cpp
 @@ -27,6 +27,7 @@
  #include <platform/PlatformManager.h>
- 
+
  #include "aliro_door_lock_delegate.h"
 +#include "aliro_settings.h"
  #include "door_lock_manager.h"
- 
+
  using namespace chip;
 @@ -46,10 +47,8 @@ namespace {
- 
+
  constexpr gpio_num_t kStatusLedPowerPin = GPIO_NUM_19;
  constexpr gpio_num_t kStatusLedDataPin = GPIO_NUM_20;
 -constexpr uint32_t kStatusLedDurationMs = 1000;
@@ -97,7 +110,7 @@ index 59d44da..4794321 100644
 @@ -62,6 +60,13 @@ enum class StatusLedResult {
      kOtherTag,
  };
- 
+
 +struct StatusLedCommand {
 +    uint8_t red;
 +    uint8_t green;
@@ -111,7 +124,7 @@ index 59d44da..4794321 100644
 @@ -121,23 +126,9 @@ bool IsSuccessfulAliroSelectResponse(const uint8_t *response, size_t response_l
      return BytesEqual(response + aid_offset, kAliroExpeditedAid, sizeof(kAliroExpeditedAid));
  }
- 
+
 -esp_err_t SetStatusLedColor(StatusLedResult result)
 +esp_err_t SetStatusLedColor(const StatusLedCommand &command)
  {
@@ -137,7 +150,7 @@ index 59d44da..4794321 100644
 @@ -150,20 +143,20 @@ void StatusLedTask(void *)
          ESP_LOGW("Aliro", "Failed to clear NanoC6 RGB LED: %s", esp_err_to_name(err));
      }
- 
+
 -    StatusLedResult result;
 +    StatusLedCommand command;
      while (true) {
@@ -151,7 +164,7 @@ index 59d44da..4794321 100644
              if (err != ESP_OK) {
                  ESP_LOGW("Aliro", "Failed to update NanoC6 RGB LED: %s", esp_err_to_name(err));
              }
- 
+
 -            StatusLedResult next_result;
 -            if (xQueueReceive(g_status_led_queue, &next_result, pdMS_TO_TICKS(kStatusLedDurationMs)) == pdTRUE) {
 -                result = next_result;
@@ -164,7 +177,7 @@ index 59d44da..4794321 100644
 @@ -224,7 +217,7 @@ esp_err_t InitStatusLed()
          return err;
      }
- 
+
 -    g_status_led_queue = xQueueCreate(1, sizeof(StatusLedResult));
 +    g_status_led_queue = xQueueCreate(1, sizeof(StatusLedCommand));
      if (!g_status_led_queue) {
@@ -198,7 +211,7 @@ index 59d44da..4794321 100644
 +    command.blue = static_cast<uint8_t>(rgb);
 +    (void)xQueueOverwrite(g_status_led_queue, &command);
  }
- 
+
  } // namespace
 diff --git a/examples/door_lock/main/aliro_settings_protocol.h b/examples/door_lock/main/aliro_settings_protocol.h
 new file mode 100644

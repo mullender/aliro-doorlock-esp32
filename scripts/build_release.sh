@@ -608,13 +608,22 @@ validate_aliro_settings() {
       'set(PROJECT_VER_NUMBER "${CLI_PROJECT_VER_NUMBER}")' \
       'set(CLI_ALIRO_VARIANT_ID "nanoc6-thread")' \
       'set(CLI_ALIRO_TRANSPORT_ID "thread")' \
+      'set(CLI_ALIRO_PROJECT_NAME "aliro-nanoc6-thread")' \
       'add_compile_definitions(ALIRO_VARIANT_ID="${CLI_ALIRO_VARIANT_ID}")' \
-      'add_compile_definitions(ALIRO_TRANSPORT_ID="${CLI_ALIRO_TRANSPORT_ID}")'; do
+      'add_compile_definitions(ALIRO_TRANSPORT_ID="${CLI_ALIRO_TRANSPORT_ID}")' \
+      'project(${CLI_ALIRO_PROJECT_NAME})'; do
     if ! grep -Fq "$required_text" "$cmake_source"; then
       echo "error: project version source is missing: $required_text" >&2
       return 2
     fi
   done
+  # The patched CMakeLists.txt must NOT keep the pristine 'project(door_lock)'
+  # literal; if it does, every variant would still build as "door_lock" and
+  # project_description.json would not identify the selected variant.
+  if grep -Fq 'project(door_lock)' "$cmake_source"; then
+    echo "error: patched CMakeLists.txt still names project(door_lock); should be project(\${CLI_ALIRO_PROJECT_NAME})" >&2
+    return 2
+  fi
   for required_text in \
       'AliroSettingsInit()' \
       'create_auto_relock_time(door_lock_cluster, settings.auto_relock_seconds)' \
@@ -715,6 +724,7 @@ idf.py \
   -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
   -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
   -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
+  -D CLI_ALIRO_PROJECT_NAME="$VARIANT_PROJECT_NAME" \
   -D SDKCONFIG_DEFAULTS="$VARIANT_BASE_SDKCONFIG;$(basename "$OVERLAY")" \
   set-target "$VARIANT_CHIP"
 
@@ -745,6 +755,7 @@ idf.py \
   -D CLI_PROJECT_VER_NUMBER="$FIRMWARE_VERSION_NUMBER" \
   -D CLI_ALIRO_VARIANT_ID="$VARIANT_ID" \
   -D CLI_ALIRO_TRANSPORT_ID="$VARIANT_TRANSPORT" \
+  -D CLI_ALIRO_PROJECT_NAME="$VARIANT_PROJECT_NAME" \
   build
 
 echo "=== size ==="
