@@ -1,0 +1,339 @@
+Add a trusted-LAN raw firmware HTTP endpoint on top of the shared
+OTA transaction core from patch 0015. Applied only to nanoc6-wifi
+and atoms3-lite-wifi via variants.json; nanoc6-thread never
+applies, compiles, links, or exposes any of the code here.
+
+Scope, kept minimal (no page UI, no multipart parser, no Arduino
+runtime, no filesystem, no UDP or TCP espota server, no password
+work, no settings or log changes, no new runtime dependency, no
+partition change):
+
+  * MODIFY main/aliro_local_web.cpp:
+      - Register one new route POST /api/ota against the existing
+        native esp_http_server. Raise cfg.max_uri_handlers from 7
+        to 8 (exactly one, to fit the new route).
+      - New static handler ota_post_handler:
+          * Requires Content-Type application/octet-stream, with
+            an optional trailing OWS-then-';' parameter suffix,
+            else 415 unsupported_content_type. Empty / missing /
+            other media types are refused.
+          * Requires a nonzero Content-Length, else 400
+            empty_body. Uses req->content_len as size_t; never
+            narrows.
+          * Calls AliroLocalOtaBegin(declared) and maps the OTA
+            core's error codes to a clear HTTP code:
+              busy (INVALID_STATE) -> 409 busy
+              invalid declared size (INVALID_ARG) -> 400 invalid_size
+              declared > partition (INVALID_SIZE) -> 413 over_partition
+              no OTA partition (NOT_FOUND) -> 500 no_ota_partition
+              other Begin error -> 500 begin_failed
+            On Begin failure the OTA core has already released the
+            busy guard, so the handler does NOT call
+            AliroLocalOtaAbort.
+          * Streams the raw body into AliroLocalOtaWrite through
+            a fixed 4 KiB stack buffer (static_assert exactly
+            4096 bytes). Bounded recv retries capped at 8 so a
+            stalled peer cannot loop the httpd task. Successful
+            reads reset the retry counter.
+          * AliroLocalOtaAbort ownership in this handler:
+              - HTTP-layer failure while the handler still owns
+                an open core transaction (early EOF n == 0,
+                timeout exhaustion, other recv/socket error, or
+                the post-loop short-body invariant) -> the
+                handler calls AliroLocalOtaAbort EXACTLY ONCE
+                before returning.
+              - Core-method failure (AliroLocalOtaWrite or
+                AliroLocalOtaFinish returns != ESP_OK) -> the
+                handler does NOT call AliroLocalOtaAbort. Those
+                core methods already consume the transaction and
+                release the shared busy guard; a second Abort
+                could race with a fresh Begin from another caller
+                and abort the new owner's handle.
+          * httpd_req_recv returning 0 before Content-Length is
+            reached (peer closed the connection cleanly early)
+            is mapped to 400 short_body, distinct from generic
+            recv_failed.
+          * Requires the exact advertised byte count. Post-loop
+            defensive check (total_read == declared) also aborts
+            + 400 short_body if the invariant is ever violated.
+          * Calls AliroLocalOtaFinish and maps errors WITHOUT a
+            defensive re-Abort:
+              INVALID_SIZE -> 400 size_mismatch
+              INVALID_STATE -> 400 invalid_state
+              other -> 500 finish_failed
+          * On success: sends a small no-store JSON body
+            ({"ok":true,"restarting":true}). ONLY if
+            httpd_resp_send returns ESP_OK does the handler wait
+            with vTaskDelay(pdMS_TO_TICKS(200)) so the response
+            flushes, then call esp_restart(). If the success
+            response send itself failed, the handler returns
+            that error and does NOT call vTaskDelay or
+            esp_restart, so the peer never sees a silent reboot
+            after a failed response. Failure paths NEVER call
+            esp_restart.
+      - Add the httpd_uri_t entry kOta and register it alongside
+        the other seven routes. The trusted-LAN posture (no
+        authentication) is preserved as requested.
+
+  * WIRE the new patch into nanoc6-wifi and atoms3-lite-wifi
+    source_patches in firmware/variants.json.
+    nanoc6-thread source_patches is unchanged.
+
+Explicit non-goals for this patch: no page UI, no multipart
+parser, no Arduino runtime, no filesystem, no UDP / TCP espota
+server, no password work, no settings or log changes, no new
+runtime dependency, no partition change, no CMakeLists.txt
+change (SRC_DIRS "." already picks up main/ .cpp files).
+
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+--- a/examples/door_lock/main/aliro_local_web.cpp
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -40,11 +40,15 @@
+
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/semphr.h>
++#include <freertos/task.h>
++
++#include <esp_system.h>
+
+ #include <lib/support/Span.h>
+ #include <setup_payload/OnboardingCodesUtil.h>
+ #include <setup_payload/SetupPayload.h>
+
++#include "aliro_local_ota.h"
+ #include "aliro_settings.h"
+ #include "aliro_settings_protocol.h"
+
+@@ -913,6 +917,206 @@
+     httpd_resp_set_type(req, "application/json");
+     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+     return httpd_resp_send(req, body, pos);
++}
++
++// ---- /api/ota ----
++//
++// Trusted-LAN raw firmware upload. The route takes a single
++// application/octet-stream body whose Content-Length equals the
++// declared image size, streams it into the shared OTA transaction
++// core (aliro_local_ota.h) 4 KiB at a time, and on the success
++// path sends a small no-store JSON response, waits briefly for the
++// response to flush, then calls esp_restart. Failure paths NEVER
++// call esp_restart.
++//
++// AliroLocalOtaAbort ownership in this handler:
++//   * HTTP-layer failure while the handler still owns an open core
++//     transaction (early EOF, timeout exhaustion, other recv /
++//     socket error, or the post-loop short-body invariant) -> the
++//     handler calls AliroLocalOtaAbort EXACTLY ONCE before
++//     returning.
++//   * Core-method failure (AliroLocalOtaWrite or
++//     AliroLocalOtaFinish returns != ESP_OK) -> the handler does
++//     NOT call AliroLocalOtaAbort. Those core methods already
++//     consume the transaction and release the shared busy guard;
++//     a second Abort here could race with a fresh Begin from
++//     another caller and abort the new owner's handle.
++esp_err_t ota_post_handler(httpd_req_t * req)
++{
++    // Content-Type must start with application/octet-stream, with
++    // an optional trailing parameter suffix (';' preceded only by
++    // OWS). Anything else, including missing/empty/multipart, is 415.
++    char content_type[64] = { 0 };
++    esp_err_t hdr_err = httpd_req_get_hdr_value_str(req, "Content-Type",
++                                                    content_type, sizeof(content_type));
++    if (hdr_err != ESP_OK)
++    {
++        return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++    }
++    static const char kExpectedCT[] = "application/octet-stream";
++    const size_t kCtLen = sizeof(kExpectedCT) - 1;
++    if (strncmp(content_type, kExpectedCT, kCtLen) != 0)
++    {
++        return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++    }
++    const char * tail = content_type + kCtLen;
++    if (*tail != '\0')
++    {
++        while (*tail == ' ' || *tail == '\t') { ++tail; }
++        if (*tail != ';')
++        {
++            return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++        }
++    }
++
++    // Nonzero Content-Length. content_len is size_t; do NOT narrow.
++    const size_t declared = req->content_len;
++    if (declared == 0)
++    {
++        return send_json_error(req, "400 Bad Request", "empty_body");
++    }
++
++    // Begin the OTA transaction with the declared image size. Map
++    // OTA-core errors to a clear HTTP code. On any Begin failure the
++    // OTA core has already released the busy guard, so DO NOT call
++    // AliroLocalOtaAbort here.
++    esp_err_t bx = AliroLocalOtaBegin(declared);
++    if (bx == ESP_ERR_INVALID_STATE)
++    {
++        return send_json_error(req, "409 Conflict", "busy");
++    }
++    if (bx == ESP_ERR_INVALID_ARG)
++    {
++        return send_json_error(req, "400 Bad Request", "invalid_size");
++    }
++    if (bx == ESP_ERR_INVALID_SIZE)
++    {
++        return send_json_error(req, "413 Payload Too Large", "over_partition");
++    }
++    if (bx == ESP_ERR_NOT_FOUND)
++    {
++        return send_json_error(req, "500 Internal Server Error", "no_ota_partition");
++    }
++    if (bx != ESP_OK)
++    {
++        return send_json_error(req, "500 Internal Server Error", "begin_failed");
++    }
++
++    // From here the handler owns an open core transaction. Ownership
++    // rules for AliroLocalOtaAbort in this handler:
++    //   * HTTP-layer failure while the transaction is still open
++    //     (early EOF, timeout exhaustion, recv/socket error, or the
++    //     post-loop short-body invariant) -> the handler calls
++    //     AliroLocalOtaAbort exactly once before returning.
++    //   * Core-method failure (AliroLocalOtaWrite or
++    //     AliroLocalOtaFinish returns != ESP_OK) -> the handler does
++    //     NOT call AliroLocalOtaAbort. Those core methods already
++    //     consume the transaction and release the shared busy
++    //     guard. A second Abort here could race with a fresh
++    //     Begin from another caller and abort the new owner's
++    //     handle.
++    constexpr size_t kChunkBytes = 4096;
++    static_assert(kChunkBytes == 4096, "raw OTA read buffer must be exactly 4 KiB");
++    char chunk[kChunkBytes];
++    size_t total_read = 0;
++    int retries = 0;
++    constexpr int kMaxRecvRetries = 8;
++    while (total_read < declared)
++    {
++        size_t want = declared - total_read;
++        if (want > kChunkBytes) { want = kChunkBytes; }
++        int n = httpd_req_recv(req, chunk, want);
++        if (n > 0)
++        {
++            esp_err_t wr = AliroLocalOtaWrite(chunk, static_cast<size_t>(n));
++            if (wr != ESP_OK)
++            {
++                // Write already consumed the transaction and
++                // released the busy guard. Do NOT call
++                // AliroLocalOtaAbort here — a second Abort could
++                // race with a fresh Begin from another caller.
++                if (wr == ESP_ERR_INVALID_ARG)
++                {
++                    return send_json_error(req, "400 Bad Request", "invalid_image");
++                }
++                if (wr == ESP_ERR_INVALID_SIZE)
++                {
++                    return send_json_error(req, "400 Bad Request", "size_mismatch");
++                }
++                return send_json_error(req, "500 Internal Server Error", "write_failed");
++            }
++            total_read += static_cast<size_t>(n);
++            retries = 0;
++            continue;
++        }
++        // Cap retries so a stalled peer cannot loop the httpd task.
++        if (n == HTTPD_SOCK_ERR_TIMEOUT && retries++ < kMaxRecvRetries)
++        {
++            continue;
++        }
++        AliroLocalOtaAbort();
++        if (n == HTTPD_SOCK_ERR_TIMEOUT)
++        {
++            return send_json_error(req, "408 Request Timeout", "recv_timeout");
++        }
++        // n == 0 means the peer closed the connection cleanly
++        // before Content-Length was reached. Report that as an
++        // explicit short_body 400 (the exact-count contract is
++        // violated); n < 0 with anything other than TIMEOUT is a
++        // real socket / read error.
++        if (n == 0)
++        {
++            return send_json_error(req, "400 Bad Request", "short_body");
++        }
++        return send_json_error(req, "400 Bad Request", "recv_failed");
++    }
++    // The exact-count check is redundant with Write's overflow-safe
++    // guard but keeps the handler contract explicit.
++    if (total_read != declared)
++    {
++        AliroLocalOtaAbort();
++        return send_json_error(req, "400 Bad Request", "short_body");
++    }
++
++    // Complete the transaction. Finish already consumed the
++    // transaction and released the busy guard by the time it
++    // returns, whether success or error. Do NOT call
++    // AliroLocalOtaAbort here — a second Abort could race with a
++    // fresh Begin from another caller.
++    esp_err_t fx = AliroLocalOtaFinish();
++    if (fx != ESP_OK)
++    {
++        if (fx == ESP_ERR_INVALID_SIZE)
++        {
++            return send_json_error(req, "400 Bad Request", "size_mismatch");
++        }
++        if (fx == ESP_ERR_INVALID_STATE)
++        {
++            return send_json_error(req, "400 Bad Request", "invalid_state");
++        }
++        return send_json_error(req, "500 Internal Server Error", "finish_failed");
++    }
++
++    // Success. Send a small no-store JSON. Only if the response
++    // actually flushed (httpd_resp_send returned ESP_OK) do we wait
++    // for the socket to drain and reboot. If the send itself failed,
++    // return the send error and DO NOT restart — the peer never
++    // observed a success response, and restarting silently would
++    // leave the caller unable to distinguish success from failure.
++    static const char kOkBody[] = "{\"ok\":true,\"restarting\":true}";
++    httpd_resp_set_status(req, "200 OK");
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    esp_err_t send_err = httpd_resp_send(req, kOkBody, sizeof(kOkBody) - 1);
++    if (send_err != ESP_OK)
++    {
++        return send_err;
++    }
++    vTaskDelay(pdMS_TO_TICKS(200));
++    esp_restart();
++    // esp_restart never returns. The trailing return keeps the
++    // compiler happy in the theoretical case that it did.
++    return ESP_OK;
+ }
+
+ // ---- Server lifecycle ----
+@@ -952,7 +1156,7 @@
+     }
+
+     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+-    cfg.max_uri_handlers = 7;
++    cfg.max_uri_handlers = 8;
+     cfg.max_open_sockets = 4;
+     cfg.stack_size       = 6144;
+     cfg.lru_purge_enable = true;
+@@ -973,13 +1177,15 @@
+     static const httpd_uri_t kSettingsGet  = { "/api/settings",  HTTP_GET,  settings_get_handler,     nullptr };
+     static const httpd_uri_t kSettingsPost = { "/api/settings",  HTTP_POST, settings_post_handler,    nullptr };
+     static const httpd_uri_t kLogs         = { "/api/logs",      HTTP_GET,  logs_get_handler,         nullptr };
++    static const httpd_uri_t kOta          = { "/api/ota",       HTTP_POST, ota_post_handler,         nullptr };
+     if (httpd_register_uri_handler(s_server, &kRoot)         != ESP_OK ||
+         httpd_register_uri_handler(s_server, &kStatus)       != ESP_OK ||
+         httpd_register_uri_handler(s_server, &kPairing)      != ESP_OK ||
+         httpd_register_uri_handler(s_server, &kQrcode)       != ESP_OK ||
+         httpd_register_uri_handler(s_server, &kSettingsGet)  != ESP_OK ||
+         httpd_register_uri_handler(s_server, &kSettingsPost) != ESP_OK ||
+-        httpd_register_uri_handler(s_server, &kLogs)         != ESP_OK)
++        httpd_register_uri_handler(s_server, &kLogs)         != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kOta)          != ESP_OK)
+     {
+         ESP_LOGW(TAG, "URI handler register failed");
+         esp_err_t stop_err = httpd_stop(s_server);

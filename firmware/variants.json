@@ -83,7 +83,8 @@
         "firmware/patches/0012-add-wifi-settings-page.patch",
         "firmware/patches/0013-add-wifi-log-capture.patch",
         "firmware/patches/0014-add-wifi-log-viewer.patch",
-        "firmware/patches/0015-add-wifi-ota-core.patch"
+        "firmware/patches/0015-add-wifi-ota-core.patch",
+        "firmware/patches/0016-add-wifi-ota-http-route.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -139,7 +140,8 @@
         "firmware/patches/0012-add-wifi-settings-page.patch",
         "firmware/patches/0013-add-wifi-log-capture.patch",
         "firmware/patches/0014-add-wifi-log-viewer.patch",
-        "firmware/patches/0015-add-wifi-ota-core.patch"
+        "firmware/patches/0015-add-wifi-ota-core.patch",
+        "firmware/patches/0016-add-wifi-ota-http-route.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
