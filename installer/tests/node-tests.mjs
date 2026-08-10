@@ -4719,6 +4719,92 @@ test("phase 2 task 1: patch 0009 escapes JSON strings and bounds output buffers"
     "the HTML page must be a static const array");
 });
 
+// Correction 1 findings — three specific source-contract checks.
+
+test("phase 2 task 1 correction 1: bind reconciles the current station IP after registering", () => {
+  const patch = phase2PatchText();
+  // The bind function must, AFTER registering both handlers, ask
+  // current_station_ip and call start_server() if a valid IP is
+  // already assigned. Otherwise a late binding (Matter station got
+  // its IP before the register) would leave the server off forever.
+  // Anchor to the definition (no trailing semicolon), not the
+  // declaration in the header.
+  const bindMatch = patch.match(
+    /extern "C" esp_err_t aliro_local_web_bind_wifi_lifecycle\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(bindMatch, "must find the bind function definition body");
+  const bindBody = bindMatch[0];
+  // Strip C++ single-line comments so a "start_server() is idempotent"
+  // note in a comment does not shadow the real call.
+  const bindCode = bindBody
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  const currentIpIdx = bindCode.indexOf("current_station_ip(ip");
+  const startServerIdx = bindCode.indexOf("(void) start_server()");
+  const secondRegisterIdx = bindCode.indexOf("WIFI_EVENT_STA_DISCONNECTED");
+  assert.ok(currentIpIdx > 0, "bind must call current_station_ip after registering");
+  assert.ok(startServerIdx > 0, "bind must call start_server() on reconciliation");
+  assert.ok(currentIpIdx > secondRegisterIdx,
+    "current-IP reconciliation must run AFTER the second handler registration");
+  assert.ok(startServerIdx > currentIpIdx,
+    "start_server() must run AFTER current_station_ip returns true");
+});
+
+test("phase 2 task 1 correction 1: bind rolls back the first handler if the second registration fails", () => {
+  const patch = phase2PatchText();
+  const bindMatch = patch.match(
+    /extern "C" esp_err_t aliro_local_web_bind_wifi_lifecycle\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(bindMatch, "must find the bind function definition body");
+  const bindBody = bindMatch[0];
+  // Strip the leading '+' diff marker from each line so multi-line
+  // C calls read as normal source for the regex checks.
+  const bindCode = bindBody
+    .split("\n")
+    .map((line) => line.replace(/^\+/, ""))
+    .join("\n");
+  // The rollback must call esp_event_handler_unregister with IP_EVENT
+  // in the failure branch of the WIFI_EVENT registration.
+  assert.match(bindCode, /esp_event_handler_unregister\s*\(\s*IP_EVENT/,
+    "rollback must unregister the IP_EVENT handler on second-register failure");
+  // The unregister call must appear inside the WIFI_EVENT failure branch,
+  // i.e. after the WIFI_EVENT_STA_DISCONNECTED register and before the
+  // reconciliation call.
+  const wifiRegIdx = bindCode.indexOf("WIFI_EVENT_STA_DISCONNECTED");
+  const unregisterIdx = bindCode.indexOf("esp_event_handler_unregister");
+  const currentIpIdx = bindCode.indexOf("current_station_ip");
+  assert.ok(unregisterIdx > wifiRegIdx,
+    "unregister must appear after the second register call");
+  assert.ok(unregisterIdx < currentIpIdx,
+    "unregister must be in the failure branch, before reconciliation");
+});
+
+test("phase 2 task 1 correction 1: stop_server keeps the live handle when httpd_stop fails", () => {
+  const patch = phase2PatchText();
+  const stopMatch = patch.match(
+    /\+void stop_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(stopMatch, "must find the stop_server function body");
+  const stopBody = stopMatch[0];
+  // The stop path must capture httpd_stop's return, and only clear
+  // s_server after ESP_OK.
+  assert.match(stopBody, /esp_err_t\s+err\s*=\s*httpd_stop/,
+    "stop_server must capture httpd_stop's return value");
+  const errCheckIdx = stopBody.indexOf("err != ESP_OK");
+  const clearIdx = stopBody.indexOf("s_server = nullptr");
+  assert.ok(errCheckIdx > 0, "stop_server must check err != ESP_OK");
+  assert.ok(clearIdx > 0, "stop_server must still clear s_server on success");
+  assert.ok(clearIdx > errCheckIdx,
+    "s_server must be cleared AFTER the err-check branch returns early");
+  // The early-return branch inside the err-check must NOT clear s_server.
+  const errBranch = stopBody.slice(errCheckIdx, clearIdx);
+  assert.doesNotMatch(errBranch, /s_server\s*=\s*nullptr/,
+    "err-branch must NOT clear s_server");
+  assert.match(errBranch, /return\s*;/,
+    "err-branch must return early with the live handle retained");
+});
+
 // The update-dialog guard reaches into ESP Web Tools' private DOM. It is
 // pinned to PR 733 commit cf6936234a6a37a5028bd2e39eca899bed8a0cd9. This
 // invariant test locks the vendor source contract (manifestPath forwarding,

@@ -63,7 +63,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_local_web.cpp
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,352 @@
 +/*
 +   Trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
 +   door-lock reader firmware.
@@ -355,7 +355,14 @@ new file mode 100644
 +void stop_server(void)
 +{
 +    if (s_server == nullptr) return;
-+    httpd_stop(s_server);
++    esp_err_t err = httpd_stop(s_server);
++    if (err != ESP_OK)
++    {
++        // Retain the live handle so a later stop attempt can retry;
++        // clearing s_server here would leak the server task.
++        ESP_LOGW(TAG, "httpd_stop failed: %s", esp_err_to_name(err));
++        return;
++    }
 +    s_server = nullptr;
 +    ESP_LOGI(TAG, "aliro-web stopped");
 +}
@@ -390,7 +397,22 @@ new file mode 100644
 +    if (err != ESP_OK)
 +    {
 +        ESP_LOGW(TAG, "WIFI_EVENT register failed: %s", esp_err_to_name(err));
++        // Roll back the first registration so no stray handler
++        // survives a partial bind.
++        (void) esp_event_handler_unregister(
++            IP_EVENT, ESP_EVENT_ANY_ID, &wifi_lifecycle_handler);
 +        return err;
++    }
++    // Reconcile the late-bind race: if Matter's Wi-Fi station already
++    // received its assigned IP before we registered, IP_EVENT_STA_GOT_IP
++    // has already fired and will not fire again for this binding.
++    // Start now if the station IP is currently valid.
++    // start_server() is idempotent, so this is safe even if the event
++    // fires immediately after.
++    char ip[32] = { 0 };
++    if (current_station_ip(ip, sizeof(ip)))
++    {
++        (void) start_server();
 +    }
 +    return ESP_OK;
 +}
@@ -400,16 +422,16 @@ diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_
 @@ -29,6 +29,8 @@
  #include <aliro_door_lock_delegate.h>
  #endif
- 
+
 +#include "aliro_local_web.h"
 +
  static const char *TAG = "app_main";
  uint16_t door_lock_endpoint_id = 0;
- 
+
 @@ -211,6 +213,9 @@
      /* do nothing now */
      door_lock_init();
- 
+
 +    /* Trusted-LAN HTTP foundation (Wi-Fi variants only). Non-fatal on error. */
 +    aliro_local_web_bind_wifi_lifecycle();
 +
