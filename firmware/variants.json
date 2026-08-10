@@ -139,7 +139,7 @@
       "user_button_gpio": 41,
       "user_button_active_low": true,
       "partition_layout_id": "esp32s3-door-lock-4mb-v1",
-      "partition_table_sha256": null,
+      "partition_table_sha256": "22770c7ddd300880cdd3e3344c174122c207fa4fe6a523ef83e6fc4e892c2421",
       "ota_slot_size_hex": "0x1E0000",
       "ota_offsets_hex": [
         "0x20000",
@@ -150,7 +150,7 @@
       "improv_wait_time": 0,
       "matter_commissioning": "ble",
       "status": "planned",
-      "notes": "No verified hardware run yet. The partition-table SHA-256 is null until the first clean build stamps the approved layout."
+      "notes": "No verified hardware run yet; source-only build stamps the approved partition-table SHA-256."
     }
   }
 }

@@ -1286,6 +1286,15 @@ test("firmware variants.json shape stays coherent", () => {
     // Both NanoC6 variants share the same NFC unit wiring.
     assert.equal(entry.nfc_sda_gpio, 2, `${variantId} NFC SDA should be GPIO 2`);
     assert.equal(entry.nfc_scl_gpio, 1, `${variantId} NFC SCL should be GPIO 1`);
+    // If partition_table_sha256 is set, it must be a 64-character
+    // lowercase hex string (SHA-256). This assertion pairs with the
+    // packager's fail-closed check that rejects a null hash — an
+    // approved hash must be verifiable as a well-formed digest before
+    // release.
+    if (entry.partition_table_sha256 !== null && entry.partition_table_sha256 !== undefined) {
+      assert.match(entry.partition_table_sha256, /^[0-9a-f]{64}$/,
+        `${variantId} partition_table_sha256 must be a 64-char lowercase hex SHA-256`);
+    }
   }
   // Phase 1A ships exactly these three variants.
   assert.deepEqual(
@@ -2371,22 +2380,34 @@ test("prepare_release.sh rejects a wrong chip", () => {
 });
 
 test("prepare_release.sh fails closed when the approved partition hash is null", () => {
-  // atoms3-lite-wifi variants.json has partition_table_sha256=null.
-  withFixture({
-    projectName: "aliro-atoms3-lite-wifi",
-    projectVersion: "0.0.6-devkit",
-    chip: "esp32s3",
-    appBin: "aliro-atoms3-lite-wifi.bin",
-  }, ({ build, artifactsDir }) => {
-    const result = runPrepare({
-      variant: "atoms3-lite-wifi",
-      tag: "aliro-v0.0.6-devkit",
-      buildDir: build,
-      artifactsDir,
+  // Every variant now has an approved partition_table_sha256 stamped.
+  // Force the null condition by patching variants.json under
+  // atoms3-lite-wifi, then assert the packager still refuses to
+  // proceed when the approved hash is missing.
+  const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
+  const originalVariants = readFileSync(variantsPath, "utf8");
+  const patched = JSON.parse(originalVariants);
+  patched.variants["atoms3-lite-wifi"].partition_table_sha256 = null;
+  writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+  try {
+    withFixture({
+      projectName: "aliro-atoms3-lite-wifi",
+      projectVersion: "0.0.6-devkit",
+      chip: "esp32s3",
+      appBin: "aliro-atoms3-lite-wifi.bin",
+    }, ({ build, artifactsDir }) => {
+      const result = runPrepare({
+        variant: "atoms3-lite-wifi",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /no approved partition_table_sha256/);
     });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /no approved partition_table_sha256/);
-  });
+  } finally {
+    writeFileSync(variantsPath, originalVariants);
+  }
 });
 
 test("prepare_release.sh rejects a partition-table SHA-256 mismatch", () => {
