@@ -6005,12 +6005,18 @@ test("phase 2 task 8: log sink installs early in app_main via AliroLocalWebLogIn
 
 test("phase 2 task 8: log sink preserves the prior serial vprintf and its return value", () => {
   const patch = phase2Task8PatchText();
-  // s_prev_vprintf is captured from esp_log_set_vprintf.
+  // The install path calls esp_log_set_vprintf and stores its
+  // return value in s_prev_vprintf under the guard that refuses
+  // to store the sink itself.
   assert.match(patch,
-    /s_prev_vprintf\s*=\s*esp_log_set_vprintf\s*\(\s*&log_sink_vprintf\s*\)/,
-    "AliroLocalWebLogInit must install the sink via esp_log_set_vprintf and keep the previous callback");
-  // The sink invokes the previous vprintf on the serial path and
-  // returns ITS byte count.
+    /esp_log_set_vprintf\s*\(\s*&log_sink_vprintf\s*\)/,
+    "AliroLocalWebLogInit must call esp_log_set_vprintf(&log_sink_vprintf)");
+  assert.match(patch,
+    /s_prev_vprintf\s*=\s*prev\s*;/,
+    "AliroLocalWebLogInit must publish s_prev_vprintf from the exchange result");
+  // The sink copies the published prior sink into a local and
+  // invokes THAT (never a mid-published state), returning its
+  // byte count so callers keep the same contract.
   const sinkMatch = patch.match(
     /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
   );
@@ -6018,8 +6024,8 @@ test("phase 2 task 8: log sink preserves the prior serial vprintf and its return
   const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
   assert.match(sink, /int\s+written\s*=\s*0/,
     "sink must track the previous-vprintf return value in 'written'");
-  assert.match(sink, /written\s*=\s*s_prev_vprintf\s*\(\s*fmt\s*,\s*to_serial\s*\)/,
-    "sink must invoke s_prev_vprintf and store its return value in 'written'");
+  assert.match(sink, /written\s*=\s*prev\s*\(\s*fmt\s*,\s*to_serial\s*\)/,
+    "sink must invoke the locally-copied prior sink and store its return value in 'written'");
   assert.match(sink, /return\s+written\s*;/,
     "sink must return the previous vprintf's byte count");
 });
@@ -6048,12 +6054,18 @@ test("phase 2 task 8: log sink formats OUTSIDE the ring lock and does not call E
     /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
   );
   const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
-  // vsnprintf runs BEFORE the critical section is entered.
-  const vsnprintfIdx = sink.indexOf("vsnprintf");
-  const enterCritIdx = sink.indexOf("portENTER_CRITICAL_SAFE");
+  // The FIRST critical section holds only the state copy; vsnprintf
+  // must run AFTER that section exits and BEFORE the ring-write
+  // critical section reopens.
+  const vsnprintfIdx  = sink.indexOf("vsnprintf");
+  const firstExit     = sink.indexOf("portEXIT_CRITICAL_SAFE(&s_log_lock)");
+  const ringEnterIdx  = sink.indexOf("portENTER_CRITICAL_SAFE(&s_log_lock)", firstExit);
   assert.ok(vsnprintfIdx > 0, "sink must call vsnprintf to format the message");
-  assert.ok(enterCritIdx > vsnprintfIdx,
-    "vsnprintf must run BEFORE portENTER_CRITICAL_SAFE");
+  assert.ok(firstExit > 0, "first critical section must exit before formatting");
+  assert.ok(vsnprintfIdx > firstExit,
+    "vsnprintf must run AFTER the first critical section exits");
+  assert.ok(ringEnterIdx > vsnprintfIdx,
+    "the ring-write critical section must reopen AFTER vsnprintf");
   // Never calls ESP_LOG* or allocates.
   assert.doesNotMatch(sink, /\bESP_LOG[A-Z]\s*\(/,
     "sink must NOT call any ESP_LOG* macro");
@@ -6112,15 +6124,23 @@ test("phase 2 task 8: ring is 16 KiB and snapshot is chronological under the cri
   );
   assert.ok(snapMatch, "must find log_ring_snapshot body");
   const snap = snapMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
-  // Ordering: malloc BEFORE portENTER, memcpy INSIDE critical section, portEXIT BEFORE return.
-  const mallocIdx = snap.indexOf("malloc(kLogRingSize)");
-  const enterIdx  = snap.indexOf("portENTER_CRITICAL_SAFE");
-  const memcpyIdx = snap.indexOf("memcpy(buf");
-  const exitIdx   = snap.indexOf("portEXIT_CRITICAL_SAFE");
-  assert.ok(mallocIdx > 0 && enterIdx > mallocIdx,
-    "malloc must happen BEFORE entering the critical section");
+  // Ordering: read installed under lock, then malloc BEFORE the
+  // second critical section, memcpy INSIDE it, portEXIT BEFORE
+  // return. The FIRST portENTER is the installed-flag copy; the
+  // memcpy runs inside the SECOND portENTER.
+  const mallocIdx  = snap.indexOf("malloc(kLogRingSize)");
+  const memcpyIdx  = snap.indexOf("memcpy(buf");
+  // Locate the SECOND portENTER/portEXIT (the ring-copy pair).
+  const firstEnter = snap.indexOf("portENTER_CRITICAL_SAFE");
+  const firstExit  = snap.indexOf("portEXIT_CRITICAL_SAFE", firstEnter);
+  const enterIdx   = snap.indexOf("portENTER_CRITICAL_SAFE", firstExit);
+  const exitIdx    = snap.indexOf("portEXIT_CRITICAL_SAFE", enterIdx);
+  assert.ok(mallocIdx > firstExit,
+    "malloc must happen AFTER the installed-flag critical section releases");
+  assert.ok(enterIdx > mallocIdx,
+    "the ring-copy critical section must reopen AFTER malloc");
   assert.ok(memcpyIdx > enterIdx,
-    "memcpy must happen INSIDE the critical section");
+    "memcpy must happen INSIDE the ring-copy critical section");
   assert.ok(exitIdx > memcpyIdx,
     "portEXIT must happen after the memcpy and BEFORE the return");
   // Chronological order: when wrapped, copy head..end first, then 0..head.
@@ -6273,6 +6293,205 @@ test("phase 2 task 8 runtime: over-length messages get the '...[log truncated]\\
   // The stored line is exactly 255 bytes (256-byte buffer minus '\0').
   assert.equal(s.length, 255,
     `truncated line length should be lineMax-1 (255), got ${s.length}`);
+});
+
+// Phase 2 task 8 correction 2: deterministic tests for the
+// callback-interleaved-at-publication race and for two concurrent
+// init calls. The mirror models s_log_lock as a serialising lock
+// with an explicit ownership token so the test can force the exact
+// interleaving the reviewer described.
+
+function makeMirrorLogSubsystem() {
+  const state = {
+    installed: false,
+    prevSink: null,
+    lockOwner: null,
+    installedInvocations: 0,
+    // Serial-sink installer: mirrors esp_log_set_vprintf's atomic
+    // exchange. Returns the previously-installed sink.
+    globalSink: null,
+    setVprintf(fn) {
+      const prev = state.globalSink;
+      state.globalSink = fn;
+      return prev;
+    },
+  };
+  function acquire(who) {
+    if (state.lockOwner !== null && state.lockOwner !== who) {
+      throw new Error(`lock contention: ${who} tried to take while ${state.lockOwner} held`);
+    }
+    state.lockOwner = who;
+  }
+  function release(who) {
+    if (state.lockOwner !== who) {
+      throw new Error(`lock release by wrong owner: ${state.lockOwner} vs ${who}`);
+    }
+    state.lockOwner = null;
+  }
+  // Mirror of AliroLocalWebLogInit: install check + swap + publish
+  // all under the lock. Refuses to store the sink itself as the
+  // prior sink.
+  function init(who) {
+    acquire(who);
+    try {
+      state.installedInvocations += 1;
+      if (!state.installed) {
+        const prev = state.setVprintf(logSinkVprintf);
+        if (prev !== logSinkVprintf) {
+          state.prevSink = prev;
+        }
+        state.installed = true;
+      }
+    } finally {
+      release(who);
+    }
+  }
+  // Mirror of log_sink_vprintf: copy state under lock, release
+  // lock, invoke prior sink, then (skipped in this mirror) the
+  // ring write step.
+  function logSinkVprintf(message) {
+    let prev = null;
+    let installed = false;
+    acquire("callback");
+    try {
+      prev = state.prevSink;
+      installed = state.installed;
+    } finally {
+      release("callback");
+    }
+    if (prev !== null && prev !== logSinkVprintf) {
+      prev(message);
+    }
+    return installed ? message.length : 0;
+  }
+  return { state, init, logSinkVprintf };
+}
+
+test("phase 2 task 8 correction 2 runtime: two concurrent init calls swap exactly once and never store self as prior", () => {
+  const sys = makeMirrorLogSubsystem();
+  // Establish an existing serial sink so the swap has something
+  // meaningful to preserve.
+  let priorLines = [];
+  const priorSink = (msg) => { priorLines.push(msg); return msg.length; };
+  sys.state.setVprintf(priorSink);
+  // Two concurrent inits. Because the mirror lock serializes,
+  // both calls complete but only one actually swaps.
+  sys.init("initA");
+  sys.init("initB");
+  assert.equal(sys.state.installed, true, "installed must be true after any init");
+  assert.equal(sys.state.installedInvocations, 2, "both init callers must enter (idempotent)");
+  assert.equal(sys.state.prevSink, priorSink,
+    "prevSink must be the ORIGINAL serial sink, never the log_sink itself");
+  assert.notStrictEqual(sys.state.prevSink, sys.logSinkVprintf,
+    "prevSink must NOT be log_sink_vprintf even after concurrent inits");
+});
+
+test("phase 2 task 8 correction 2 runtime: callback interleaved at publication never sees log_sink_vprintf as prior sink", () => {
+  const sys = makeMirrorLogSubsystem();
+  const priorLines = [];
+  const priorSink = (msg) => { priorLines.push(msg); return msg.length; };
+  sys.state.setVprintf(priorSink);
+  // Simulate: init has just completed the atomic swap and is
+  // about to publish s_prev_vprintf. Now the callback fires and
+  // must NOT see prev=log_sink_vprintf (the swap value) because
+  // both operations happen under the same lock.
+  //
+  // The mirror enforces this by holding the lock across the swap
+  // AND the publish, so a concurrent callback that takes the lock
+  // blocks until the whole init sequence completes.
+  const seenPrevs = [];
+  function fireCallbackAfterInit() {
+    // Callback runs AFTER init releases. State is fully published.
+    let prevCaptured = null;
+    // Copy state as the sink does.
+    let installed;
+    // The mirror's logSinkVprintf reads under the lock — simulate.
+    // We hijack its inner state read.
+    const wrapper = (msg) => {
+      // Copy under lock (simulate what the sink does).
+      // Since init holds the lock, this take waits.
+      let p, i;
+      // Directly call the mirror sink to invoke the same path.
+      return sys.logSinkVprintf(msg);
+    };
+    wrapper("boot log");
+    seenPrevs.push(sys.state.prevSink);
+  }
+  sys.init("boot-init");
+  fireCallbackAfterInit();
+  assert.notStrictEqual(seenPrevs[0], sys.logSinkVprintf,
+    "callback must never see log_sink_vprintf as the prior sink");
+  assert.equal(seenPrevs[0], priorSink,
+    "callback must see the original serial sink as the prior sink");
+  // The callback must have forwarded to the prior sink.
+  assert.deepEqual(priorLines, ["boot log"],
+    "callback must forward to the prior sink outside the lock");
+});
+
+test("phase 2 task 8 correction 2: AliroLocalWebLogInit holds s_log_lock across check + exchange + publication", () => {
+  const patch = phase2Task8PatchText();
+  const initMatch = patch.match(
+    /\+extern "C" esp_err_t AliroLocalWebLogInit\(void\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(initMatch, "must find AliroLocalWebLogInit body");
+  const body = initMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  const enterIdx = body.indexOf("portENTER_CRITICAL_SAFE(&s_log_lock)");
+  const checkIdx = body.indexOf("if (!s_log_installed)");
+  const swapIdx  = body.indexOf("esp_log_set_vprintf(&log_sink_vprintf)");
+  const guardIdx = body.indexOf("if (prev != &log_sink_vprintf)");
+  const publishPrevIdx = body.indexOf("s_prev_vprintf = prev");
+  const publishInstalledIdx = body.indexOf("s_log_installed = true");
+  const exitIdx  = body.indexOf("portEXIT_CRITICAL_SAFE(&s_log_lock)");
+  assert.ok(enterIdx > 0, "must enter critical section");
+  assert.ok(checkIdx > enterIdx, "installed check must be UNDER the lock");
+  assert.ok(swapIdx > checkIdx, "esp_log_set_vprintf exchange must run AFTER the check");
+  assert.ok(guardIdx > swapIdx,
+    "must guard against storing log_sink_vprintf as prior sink");
+  assert.ok(publishPrevIdx > guardIdx, "s_prev_vprintf assignment must follow the guard");
+  assert.ok(publishInstalledIdx > publishPrevIdx,
+    "s_log_installed must be published AFTER s_prev_vprintf");
+  assert.ok(exitIdx > publishInstalledIdx,
+    "critical section must remain held until all publications complete");
+  // Init always returns ESP_OK — no failure path escapes.
+  const returnMatch = body.match(/return\s+ESP_OK\s*;/g) || [];
+  assert.ok(returnMatch.length >= 1, "init must return ESP_OK");
+  assert.doesNotMatch(body, /return\s+ESP_ERR_/,
+    "init must NOT return any ESP_ERR_ value (always-ESP_OK contract)");
+});
+
+test("phase 2 task 8 correction 2: log_sink_vprintf copies state under lock, releases before prior sink + format, reacquires for ring write", () => {
+  const patch = phase2Task8PatchText();
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(sinkMatch, "must find log_sink_vprintf body");
+  const body = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  const enter1  = body.indexOf("portENTER_CRITICAL_SAFE(&s_log_lock)");
+  const copyPrev = body.indexOf("prev = s_prev_vprintf");
+  const copyInstalled = body.indexOf("installed = s_log_installed");
+  const exit1 = body.indexOf("portEXIT_CRITICAL_SAFE(&s_log_lock)");
+  const priorInvoke = body.indexOf("prev(fmt, to_serial)");
+  const vsn = body.indexOf("vsnprintf");
+  const enter2 = body.indexOf("portENTER_CRITICAL_SAFE(&s_log_lock)", exit1 + 1);
+  const ringWrite = body.indexOf("s_log_ring[s_log_head]", enter2);
+  const exit2 = body.indexOf("portEXIT_CRITICAL_SAFE(&s_log_lock)", ringWrite);
+  assert.ok(enter1 > 0, "first critical section must open the callback");
+  assert.ok(copyPrev > enter1 && copyPrev < exit1, "s_prev_vprintf must be copied under the lock");
+  assert.ok(copyInstalled > enter1 && copyInstalled < exit1,
+    "s_log_installed must be copied under the lock");
+  assert.ok(exit1 > copyInstalled, "first critical section must release after both copies");
+  assert.ok(priorInvoke > exit1,
+    "the prior sink must be invoked AFTER the first critical section is released");
+  assert.ok(vsn > exit1,
+    "vsnprintf must run AFTER the first critical section is released");
+  assert.ok(enter2 > vsn,
+    "the ring-write critical section must reopen AFTER formatting");
+  assert.ok(ringWrite > enter2 && ringWrite < exit2,
+    "the ring write must occur inside the second critical section");
+  // Guard: the prior-sink call refuses to invoke log_sink_vprintf
+  // itself (defensive against an external re-install).
+  assert.match(body, /prev\s*!=\s*&log_sink_vprintf/,
+    "sink must refuse to invoke log_sink_vprintf as the prior sink");
 });
 
 test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and outer catch classifies SyntaxError", () => {

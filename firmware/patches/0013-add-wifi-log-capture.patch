@@ -9,48 +9,60 @@ authentication, no settings changes):
   * MODIFY main/aliro_local_web.h: declare
       esp_err_t AliroLocalWebLogInit(void);
     which app_main calls exactly once at boot to install the log
-    sink. The header prose reflects the implementation: the ring
-    lock is a statically initialised portMUX with no runtime
-    construction, so this entry point always returns ESP_OK.
+    sink. The ring lock is a statically initialised portMUX with
+    no runtime construction, so this entry point always returns
+    ESP_OK.
 
   * MODIFY main/aliro_local_web.cpp: add a static 16 KiB ring
     (s_log_ring), a portMUX spinlock (s_log_lock,
     portMUX_INITIALIZER_UNLOCKED — statically initialised), a
     kLogLineMax = 256 stack format buffer, and:
-      - log_sink_vprintf: reentrant, formats OUTSIDE the ring lock
-        with independent va_copy values, invokes the captured
-        prior serial vprintf and returns ITS return value so
-        callers keep the same byte-count contract, then enters a
-        bounded critical section (portENTER/EXIT_CRITICAL_SAFE)
-        to copy the formatted line into the ring. The critical
-        section replaces a no-wait mutex on purpose: the reviewer
-        requires that no diagnostic data is silently dropped. If
-        vsnprintf reports truncation, the tail of the stack
-        buffer is rewritten with a clear
-        '...[log truncated]\n' marker before it is copied to the
-        ring, so a reader of the snapshot sees the loss instead
-        of a silently cropped message. The sink NEVER calls
-        ESP_LOG and NEVER allocates.
-      - log_ring_snapshot: allocates a kLogRingSize heap buffer
-        BEFORE entering the critical section, memcpy's the ring
-        chronologically (head..end + 0..head when wrapped) UNDER
-        the critical section, releases the critical section
-        BEFORE returning to the caller, and hands the caller
-        ownership of the heap buffer. Handles the allocation
-        failure explicitly.
+      - AliroLocalWebLogInit: holds s_log_lock across the
+        installed check, the esp_log_set_vprintf exchange, the
+        publication of s_prev_vprintf, and the publication of
+        s_log_installed, so two concurrent callers see exactly
+        one exchange and the callback never observes a
+        half-published state. esp_log_set_vprintf is safe to
+        call inside a portMUX critical section because the IDF
+        entry point is a single __atomic_exchange_n(...,
+        SEQ_CST) with no internal mutex. The return of the
+        exchange is refused if it points at log_sink_vprintf so
+        an external re-install cannot make us capture our own
+        callback as the prior sink. Always returns ESP_OK.
+      - log_sink_vprintf: reentrant. First takes s_log_lock
+        JUST long enough to copy s_prev_vprintf +
+        s_log_installed to locals, then releases the lock.
+        Invokes the prior sink OUTSIDE the lock with an
+        independent va_copy, and returns ITS byte count so
+        callers keep the same byte-count contract. Formats the
+        message OUTSIDE the lock with a second independent
+        va_copy. On vsnprintf truncation rewrites the tail of
+        the stack buffer with a clear '...[log truncated]\n'
+        marker before it is copied to the ring, so a reader of
+        the snapshot sees the loss instead of a silently
+        cropped message. Reacquires s_log_lock ONLY for the
+        bounded ring write. Both lock holds are bounded (two
+        words on copy, ~<=256 bytes on ring write). The sink
+        NEVER calls ESP_LOG and NEVER allocates. No no-wait
+        take path — no diagnostic data is silently dropped.
+      - log_ring_snapshot: reads s_log_installed under
+        s_log_lock, then allocates a kLogRingSize heap buffer
+        BEFORE the second critical section, memcpys the ring
+        chronologically (head..end + 0..head when wrapped)
+        UNDER the critical section, releases the critical
+        section BEFORE returning to the caller, and hands the
+        caller ownership of the heap buffer. Handles the
+        allocation failure explicitly.
       - logs_get_handler: calls log_ring_snapshot, sets
-        Content-Type text/plain; charset=utf-8 and Cache-Control:
-        no-store, sends the buffer with httpd_resp_send, then
-        free()s the buffer. An out-of-memory snapshot is surfaced
-        as 503 with a small JSON error body; any other failure is
-        500.
-      - AliroLocalWebLogInit: idempotent installer for the log
-        sink; the ring lock is a portMUX so it needs no runtime
-        construction.
+        Content-Type text/plain; charset=utf-8 and
+        Cache-Control: no-store, sends the buffer with
+        httpd_resp_send, then free()s the buffer. An
+        out-of-memory snapshot is surfaced as 503 with a small
+        JSON error body; any other failure is 500.
     httpd_config max_uri_handlers is bumped from 6 to 7; the new
-    register call rides the same atomic URI-registration failure
-    branch that already retains s_server when httpd_stop also
-    fails. No log text is redacted anywhere.
+    kLogs register call rides the same atomic URI-registration
+    failure branch that already retains s_server when httpd_stop
+    also fails. No log text is redacted anywhere.
 
   * MODIFY main/app_main.cpp: call AliroLocalWebLogInit() as the
     very first line inside app_main() so the ring captures the
@@ -96,7 +108,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
  #include <freertos/FreeRTOS.h>
  #include <freertos/semphr.h>
 
-@@ -70,6 +73,33 @@
+@@ -70,6 +73,36 @@
  // ready flag so callers never see a false "complete server" report.
  httpd_handle_t s_server = nullptr;
  bool           s_server_ready = false;
@@ -104,19 +116,22 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +// ---- Recent-log ring ----
 +//
 +// 16 KiB static ring hooked into esp_log via esp_log_set_vprintf.
-+// The sink is reentrant, formats outside the ring lock, never
-+// allocates, and never calls ESP_LOG. The prior serial vprintf is
-+// preserved and invoked with an independent va_copy so the console
-+// output is unchanged. The snapshot allocates its heap buffer
-+// BEFORE taking the lock, copies bytes chronologically UNDER the
-+// lock, then releases the lock BEFORE the HTTP send.
++// The sink is reentrant, formats outside the lock, never allocates,
++// and never calls ESP_LOG. The prior serial vprintf is preserved
++// and invoked with an independent va_copy so the console output is
++// unchanged. The snapshot allocates its heap buffer BEFORE taking
++// the lock, copies bytes chronologically UNDER the lock, then
++// releases the lock BEFORE the HTTP send.
 +//
-+// The ring lock is a portMUX spinlock (not a FreeRTOS mutex): the
-+// sink must never silently drop diagnostic data, so it cannot use a
-+// no-wait mutex take; a critical section guarantees every formatted
-+// message reaches the ring, and the bounded 256-byte memcpy under
-+// the critical section is short enough to keep priority-inversion
-+// pressure negligible.
++// The single s_log_lock is a statically initialised portMUX that
++// serialises every read and every write of s_prev_vprintf and
++// s_log_installed AND the bounded ring copy. Holding a portMUX
++// while calling esp_log_set_vprintf is safe because that IDF
++// entry point is a single __atomic_exchange_n(..., SEQ_CST) with
++// no internal mutex. The callback takes the portMUX only long
++// enough to copy the prior-sink pointer + installed state, then
++// releases it before invoking the prior sink or formatting, and
++// reacquires it for the small bounded ring write.
 +constexpr size_t     kLogRingSize     = 16 * 1024;
 +constexpr size_t     kLogLineMax      = 256;
 +constexpr char       kLogTruncMarker[] = "...[log truncated]\n";
@@ -130,38 +145,50 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 
  // Static HTML + JavaScript for the local pairing page. Every string
  // literal here is compile-time only: no server-side interpolation of
-@@ -571,7 +601,134 @@
-         return send_json_error(req, "500 Internal Server Error", "busy");
+@@ -572,6 +605,153 @@
      }
  }
-+
+
 +// ---- /api/logs ----
 +//
-+// Reentrant sink: format OUTSIDE the ring lock into a stack buffer,
-+// then enter a bounded critical section to copy into the ring. The
-+// critical section replaces a FreeRTOS mutex on purpose: a no-wait
-+// take would silently drop diagnostic data, and a blocking take on
-+// a contended mutex could stall the caller for the duration of a
-+// snapshot's memcpy. The critical section only wraps the ~ <=256 B
-+// byte copy, so priority-inversion pressure is negligible; it also
-+// keeps the sink callable from any task context. NEVER call
-+// ESP_LOG or allocate here.
++// Reentrant sink. Both s_log_lock holds are bounded — the first
++// copies two words (prior-sink pointer + installed state), the
++// second is the small ring write — and the prior-sink invocation
++// plus the vsnprintf format both run OUTSIDE the lock. NEVER call
++// ESP_LOG or allocate inside this callback.
 +int log_sink_vprintf(const char * fmt, va_list args)
 +{
++    // Copy the published prior-sink pointer + installed state under
++    // the lock. A concurrent init runs under the SAME lock, so we
++    // never see a half-published state (installed=true with a
++    // stale or self-pointing prev).
++    vprintf_like_t prev = nullptr;
++    bool installed = false;
++    portENTER_CRITICAL_SAFE(&s_log_lock);
++    prev = s_prev_vprintf;
++    installed = s_log_installed;
++    portEXIT_CRITICAL_SAFE(&s_log_lock);
++
++    // Invoke the prior sink OUTSIDE the lock so a slow serial
++    // write cannot stall concurrent ring writes. Uses its own
++    // va_copy so the caller's va_list is untouched and
++    // independent of the ring format below.
 +    va_list to_serial;
 +    va_copy(to_serial, args);
 +    int written = 0;
-+    if (s_prev_vprintf != nullptr)
++    if (prev != nullptr && prev != &log_sink_vprintf)
 +    {
-+        written = s_prev_vprintf(fmt, to_serial);
++        written = prev(fmt, to_serial);
 +    }
 +    va_end(to_serial);
-
-+    if (!s_log_installed)
++
++    if (!installed)
 +    {
 +        return written;
 +    }
 +
++    // Format OUTSIDE the ring lock. Its own va_copy — independent
++    // of the serial va_list used above — into a stack buffer.
 +    char line[kLogLineMax];
 +    va_list to_ring;
 +    va_copy(to_ring, args);
@@ -189,6 +216,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +        len = static_cast<size_t>(n);
 +    }
 +
++    // Reacquire s_log_lock ONLY for the bounded ring write.
 +    portENTER_CRITICAL_SAFE(&s_log_lock);
 +    for (size_t i = 0; i < len; ++i)
 +    {
@@ -212,7 +240,13 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +{
 +    *out = nullptr;
 +    *out_len = 0;
-+    if (!s_log_installed)
++    // Read the installed flag under s_log_lock so a concurrent init
++    // never lets us observe half-published state.
++    bool installed;
++    portENTER_CRITICAL_SAFE(&s_log_lock);
++    installed = s_log_installed;
++    portEXIT_CRITICAL_SAFE(&s_log_lock);
++    if (!installed)
 +    {
 +        return ESP_ERR_INVALID_STATE;
 +    }
@@ -265,7 +299,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
  esp_err_t qrcode_get_handler(httpd_req_t * req)
  {
      // Embedded MIT-licensed QR generator, served as gzip-encoded
-@@ -714,7 +871,7 @@
+@@ -714,7 +894,7 @@
      }
 
      httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -274,7 +308,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
      cfg.max_open_sockets = 4;
      cfg.stack_size       = 6144;
      cfg.lru_purge_enable = true;
-@@ -734,12 +891,14 @@
+@@ -734,12 +914,14 @@
      static const httpd_uri_t kQrcode       = { "/qrcode.js",     HTTP_GET,  qrcode_get_handler,       nullptr };
      static const httpd_uri_t kSettingsGet  = { "/api/settings",  HTTP_GET,  settings_get_handler,     nullptr };
      static const httpd_uri_t kSettingsPost = { "/api/settings",  HTTP_POST, settings_post_handler,    nullptr };
@@ -290,21 +324,32 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
      {
          ESP_LOGW(TAG, "URI handler register failed");
          esp_err_t stop_err = httpd_stop(s_server);
-@@ -807,6 +966,20 @@
+@@ -807,6 +989,31 @@
 
  } // namespace
 
 +extern "C" esp_err_t AliroLocalWebLogInit(void)
 +{
-+    // Idempotent on repeat calls. The ring lock is a portMUX that
-+    // is statically initialised, so nothing needs to be created
-+    // here — installing the sink once and capturing the previous
-+    // serial vprintf is all the state we need to keep.
++    // Idempotent under s_log_lock: two concurrent callers see
++    // exactly one esp_log_set_vprintf exchange, and the
++    // installed-flag + prior-vprintf publication happens under
++    // the same lock. esp_log_set_vprintf is a single
++    // __atomic_exchange_n(..., SEQ_CST) in IDF, so it is safe
++    // to invoke inside a portMUX critical section.
++    portENTER_CRITICAL_SAFE(&s_log_lock);
 +    if (!s_log_installed)
 +    {
-+        s_prev_vprintf = esp_log_set_vprintf(&log_sink_vprintf);
++        vprintf_like_t prev = esp_log_set_vprintf(&log_sink_vprintf);
++        // Never store our own sink as the prior: if an external
++        // caller installed us then re-installed something that
++        // captured us, we would otherwise recurse forever.
++        if (prev != &log_sink_vprintf)
++        {
++            s_prev_vprintf = prev;
++        }
 +        s_log_installed = true;
 +    }
++    portEXIT_CRITICAL_SAFE(&s_log_lock);
 +    return ESP_OK;
 +}
 +
@@ -323,4 +368,3 @@ diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_
 +
      /* Initialize the ESP NVS layer */
      nvs_flash_init();
-
