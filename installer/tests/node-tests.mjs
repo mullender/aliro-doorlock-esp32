@@ -3310,14 +3310,20 @@ test("assemble_release.py fails closed on a bad embedded app slice", () => {
   });
 });
 
-test("assemble_release.py publication lock keeps an existing racing destination byte-for-byte after failed publication", () => {
-  // Inject the P1 race: a rival assembler creates an empty destination
-  // during the winner's staging window. On POSIX (macOS, Linux)
-  // os.rename could silently replace an EMPTY destination directory,
-  // which would erase the rival's package. This test pre-creates the
-  // destination with a marker file inside, runs the assembler, and
-  // asserts that the assembler fails, the marker file remains
-  // byte-for-byte identical, and the destination inode is stable.
+test("assemble_release.py fails and preserves the destination inode when an empty directory appears at the race point", () => {
+  // The blocked parent (f2a7535) had this exact P1 gap: os.rename on
+  // POSIX silently replaces an EMPTY destination directory created
+  // between the initial existence check and the rename. A test that
+  // pre-creates the destination BEFORE _assemble runs would trip the
+  // initial existence check on both f2a7535 AND the current head, so
+  // it never exercises the race. The scenario script below imports
+  // assemble_release and monkeypatches _stage_variant to create the
+  // empty destination during staging — the exact race window. On
+  // f2a7535 the rename succeeds and the scenario exits non-zero
+  // because the assembler did not raise. On the current head the
+  // sibling publication lock plus the pre-rename existence check both
+  // fire, _assemble raises AssemblyError, and the injected empty
+  // directory keeps its inode.
   const partitionBytes = forgePartitionBytes();
   withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
     const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
@@ -3325,32 +3331,31 @@ test("assemble_release.py publication lock keeps an existing racing destination 
     const outDir = path.join(outParent, "site");
     try {
       buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
-      // Pre-existing rival package: destination directory with a
-      // marker file whose contents must survive.
-      mkdirSync(outDir, { recursive: true });
-      const marker = path.join(outDir, "rival-marker.txt");
-      const markerBody = "rival publisher was here\n";
-      writeFileSync(marker, markerBody);
-      const beforeInode = statSync(outDir).ino;
-      const beforeMarkerBytes = readFileSync(marker);
-
-      const result = runAssemble({
-        tag: "aliro-v0.0.6-devkit",
-        variantsPath,
-        assetsRoot,
-        outDir,
-      });
-      assert.notEqual(result.status, 0, "assembler must fail when destination already exists");
-      assert.match(result.stderr, /output directory .* already exists; refusing to overwrite/);
-
-      // The rival's marker and inode must be unchanged.
-      const afterInode = statSync(outDir).ino;
-      const afterMarkerBytes = readFileSync(marker);
-      assert.equal(afterInode, beforeInode,
-        "destination directory inode must remain stable after a refused publication");
-      assert.deepEqual(afterMarkerBytes, beforeMarkerBytes,
-        "rival's marker file must remain byte-for-byte identical");
-      // No stage residue in the parent either.
+      const scenarioPath = new URL("./assemble_release_race_scenario.py", import.meta.url).pathname;
+      const scriptPath = new URL("../../scripts/assemble_release.py", import.meta.url).pathname;
+      let result;
+      try {
+        const stdout = execFileSync("python3", [
+          scenarioPath,
+          "--script", scriptPath,
+          "--tag", "aliro-v0.0.6-devkit",
+          "--variants", variantsPath,
+          "--assets", assetsRoot,
+          "--out", outDir,
+        ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 30000 });
+        result = { status: 0, stdout, stderr: "" };
+      } catch (error) {
+        result = {
+          status: typeof error.status === "number" ? error.status : -1,
+          stdout: error.stdout?.toString() || "",
+          stderr: error.stderr?.toString() || String(error),
+        };
+      }
+      assert.equal(result.status, 0,
+        "scenario must exit 0 (assembler raised AND inode preserved). scenario stderr: " + result.stderr);
+      assert.match(result.stdout, /assembler raised:/);
+      assert.match(result.stdout, /destination inode preserved:/);
+      // No stage residue in the parent.
       for (const entry of readdirSync(outParent)) {
         assert.doesNotMatch(entry, /\.stage\./,
           `no stage residue allowed under ${outParent}: found ${entry}`);
