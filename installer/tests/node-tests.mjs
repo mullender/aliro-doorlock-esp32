@@ -4072,6 +4072,294 @@ test("HTML wires the three-variant selector, warning, and inert update button wi
   assert.match(html, /AtomS3 Lite/);
 });
 
+// Correction 2 finding 1: an eligible preserving update must remain
+// usable through the intentional serial-monitor release that runs on
+// its first install click. releaseForInstall dispatches the real
+// "serial-disconnected" event; the controller now scopes the
+// fail-closed disable to unintentional disconnects only.
+test("intentional release-for-install keeps eligibility so the second click can start the update", async () => {
+  const serialPort = fakeSerialPort();
+  const serial = new FakeSerial([serialPort]);
+  const monitorElements = fakeMonitorElements();
+  const { flow } = fakeFlow();
+  const monitor = createSerialMonitor({
+    elements: monitorElements,
+    setupFlow: flow,
+    serial,
+    secureContext: true,
+    resetPulseMs: 0,
+  });
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor: monitor,
+    attachDialogGuard: () => ({ disconnect() {} }),
+  });
+
+  assert.equal(await monitor.connect(), true);
+  serialPort.streamController.enqueue(new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00ff00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500 " +
+    "variant=nanoc6-wifi transport=wifi\n",
+  ));
+  await nextTask();
+  assert.equal(updateButton.inert, false, "eligible STATUS un-inerts the button");
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-wifi.json",
+    "eligible STATUS assigns the exact matching update manifest");
+
+  // Trap the release promise the click guard fires so the test can
+  // await it deterministically instead of polling.
+  const originalRelease = monitor.releaseForInstall.bind(monitor);
+  let releasePromise = null;
+  let saw = { manifestDuringRelease: null, inertDuringRelease: null };
+  monitor.releaseForInstall = () => {
+    releasePromise = originalRelease().finally(() => {
+      // Capture the state at the moment the release completes —
+      // this is precisely when serial-disconnected has fired.
+      saw.manifestDuringRelease = updateButton.manifest;
+      saw.inertDuringRelease = updateButton.inert;
+    });
+    return releasePromise;
+  };
+
+  updateButton.activator.click();
+  assert.ok(releasePromise, "click must call releaseForInstall through the click guard");
+  await releasePromise;
+  await nextTask();
+
+  assert.equal(monitor.isActive(), false, "the serial monitor did release the port");
+  assert.equal(saw.manifestDuringRelease, "manifest-update-nanoc6-wifi.json",
+    "manifest must survive the intentional release event");
+  assert.equal(saw.inertDuringRelease, false,
+    "the update button must not re-inert during the intentional release");
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-wifi.json",
+    "manifest survives after the release completes");
+  assert.equal(updateButton.inert, false, "button stays un-inert after the release");
+  assert.equal(updateButton.activator.disabled, false,
+    "the second click has a live activator");
+});
+
+// A real disconnect that is NOT part of an intentional release-for-
+// install must still fail-closed. The "every deny path re-inerts"
+// test above already exercises the serial-disconnected event outside
+// any release window; this narrower test only proves the release
+// window itself does not corrupt the fail-closed default.
+test("a serial-disconnected outside the release window still re-inerts the update button", () => {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor,
+    attachDialogGuard: () => ({ disconnect() {} }),
+  });
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.equal(updateButton.inert, false);
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-thread.json");
+
+  // No release in progress — a plain serial-disconnected must fail-closed.
+  serialMonitor.dispatchEvent(new CustomEvent("serial-disconnected"));
+  assert.equal(updateButton.inert, true);
+  assert.equal(updateButton.manifest ?? null, null);
+});
+
+// Correction 2 finding 2: before every factory post-flash STATUS
+// capture, any prior preserving-update eligibility must be cleared.
+// A null, denied, or thrown capture leaves the update inert with no
+// manifest and no dialog guard.
+test("factory post-flash pre-clears prior eligibility even when capture returns null", async () => {
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor,
+    logger: { log() {}, error() {} },
+    attachDialogGuard,
+    statusTimeoutMs: 30,
+  });
+
+  // Establish prior eligibility.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.equal(updateButton.inert, false);
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-thread.json");
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-thread.json"]);
+  assert.equal(disconnects.length, 0);
+
+  // Post-flash boot log with no STATUS line — captureDeviceStatus
+  // hits its timeout and returns null.
+  const bootLog = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  const port = twoPassSerialPort([bootLog]);
+
+  await factoryButton.onPostFlash(port);
+
+  assert.equal(updateButton.inert, true,
+    "prior eligibility must not survive a factory install whose capture returned null");
+  assert.equal(updateButton.manifest ?? null, null,
+    "manifest must be cleared when the capture yielded no STATUS");
+  assert.deepEqual(disconnects, ["manifest-update-nanoc6-thread.json"],
+    "the dialog guard for the prior manifest must be disconnected");
+});
+
+test("factory post-flash pre-clears prior eligibility when the captured STATUS is denied", async () => {
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settingsCalls = [];
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow: {
+      begin: () => new AbortController().signal,
+      finish() {},
+      finishPreservedUpdate() {},
+    },
+    serialMonitor,
+    deviceSettings: { applyStatus(status) { settingsCalls.push(status); } },
+    logger: { log() {}, error() {} },
+    attachDialogGuard,
+    statusTimeoutMs: 200,
+  });
+
+  // Establish prior eligibility on nanoc6-thread.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-thread.json");
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-thread.json"]);
+
+  // Post-flash STATUS reports an unknown variant. captureDeviceStatus
+  // yields a well-formed STATUS, but checkPreservingUpdate denies it.
+  const bootLog = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  const statusLine = new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500 " +
+    "variant=mystery-board transport=thread\n",
+  );
+  const port = twoPassSerialPort([bootLog, statusLine]);
+
+  await factoryButton.onPostFlash(port);
+
+  assert.equal(settingsCalls.length, 1,
+    "device-settings still sees the captured STATUS for the settings form");
+  assert.equal(settingsCalls[0].variant, "mystery-board");
+  assert.equal(updateButton.inert, true,
+    "an unknown-variant capture must leave the update inert");
+  assert.equal(updateButton.manifest ?? null, null,
+    "a denied capture must clear the update manifest");
+  assert.deepEqual(disconnects, ["manifest-update-nanoc6-thread.json"],
+    "the prior variant's dialog guard must be disconnected");
+});
+
+// Correction 2 finding 3: manifest-path-only freshness lets an older
+// A response overwrite a newer A response after an A→B→A sequence.
+// Each fetch now captures a monotonic request generation and drops
+// its result on token mismatch.
+test("device-settings request generation ignores a stale A response after an A→B→A sequence", async () => {
+  const deferreds = [];
+  const fetchImpl = (url) => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    deferreds.push({ url, resolve });
+    return promise;
+  };
+  const elements = fakeSettingsElements();
+  const serialMonitor = new FakeProtocolMonitor();
+  const settings = createDeviceSettings({ elements, serialMonitor, fetchImpl });
+  await nextTask();
+
+  const dispatch = (variant, transport) =>
+    serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+      detail: explicitStatusFor(variant, transport, { firmware: "0.0.3-devkit" }),
+    }));
+
+  // A: nanoc6-thread → fetch #1 for manifest-update-nanoc6-thread.json.
+  dispatch("nanoc6-thread", "thread");
+  await nextTask();
+  assert.equal(deferreds.length, 1);
+  assert.equal(deferreds[0].url, "manifest-update-nanoc6-thread.json");
+
+  // B: nanoc6-wifi → fetch #2 for a different manifest.
+  dispatch("nanoc6-wifi", "wifi");
+  await nextTask();
+  assert.equal(deferreds.length, 2);
+  assert.equal(deferreds[1].url, "manifest-update-nanoc6-wifi.json");
+
+  // A: nanoc6-thread again → fetch #3 for the SAME manifest as fetch
+  // #1. Manifest-path-only freshness would let the stale fetch #1
+  // response land on top of fetch #3; the token check prevents it.
+  dispatch("nanoc6-thread", "thread");
+  await nextTask();
+  assert.equal(deferreds.length, 3);
+  assert.equal(deferreds[2].url, "manifest-update-nanoc6-thread.json");
+
+  // Resolve the stale fetch #1 with an OLDER version.
+  deferreds[0].resolve({ ok: true, json: async () => ({ version: "0.0.4-devkit" }) });
+  await nextTask();
+  assert.notEqual(elements.latest.textContent, "0.0.4-devkit",
+    "the stale A response must not surface");
+  // Fetch #1 was superseded so the latest-loaded flag stays cleared.
+  assert.equal(elements.latest.textContent, "Checking…",
+    "the fresh A fetch is still in flight");
+
+  // Resolve the superseded fetch #2 (B).
+  deferreds[1].resolve({ ok: true, json: async () => ({ version: "0.0.5-devkit" }) });
+  await nextTask();
+  assert.notEqual(elements.latest.textContent, "0.0.5-devkit",
+    "the superseded B response must not surface");
+
+  // Finally resolve fetch #3 with the authoritative version.
+  deferreds[2].resolve({ ok: true, json: async () => ({ version: "0.0.9-devkit" }) });
+  await nextTask();
+  assert.equal(elements.latest.textContent, "0.0.9-devkit",
+    "only the fresh A response is authoritative");
+
+  settings.destroy();
+});
+
 test("README and installer link to each other", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");

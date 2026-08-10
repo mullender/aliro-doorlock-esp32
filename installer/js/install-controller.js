@@ -41,7 +41,7 @@ function clearButtonManifest(button) {
   button.removeAttribute?.("manifest");
 }
 
-function guardInstallClick(activator, serialMonitor) {
+function guardInstallClick(activator, serialMonitor, releaseWindow) {
   if (!serialMonitor) return;
   let releasing = false;
   activator.addEventListener("click", (event) => {
@@ -51,9 +51,11 @@ function guardInstallClick(activator, serialMonitor) {
     if (releasing) return;
     releasing = true;
     activator.disabled = true;
+    releaseWindow?.begin();
     void serialMonitor.releaseForInstall().catch(() => false).finally(() => {
       releasing = false;
       activator.disabled = false;
+      releaseWindow?.end();
     });
   }, { capture: true });
 }
@@ -200,10 +202,24 @@ export function configureInstallButtons({
   // Start disabled so the button is safe even before any STATUS arrives.
   disableUpdateTarget();
 
+  // The install click guard calls serialMonitor.releaseForInstall(),
+  // which triggers a serial-disconnected event on its way out. That
+  // disconnect is intentional — the user clicked Update on an eligible
+  // device — so it must NOT clear the update manifest or re-inert the
+  // button; otherwise the required second click has no target. Every
+  // OTHER serial-disconnected (physical unplug, user-initiated Disconnect,
+  // read-loop failure) must still fail-closed.
+  let intentionalReleaseDepth = 0;
+  const releaseWindow = {
+    begin() { intentionalReleaseDepth += 1; },
+    end() { if (intentionalReleaseDepth > 0) intentionalReleaseDepth -= 1; },
+  };
+
   serialMonitor?.addEventListener?.("aliro-status", (event) => {
     evaluateStatusForUpdate(event.detail);
   });
   serialMonitor?.addEventListener?.("serial-disconnected", () => {
+    if (intentionalReleaseDepth > 0) return;
     disableUpdateTarget();
   });
 
@@ -222,6 +238,12 @@ export function configureInstallButtons({
       logger.error("[install-controller] The boot-code read failed.", error);
       setupFlow.finish({ ok: false, kind: "serial-failure" });
     }
+    // Fail-closed: a factory install may swap board or transport, so any
+    // prior preserving-update eligibility must not carry over. Only a
+    // captured STATUS that the guard admits can re-earn it. A null,
+    // denied, or thrown capture leaves the update inert with no
+    // manifest and no dialog guard.
+    disableUpdateTarget();
     try {
       const status = await captureDeviceStatus(port, logger, statusTimeoutMs);
       if (status) {
@@ -240,7 +262,7 @@ export function configureInstallButtons({
     setupFlow.finishPreservedUpdate();
   };
 
-  guardInstallClick(factoryActivator, serialMonitor);
-  guardInstallClick(updateActivator, serialMonitor);
+  guardInstallClick(factoryActivator, serialMonitor, releaseWindow);
+  guardInstallClick(updateActivator, serialMonitor, releaseWindow);
   enableButton(factoryButton, factoryActivator);
 }

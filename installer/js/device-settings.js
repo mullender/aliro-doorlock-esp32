@@ -36,6 +36,14 @@ export function createDeviceSettings({
   let latestVersion = null;
   let latestLoaded = false;
   let latestManifest = null;
+  // A monotonic request generation stamps every eligibility change and
+  // every loadLatestVersion call. An in-flight fetch checks its captured
+  // token on resolve; a mismatch means a newer eligibility (including the
+  // A→B→A case where the manifest returns to its earlier value) has
+  // superseded this one, so the response is discarded. A manifest-only
+  // freshness check would let stale A responses land on top of new A
+  // responses because both share the same manifest path.
+  let requestGeneration = 0;
   let destroyed = false;
   let readOnly = false;
 
@@ -145,15 +153,17 @@ export function createDeviceSettings({
       const variant = getVariant(decision.targetVariant);
       const nextManifest = variant?.manifestUpdate || decision.manifest;
       if (variant && nextManifest !== latestManifest) {
+        requestGeneration += 1;
         eligibleVariant = variant;
         latestManifest = nextManifest;
         latestVersion = null;
         latestLoaded = false;
-        void loadLatestVersion(nextManifest);
+        void loadLatestVersion(nextManifest, requestGeneration);
       } else if (variant) {
         eligibleVariant = variant;
       }
-    } else {
+    } else if (latestManifest !== null || eligibleVariant !== null) {
+      requestGeneration += 1;
       eligibleVariant = null;
       latestManifest = null;
       latestVersion = null;
@@ -213,6 +223,7 @@ export function createDeviceSettings({
     elements.panel.hidden = true;
     currentStatus = null;
     pendingValues = null;
+    requestGeneration += 1;
     eligibleVariant = null;
     latestManifest = null;
     latestVersion = null;
@@ -269,10 +280,10 @@ export function createDeviceSettings({
     }
   }
 
-  async function loadLatestVersion(manifestPath) {
+  async function loadLatestVersion(manifestPath, token) {
     if (!manifestPath) return;
     if (typeof fetchImpl !== "function") {
-      if (manifestPath !== latestManifest) return;
+      if (token !== requestGeneration) return;
       latestLoaded = true;
       if (!destroyed) renderFirmware();
       return;
@@ -287,7 +298,10 @@ export function createDeviceSettings({
       version = null;
     }
     if (destroyed) return;
-    if (manifestPath !== latestManifest) return;
+    // Token beats manifest path: an A→B→A sequence gives the two A
+    // fetches distinct tokens, so an older A response cannot land on
+    // top of a newer A response.
+    if (token !== requestGeneration) return;
     latestVersion = version;
     latestLoaded = true;
     renderFirmware();
