@@ -5369,6 +5369,89 @@ test("phase 2 task 5: patch 0011 introduces no forbidden subsystem and no new ru
   }
 });
 
+// Phase 2 task 5 correction 1: Content-Type validation now rejects
+// any suffix after the exact application/x-www-form-urlencoded media
+// type unless it is end-of-value or, after optional spaces and tabs,
+// a ';' that starts a parameter. This mirrors the C++ logic in JS to
+// exercise the positive and negative vectors deterministically.
+
+function acceptsFormUrlencodedContentType(ct) {
+  const expected = "application/x-www-form-urlencoded";
+  if (!ct.startsWith(expected)) return false;
+  let i = expected.length;
+  // Bare value is fine.
+  if (i === ct.length) return true;
+  // Otherwise: OWS (space/tab) is only allowed when it eventually
+  // reaches a ';' that starts a parameter. Trailing OWS-only tail
+  // (no ';') is a malformed suffix.
+  while (ct[i] === " " || ct[i] === "\t") i += 1;
+  return ct[i] === ";";
+}
+
+test("phase 2 task 5 correction 1: Content-Type validation accepts bare, semicolon, and OWS-then-semicolon forms", () => {
+  const positives = [
+    "application/x-www-form-urlencoded",
+    "application/x-www-form-urlencoded;charset=UTF-8",
+    "application/x-www-form-urlencoded;",
+    "application/x-www-form-urlencoded ;charset=UTF-8",
+    "application/x-www-form-urlencoded\t;q=1",
+    "application/x-www-form-urlencoded  \t \t;charset=utf-8",
+  ];
+  for (const ct of positives) {
+    assert.equal(acceptsFormUrlencodedContentType(ct), true,
+      `must accept ${JSON.stringify(ct)}`);
+  }
+});
+
+test("phase 2 task 5 correction 1: Content-Type validation rejects space-suffix garbage and second-media-type forms", () => {
+  const negatives = [
+    "application/x-www-form-urlencoded garbage",
+    "application/x-www-form-urlencoded text/plain",
+    "application/x-www-form-urlencoded  garbage",
+    "application/x-www-form-urlencoded\tgarbage",
+    "application/x-www-form-urlencoded ",       // trailing space alone, no ';'
+    "application/x-www-form-urlencoded/junk",
+    "application/x-www-form-urlencoded-extra",
+    "application/x-www-form-urlencodedX",
+    "multipart/form-data",
+    "application/json",
+    "text/plain",
+    "",
+  ];
+  for (const ct of negatives) {
+    assert.equal(acceptsFormUrlencodedContentType(ct), false,
+      `must reject ${JSON.stringify(ct)}`);
+  }
+});
+
+test("phase 2 task 5 correction 1: patch 0011 mirrors the OWS-then-semicolon rule in C++", () => {
+  const patch = phase2Task5PatchText();
+  const handlerMatch = patch.match(
+    /\+esp_err_t settings_post_handler\(httpd_req_t \* req\)[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(handlerMatch, "must find settings_post_handler body");
+  const body = handlerMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+
+  // A skip-whitespace loop advances past ' ' and '\t' AFTER the media
+  // type prefix.
+  assert.match(body,
+    /while\s*\(\s*\*tail\s*==\s*' '\s*\|\|\s*\*tail\s*==\s*'\\t'\s*\)/,
+    "handler must skip OWS (space/tab) after the media type via a while loop");
+  // A bare value (immediate '\0' after the media type) is accepted
+  // without entering the OWS-skip branch; anything else must end at ';'.
+  assert.match(body,
+    /if\s*\(\s*\*tail\s*!=\s*'\\0'\s*\)/,
+    "handler must guard the skip-loop under a non-'\\0' check");
+  assert.match(body,
+    /if\s*\(\s*\*tail\s*!=\s*';'\s*\)/,
+    "handler must reject any non-';' terminator after skipping OWS");
+  // The OLD buggy form — accepting ' ' directly after the media type
+  // without demanding an eventual ';' — must be gone.
+  assert.doesNotMatch(body,
+    /content_type\[kCtLen\]\s*!=\s*' '/,
+    "handler must NOT accept a bare space suffix (that was the pre-fix bug)");
+});
+
 test("phase 2 task 5: patch 0011 keeps scope inside examples/door_lock/main/ only", () => {
   const patch = phase2Task5PatchText();
   const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);

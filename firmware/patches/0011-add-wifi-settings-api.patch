@@ -39,9 +39,16 @@ Scope:
     declared body length is read as size_t (never narrowed to
     int) so a very large content_len cannot wrap before the
     over-limit check. Short reads and receive timeouts retry
-    with a bounded cap. The body is validated against a strict
-    allowlist ([a-zA-Z0-9_] plus '=' and '&') and rewritten into
-    an "ALIRO/1 SET k=v ..." protocol line, then handed to
+    with a bounded cap. The Content-Type value is validated
+    strictly: after the exact media type it accepts end of
+    value, or skips optional spaces and tabs ONLY when they are
+    followed by a ';' that starts a parameter — anything else
+    (trailing OWS-only, garbage suffix, a second media type, or
+    a slash extension) is refused with the literal
+    '415 Unsupported Media Type' response. The body is
+    validated against a strict allowlist ([a-zA-Z0-9_] plus
+    '=' and '&') and rewritten into an "ALIRO/1 SET k=v ..."
+    protocol line, then handed to
     AliroSettingsSerializedSetApply so the read + parse + apply
     happen atomically. Every rejection path surfaces a JSON
     error body under the right HTTP status. Status strings are
@@ -247,7 +254,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
  #ifndef ALIRO_VARIANT_ID
  #define ALIRO_VARIANT_ID "unknown"
  #endif
-@@ -239,6 +242,171 @@
+@@ -239,6 +242,183 @@
      httpd_resp_set_type(req, "text/html; charset=utf-8");
      httpd_resp_set_hdr(req, "Cache-Control", "no-store");
      return httpd_resp_send(req, kIndexHtml, HTTPD_RESP_USE_STRLEN);
@@ -318,11 +325,23 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    }
 +    static const char kExpectedCT[] = "application/x-www-form-urlencoded";
 +    const size_t kCtLen = sizeof(kExpectedCT) - 1;
-+    if (strncmp(content_type, kExpectedCT, kCtLen) != 0 ||
-+        (content_type[kCtLen] != '\0' && content_type[kCtLen] != ';' &&
-+         content_type[kCtLen] != ' '))
++    if (strncmp(content_type, kExpectedCT, kCtLen) != 0)
 +    {
 +        return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++    }
++    // After the exact media type, accept the end of the value; or
++    // skip optional spaces and tabs ONLY when they are followed by
++    // a ';' that starts a parameter. A trailing-whitespace-only
++    // tail (no ';') is a malformed suffix and is refused, as are
++    // garbage suffixes and second-media-type suffixes.
++    const char * tail = content_type + kCtLen;
++    if (*tail != '\0')
++    {
++        while (*tail == ' ' || *tail == '\t') { ++tail; }
++        if (*tail != ';')
++        {
++            return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++        }
 +    }
 +
 +    // Body length checks. httpd_req_t::content_len is size_t; do NOT
@@ -419,7 +438,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
  }
 
  esp_err_t qrcode_get_handler(httpd_req_t * req)
-@@ -383,7 +551,7 @@
+@@ -383,7 +563,7 @@
      }
 
      httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -428,7 +447,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
      cfg.max_open_sockets = 4;
      cfg.stack_size       = 6144;
      cfg.lru_purge_enable = true;
-@@ -397,14 +565,18 @@
+@@ -397,14 +577,18 @@
          return err;
      }
 
