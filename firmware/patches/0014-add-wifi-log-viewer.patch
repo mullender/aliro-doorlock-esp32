@@ -1,0 +1,137 @@
+Extend the Wi-Fi variants' local trusted-LAN root page with a
+small "Recent logs" viewer on top of accepted GET /api/logs
+from patch 0013. Applied only to nanoc6-wifi and
+atoms3-lite-wifi via variants.json; nanoc6-thread never
+applies, compiles, links, or serves it.
+
+Scope, kept minimal (no polling, no WebSocket, no OTA, no
+authentication, no API changes, no log-capture changes, no
+settings changes):
+
+  * MODIFY main/aliro_local_web.cpp: extend kIndexHtml with a
+    Recent logs section:
+      - <h2>Recent logs</h2>
+      - <button id="logs-refresh">Refresh logs</button>
+      - direct <a href="/api/logs"> link
+      - bounded-height <pre id="logs"> (max-height 20rem, scrolls;
+        pre-wrap; word-break; monospace)
+      - separate <p id="logs-status" role="status" aria-live=
+        "polite"> for success and errors
+    A new <script> IIFE, SEPARATE from the QR IIFE and the
+    settings IIFE, fetches /api/logs once on load and on every
+    click of #logs-refresh. It requires response.ok, reads
+    response.text() (letting r.text() reject with its original
+    error name so the outer catch classifies network/body
+    failures correctly), and assigns the unredacted result to
+    #logs via textContent. Any '<script>' or HTML in the log
+    body is therefore rendered as literal text and never
+    evaluated. A failed refresh only updates #logs-status —
+    the last successful log snapshot in #logs is preserved.
+    /api/logs is added to the machine-endpoint list.
+
+Explicit non-goals for this patch: no settings backend change,
+no log-capture change (patch 0013 unchanged), no polling, no
+WebSocket, no OTA, no authentication, no cJSON or new runtime
+dependency, no external asset, no partition change.
+
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+--- a/examples/door_lock/main/aliro_local_web.cpp
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -164,21 +164,33 @@
+     "<input id=\"s-other_rgb\" name=\"other_rgb\" type=\"color\" required> "
+     "<label for=\"s-other_ms\">duration (ms, 0&ndash;10000)</label> "
+     "<input id=\"s-other_ms\" name=\"other_ms\" type=\"number\" "
+     "min=\"0\" max=\"10000\" step=\"1\" required inputmode=\"numeric\">"
+     "</p>"
+     "<p><button type=\"submit\" id=\"settings-submit\">Save settings</button></p>"
+     "</form>"
+     "<p id=\"settings-status\" role=\"status\" aria-live=\"polite\"></p>"
++    "<h2>Recent logs</h2>"
++    "<p>"
++    "<button type=\"button\" id=\"logs-refresh\">Refresh logs</button> "
++    "<a href=\"/api/logs\" id=\"logs-link\">Open <code>/api/logs</code></a>"
++    "</p>"
++    "<pre id=\"logs\" style=\"max-height:20rem;overflow:auto;background:#f5f5f5;"
++    "padding:.5rem;border-radius:.25rem;white-space:pre-wrap;word-break:break-all;"
++    "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em\">"
++    "Loading logs&hellip;</pre>"
++    "<p id=\"logs-status\" role=\"status\" aria-live=\"polite\"></p>"
+     "<h2>Machine endpoints</h2><ul>"
+     "<li><a href=\"/api/status\"><code>/api/status</code></a></li>"
+     "<li><a href=\"/api/pairing\"><code>/api/pairing</code></a></li>"
+     "<li><a href=\"/api/settings\"><code>/api/settings</code></a> "
+     "(GET and POST application/x-www-form-urlencoded)</li>"
++    "<li><a href=\"/api/logs\"><code>/api/logs</code></a> "
++    "(text/plain, recent 16 KiB ring)</li>"
+     "<li><a href=\"/qrcode.js\"><code>/qrcode.js</code></a> "
+     "(local MIT-licensed QR generator, gzip-encoded)</li>"
+     "</ul>"
+     "<script src=\"/qrcode.js\" defer></script>"
+     "<script>"
+     "(function(){"
+     "var showError=function(msg){"
+     "var e=document.getElementById('error');"
+@@ -327,17 +339,63 @@
+     "else{setStatus('Settings save failed: '+err.message,true);}"
+     "});"
+     "};"
+     "var wire=function(){"
+     "var form=document.getElementById('settings-form');"
+     "if(!form){return;}"
+     "form.addEventListener('submit',submit);"
+     "load();"
++    "};"
++    "if(document.readyState==='loading'){"
++    "document.addEventListener('DOMContentLoaded',wire);"
++    "}else{wire();}"
++    "})();"
++    "</script>"
++    "<script>"
++    "(function(){"
++    "var setStatus=function(text,isError){"
++    "var el=document.getElementById('logs-status');"
++    "if(!el){return;}"
++    "el.textContent=text;"
++    "el.style.color=isError?'#a11':'';"
++    "};"
++    "var refresh=function(){"
++    "var btn=document.getElementById('logs-refresh');"
++    "if(btn){btn.disabled=true;}"
++    "setStatus('Refreshing logs\\u2026');"
++    "fetch('/api/logs').then(function(r){"
++    "if(!r.ok)throw new Error('HTTP '+r.status);"
++    // Read the body as plain text. If the body-read itself rejects
++    // (TypeError from a network body-read failure, or AbortError
++    // from an aborted read), let the original error surface to the
++    // outer catch — do not rebrand it.
++    "return r.text();"
++    "}).then(function(t){"
++    // Assign UNREDACTED text via textContent so any '<script>' /
++    // HTML in the log body is rendered as literal characters and
++    // never evaluated. innerHTML must NOT be used here.
++    "var pre=document.getElementById('logs');"
++    "if(pre){pre.textContent=t;}"
++    "setStatus('Refreshed.');"
++    "}).catch(function(err){"
++    // A failed refresh must NOT destroy the last snapshot: only
++    // the separate #logs-status element is updated with the
++    // failure text.
++    "setStatus('Logs refresh failed: '+err.message,true);"
++    "}).then(function(){"
++    "if(btn){btn.disabled=false;}"
++    "});"
+     "};"
++    "var wire=function(){"
++    "var btn=document.getElementById('logs-refresh');"
++    "if(!btn){return;}"
++    "btn.addEventListener('click',refresh);"
++    "refresh();"
++    "};"
+     "if(document.readyState==='loading'){"
+     "document.addEventListener('DOMContentLoaded',wire);"
+     "}else{wire();}"
+     "})();"
+     "</script>"
+     "</html>";
+
+ // Embedded local QR generator asset (installer/vendor/qrcode.js,

@@ -6494,6 +6494,316 @@ test("phase 2 task 8 correction 2: log_sink_vprintf copies state under lock, rel
     "sink must refuse to invoke log_sink_vprintf as the prior sink");
 });
 
+// Phase 2 task 9: local log viewer page on top of accepted
+// GET /api/logs. Patch 0014 extends kIndexHtml with a Recent-logs
+// section and a separate IIFE that fetches /api/logs on load + on
+// button click, requires response.ok, reads response.text(), and
+// assigns the unredacted result to a bounded-height <pre> via
+// textContent only. A failed refresh preserves the last snapshot.
+
+const PHASE2_TASK9_PATCH = "firmware/patches/0014-add-wifi-log-viewer.patch";
+
+function phase2Task9PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE2_TASK9_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 9: patch 0014 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_TASK9_PATCH),
+      `${id}.source_patches must include ${PHASE2_TASK9_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_TASK9_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only log-viewer patch");
+  const patch = phase2Task9PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 9: patch 0014 keeps scope inside examples/door_lock/main/aliro_local_web.cpp only", () => {
+  const patch = phase2Task9PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_local_web.cpp",
+  ]));
+});
+
+test("phase 2 task 9: patch 0014 adds the log viewer HTML with a bounded <pre> and separate status", () => {
+  const patch = phase2Task9PatchText();
+  // The section: heading, refresh button, direct link, <pre>, status.
+  assert.match(patch, /<h2>Recent logs<\/h2>/,
+    "patch must add a 'Recent logs' section heading");
+  assert.match(patch, /id=\\"logs-refresh\\"/,
+    "patch must add a #logs-refresh button");
+  assert.match(patch, /<a href=\\"\/api\/logs\\" id=\\"logs-link\\"/,
+    "patch must add a direct link to /api/logs");
+  assert.match(patch, /<pre id=\\"logs\\"[^>]*max-height:20rem/,
+    "patch must add a bounded-height <pre id=\"logs\">");
+  assert.match(patch, /<p id=\\"logs-status\\" role=\\"status\\"/,
+    "patch must add a SEPARATE #logs-status element");
+  // /api/logs is added to the endpoint list.
+  assert.match(patch, /<li><a href=\\"\/api\/logs\\">/,
+    "/api/logs must be added to the machine-endpoint list");
+});
+
+test("phase 2 task 9: log-viewer JS renders via textContent only and never innerHTML with fetched text", () => {
+  const patch = phase2Task9PatchText();
+  // Isolate the log-viewer IIFE (the second-added <script> block).
+  // It contains the specific 'logs-refresh' identifier which no
+  // earlier IIFE mentions.
+  // The log-viewer IIFE spans from the added "<script>" through to
+  // a "</script>" that the diff may present as context rather than
+  // an added line (see extractPhase2LogViewerScript for the same
+  // note). Match against the raw patch and let the trailing
+  // "</script>" come from either side.
+  const iifeMatch = patch.match(
+    /"<script>"[\s\S]*?"var refresh=function\(\)\{"[\s\S]*?"<\/script>"/,
+  );
+  assert.ok(iifeMatch, "must find the log-viewer IIFE");
+  const iife = iifeMatch[0];
+  // The <pre> content is assigned via textContent.
+  assert.match(iife, /pre\.textContent=t/,
+    "the log-viewer IIFE must assign the fetched text via pre.textContent");
+  // No innerHTML anywhere in the log-viewer IIFE.
+  assert.doesNotMatch(iife, /\.innerHTML\s*=/,
+    "the log-viewer IIFE must NOT use innerHTML");
+  // Requires response.ok.
+  assert.match(iife, /if\(!r\.ok\)throw new Error\('HTTP '\+r\.status\)/,
+    "the log-viewer IIFE must require response.ok before reading the body");
+  // Reads response.text() (not r.json).
+  assert.match(iife, /return r\.text\(\)/,
+    "the log-viewer IIFE must read response.text()");
+  assert.doesNotMatch(iife, /r\.json\(\)/,
+    "the log-viewer IIFE must NOT call r.json()");
+});
+
+test("phase 2 task 9: failed refresh preserves last snapshot; only status updates", () => {
+  const patch = phase2Task9PatchText();
+  // The log-viewer IIFE spans from the added "<script>" through to
+  // a "</script>" that the diff may present as context rather than
+  // an added line (see extractPhase2LogViewerScript for the same
+  // note). Match against the raw patch and let the trailing
+  // "</script>" come from either side.
+  const iifeMatch = patch.match(
+    /"<script>"[\s\S]*?"var refresh=function\(\)\{"[\s\S]*?"<\/script>"/,
+  );
+  const iife = iifeMatch[0];
+  // The .catch branch must NOT touch #logs (no textContent write
+  // to the pre in the catch); it must only setStatus(..., true).
+  const catchMatch = iife.match(
+    /"\}\)\.catch\(function\(err\)\{"[\s\S]*?"\}\)\.then\(function\(\)\{"/,
+  );
+  assert.ok(catchMatch, "must find the catch block");
+  const catchBody = catchMatch[0];
+  assert.match(catchBody, /setStatus\('Logs refresh failed: '\+err\.message,true\)/,
+    "catch must call setStatus with the failure text (isError=true)");
+  assert.doesNotMatch(catchBody, /pre\.textContent\s*=/,
+    "catch must NOT overwrite the #logs pre — the last snapshot must survive");
+  assert.doesNotMatch(catchBody, /logsEl\.textContent\s*=/,
+    "catch must NOT overwrite the logs element");
+});
+
+test("phase 2 task 9: log-viewer JS has no polling / WebSocket / OTA / auth / API-changing tokens", () => {
+  const patch = phase2Task9PatchText();
+  const addedLines = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  const forbidden = [
+    { name: "polling (setInterval)",  pattern: /\bsetInterval\s*\(/ },
+    { name: "polling (setTimeout re-arm)", pattern: /\bsetTimeout\s*\([^)]*refresh/ },
+    { name: "WebSocket",              pattern: /\bnew\s+WebSocket\b|Sec-WebSocket|httpd_ws_/ },
+    { name: "OTA route",              pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "auth headers",           pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate|httpd_basic_auth/ },
+    { name: "POST to /api/logs",      pattern: /method\s*:\s*['"]POST['"][^}]*\/api\/logs/ },
+    { name: "log-capture change",     pattern: /esp_log_set_vprintf|AliroLocalWebLogInit|log_ring_snapshot/ },
+    { name: "settings backend change",pattern: /nvs_open\s*\(|AliroSettingsSerializedSetApply/ },
+    { name: "external URL",           pattern: /['"]https?:\/\// },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0014 must not introduce ${name}`);
+  }
+});
+
+// Extract-and-execute the log-viewer IIFE against a minimal DOM +
+// fetch mock. Prove that:
+//   1. initial success populates #logs via textContent (unsafe text
+//      is preserved as text, never HTML-interpreted).
+//   2. clicking #logs-refresh triggers a second fetch.
+//   3. an HTTP failure preserves the LAST snapshot in #logs and
+//      shows the failure text in #logs-status.
+//   4. a network / body-read failure (r.text() throws) also
+//      preserves the last snapshot and reports the error.
+
+function extractPhase2LogViewerScript() {
+  const patch = phase2Task9PatchText();
+  // Walk the diff in file order and reconstruct the post-patch
+  // stream of C string chunks: for each line, include added ('+')
+  // and context (' ') lines and drop removed ('-') lines. When
+  // consecutive scripts have identical closing tails (as in
+  // patch 0014, where the log-viewer IIFE ends with the same
+  // "};" / DOMContentLoaded / "})();" / "</script>" pattern as the
+  // preceding settings IIFE), the diff can present the closing
+  // lines as CONTEXT — the reconstruction here recovers the full
+  // post-patch tail regardless.
+  const reconstructed = [];
+  for (const raw of patch.split("\n")) {
+    if (raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("@@")) continue;
+    if (raw.startsWith("diff --git ")) continue;
+    if (raw.startsWith("+")) reconstructed.push(raw.slice(1));
+    else if (raw.startsWith(" ")) reconstructed.push(raw.slice(1));
+    // '-' lines skipped (removed from post-patch state).
+  }
+  // The log-viewer IIFE is anchored on the 'var refresh=function()'
+  // identifier which is unique to patch 0014. Walk backwards from
+  // that line to the LAST preceding "<script>" open, and forwards
+  // to the FIRST following "</script>" close.
+  const refreshIdx = reconstructed.findIndex(
+    (line) => /"var refresh=function\(\)\{"/.test(line));
+  assert.ok(refreshIdx > 0,
+    "expected patch 0014 to place the log-viewer IIFE anchored on 'var refresh=function()'");
+  let openIdx = -1;
+  for (let i = refreshIdx; i >= 0; i--) {
+    if (/^\s*"<script>"$/.test(reconstructed[i])) { openIdx = i; break; }
+  }
+  let closeIdx = -1;
+  for (let i = refreshIdx; i < reconstructed.length; i++) {
+    if (/^\s*"<\/script>"$/.test(reconstructed[i])) { closeIdx = i; break; }
+  }
+  assert.ok(openIdx > 0 && closeIdx > openIdx,
+    "expected patch 0014 to bracket the log-viewer IIFE with <script>...</script>");
+  const bodyLines = reconstructed.slice(openIdx + 1, closeIdx);
+  const chunks = bodyLines.map((line) => {
+    const m = line.match(/^\s*"(.*)"\s*$/);
+    if (!m) return "";
+    let s = m[1];
+    s = s.replace(/\\\\/g, "\x00__BS__\x00");
+    s = s.replace(/\\"/g, '"');
+    s = s.replace(/\\n/g, "\n");
+    s = s.replace(/\\t/g, "\t");
+    s = s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    s = s.replace(/\x00__BS__\x00/g, "\\");
+    return s;
+  });
+  return chunks.join("");
+}
+
+function runPhase2LogViewerScript({ fetchImpl }) {
+  const script = extractPhase2LogViewerScript();
+  const logsEl   = { id: "logs",        textContent: "Loading logs\u2026", style: {} };
+  const statusEl = { id: "logs-status", textContent: "",                    style: {} };
+  const btnEl    = { id: "logs-refresh", disabled: false, style: {},
+                     _click: null,
+                     addEventListener(ev, h) { if (ev === "click") btnEl._click = h; } };
+  const elements = new Map([
+    ["logs", logsEl],
+    ["logs-status", statusEl],
+    ["logs-refresh", btnEl],
+  ]);
+  const doc = {
+    readyState: "complete",
+    getElementById(id) { return elements.get(id) || null; },
+    addEventListener() {},
+  };
+  const runner = new Function("document", "fetch", "console", script);
+  runner(doc, fetchImpl, console);
+  async function settle(rounds = 8) {
+    for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, 0));
+  }
+  function clickRefresh() {
+    if (btnEl._click) btnEl._click({});
+  }
+  return { logsEl, statusEl, btnEl, clickRefresh, settle };
+}
+
+test("phase 2 task 9 runtime: initial success populates #logs via textContent; unsafe-looking text is preserved", async () => {
+  const unsafeBody = "line 1\n<script>alert('x')</script>\nline 3 & <b>bold</b> <img src=x onerror=y>\n";
+  const { logsEl, statusEl, settle } = runPhase2LogViewerScript({
+    fetchImpl: async () => ({
+      ok: true,
+      text: async () => unsafeBody,
+    }),
+  });
+  await settle();
+  // textContent equals the raw body BYTE-for-BYTE — no HTML parsing.
+  assert.equal(logsEl.textContent, unsafeBody,
+    "unsafe-looking log text must be assigned verbatim via textContent");
+  assert.match(statusEl.textContent, /^Refreshed\.$/,
+    "success path must set #logs-status to 'Refreshed.'");
+});
+
+test("phase 2 task 9 runtime: clicking #logs-refresh triggers a second fetch that updates the snapshot", async () => {
+  let call = 0;
+  const bodies = ["first snapshot\n", "second snapshot\n"];
+  const { logsEl, statusEl, clickRefresh, settle } = runPhase2LogViewerScript({
+    fetchImpl: async () => {
+      const body = bodies[call] ?? "";
+      call += 1;
+      return { ok: true, text: async () => body };
+    },
+  });
+  await settle();
+  assert.equal(logsEl.textContent, bodies[0],
+    "initial load must populate #logs with the first fetch's body");
+  clickRefresh();
+  await settle();
+  assert.equal(logsEl.textContent, bodies[1],
+    "clicking #logs-refresh must overwrite #logs with the second fetch's body");
+  assert.equal(call, 2, "exactly two fetches occur (load + one click)");
+  assert.match(statusEl.textContent, /^Refreshed\.$/);
+});
+
+test("phase 2 task 9 runtime: HTTP failure preserves the last snapshot and shows failure text", async () => {
+  let call = 0;
+  const okBody = "good snapshot\n";
+  const { logsEl, statusEl, clickRefresh, settle } = runPhase2LogViewerScript({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { ok: true, text: async () => okBody };
+      return { ok: false, status: 503, text: async () => "" };
+    },
+  });
+  await settle();
+  assert.equal(logsEl.textContent, okBody, "initial load populates #logs");
+  clickRefresh();
+  await settle();
+  assert.equal(logsEl.textContent, okBody,
+    "HTTP failure MUST preserve the last snapshot in #logs");
+  assert.match(statusEl.textContent, /^Logs refresh failed:/,
+    "HTTP failure must surface 'Logs refresh failed:' in #logs-status");
+  assert.match(statusEl.textContent, /HTTP 503/,
+    "HTTP failure must include the status code in the error text");
+});
+
+test("phase 2 task 9 runtime: network / body failure preserves last snapshot and reports the error", async () => {
+  let call = 0;
+  const okBody = "good snapshot\n";
+  const { logsEl, statusEl, clickRefresh, settle } = runPhase2LogViewerScript({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { ok: true, text: async () => okBody };
+      // Body-read failure — r.text() throws TypeError (network).
+      return {
+        ok: true,
+        text: async () => { throw new TypeError("network body read failed"); },
+      };
+    },
+  });
+  await settle();
+  assert.equal(logsEl.textContent, okBody);
+  clickRefresh();
+  await settle();
+  assert.equal(logsEl.textContent, okBody,
+    "body-read failure MUST preserve the last snapshot in #logs");
+  assert.match(statusEl.textContent, /^Logs refresh failed:/,
+    "body-read failure must surface 'Logs refresh failed:' in #logs-status");
+  assert.match(statusEl.textContent, /network body read failed/,
+    "body-read failure must include the underlying error message");
+});
+
 test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and outer catch classifies SyntaxError", () => {
   const patch = phase2Task6PatchText();
   // populate no longer strips a leading '#' from the response.
