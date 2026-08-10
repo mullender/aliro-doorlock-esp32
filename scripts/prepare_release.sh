@@ -262,8 +262,13 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   exit 3
 fi
 
-STAGE_DIR="$(mktemp -d "$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.stage.XXXXXX")"
-
+# Order matters: once the lock is acquired, initialize STAGE_DIR to
+# empty, define cleanup, and install the trap BEFORE mktemp runs. That
+# way even a mktemp failure — or any later exit — always releases the
+# lock and never touches the existing published package (the cleanup
+# only removes STAGE_DIR when it exists inside ARTIFACTS_DIR, and only
+# rmdirs LOCK_DIR which is bare by definition).
+STAGE_DIR=""
 cleanup() {
   if [[ -n "${STAGE_DIR:-}" && -d "$STAGE_DIR" &&
         "$(dirname "$STAGE_DIR")" == "$ARTIFACTS_DIR" ]]; then
@@ -275,6 +280,13 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+if ! STAGE_DIR="$(mktemp -d "$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.stage.XXXXXX")"; then
+  echo "error: could not create stage directory under $ARTIFACTS_DIR" >&2
+  # STAGE_DIR is empty, so cleanup will only rmdir the lock and leave
+  # any existing OUT_DIR untouched.
+  exit 3
+fi
 
 # Refuse to overwrite an existing final variant directory. Because we
 # hold the publication lock, no other publisher can insert a directory

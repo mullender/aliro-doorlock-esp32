@@ -2840,6 +2840,112 @@ test("prepare_release.sh publication lock blocks a concurrent publisher without 
   });
 });
 
+test("prepare_release.sh releases the lock and leaves the package untouched when stage mktemp fails", () => {
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  withForgedPartition(partitionBytes, () => {
+    // First publish nanoc6-thread cleanly so there is an existing
+    // package that must survive a later failure on a different variant.
+    const artifactsDir = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
+    const { root: rootA, build: buildA } = makeFixtureBuild({});
+    writeFileSync(path.join(buildA, "partition_table/partition-table.bin"), partitionBytes);
+    try {
+      const first = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: buildA,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+    } finally {
+      rmSync(rootA, { recursive: true, force: true });
+    }
+    // Snapshot the winner's published bytes.
+    const winnerDir = path.join(artifactsDir, "aliro-v0.0.6-devkit", "nanoc6-thread");
+    const winnerDigests = {};
+    for (const f of readdirSync(winnerDir)) {
+      winnerDigests[f] = createHash("sha256")
+        .update(readFileSync(path.join(winnerDir, f))).digest("hex");
+    }
+
+    // Now try to publish nanoc6-wifi under the same tag with a
+    // deterministically failing `mktemp` shim. The pre-existing lock
+    // acquisition must succeed (variant differs), then the mktemp
+    // failure must fire cleanup, releasing the lock and leaving
+    // nanoc6-thread's package byte-for-byte unchanged.
+    const shimDir = mkdtempSync(path.join(tmpdir(), "prep-shim-mktemp-"));
+    writeFileSync(path.join(shimDir, "mktemp"),
+      "#!/bin/sh\necho 'mktemp: forced failure for regression test' >&2\nexit 1\n",
+      { mode: 0o755 });
+    // Also ship the mock esptool so the earlier PATH resolves it after
+    // the shim shadows mktemp.
+    writeFileSync(path.join(shimDir, "esptool.py"),
+      `#!/bin/sh\nexec python3 ${JSON.stringify(MOCK_ESPTOOL)} "$@"\n`,
+      { mode: 0o755 });
+
+    const { root: rootB, build: buildB } = makeFixtureBuild({
+      projectName: "aliro-nanoc6-wifi",
+      appBin: "aliro-nanoc6-wifi.bin",
+    });
+    writeFileSync(path.join(buildB, "partition_table/partition-table.bin"), partitionBytes);
+    try {
+      const env = {
+        ...process.env,
+        ALIRO_ARTIFACTS_DIR: artifactsDir,
+        PATH: shimDir + path.delimiter + process.env.PATH,
+      };
+      delete env.IDF_PATH;
+      const scriptPath = new URL("../../scripts/prepare_release.sh", import.meta.url).pathname;
+      let result;
+      try {
+        const stdout = execFileSync("bash", [
+          scriptPath,
+          "--variant", "nanoc6-wifi",
+          "--tag", "aliro-v0.0.6-devkit",
+          "--build-dir", buildB,
+        ], { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 15000, env });
+        result = { status: 0, stdout, stderr: "" };
+      } catch (error) {
+        result = {
+          status: typeof error.status === "number" ? error.status : -1,
+          stdout: error.stdout?.toString() || "",
+          stderr: error.stderr?.toString() || String(error),
+        };
+      }
+      assert.notEqual(result.status, 0, "forced mktemp failure must fail the run");
+      assert.match(result.stderr, /could not create stage directory/);
+
+      // The nanoc6-wifi lock must have been released.
+      const wifiLock = path.join(artifactsDir,
+        ".aliro-v0.0.6-devkit-nanoc6-wifi.publish.lock");
+      assert.equal(existsSync(wifiLock), false,
+        "lock directory must be removed after a mktemp failure");
+      // No stage directory anywhere under the artifacts root.
+      for (const entry of readdirSync(artifactsDir)) {
+        assert.doesNotMatch(entry, /\.stage\./,
+          `no stage residue allowed after mktemp failure: ${entry}`);
+      }
+      // No nanoc6-wifi final directory.
+      assert.equal(existsSync(path.join(artifactsDir,
+        "aliro-v0.0.6-devkit", "nanoc6-wifi")), false,
+        "no nanoc6-wifi final directory may be created after mktemp failure");
+      // The pre-existing nanoc6-thread package must be byte-for-byte
+      // identical.
+      const afterDigests = {};
+      for (const f of readdirSync(winnerDir)) {
+        afterDigests[f] = createHash("sha256")
+          .update(readFileSync(path.join(winnerDir, f))).digest("hex");
+      }
+      assert.deepEqual(afterDigests, winnerDigests,
+        "existing package must be untouched when a different-variant publish fails at mktemp");
+    } finally {
+      rmSync(rootB, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+      rmSync(artifactsDir, { recursive: true, force: true });
+    }
+  });
+});
+
 test("runPrepare refuses to point at the repository artifacts tree", () => {
   const repoArtifactsPath = new URL("../../artifacts/", import.meta.url).pathname;
   withFixture({}, ({ build }) => {
