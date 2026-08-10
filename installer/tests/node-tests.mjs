@@ -2253,7 +2253,22 @@ function makeFixtureBuild({
 // Every fixture test routes the packager's output through a temporary
 // artifact root via ALIRO_ARTIFACTS_DIR so a normal host test run
 // never creates, replaces, or removes anything inside repo/artifacts.
-function runPrepare({ variant, tag, buildDir, artifactsDir }) {
+//
+// `extraArgs` and `useMockEsptool` support the atomic-publication
+// tests. The mock esptool.py stand-in ships in installer/tests/ and
+// mimics `esptool.py merge_bin` well enough to exercise the merged-
+// binary checks without a real ESP-IDF toolchain.
+const MOCK_ESPTOOL_DIR = new URL("./", import.meta.url).pathname;
+const MOCK_ESPTOOL = new URL("./mock-esptool.py", import.meta.url).pathname;
+function runPrepare({
+  variant,
+  tag,
+  buildDir,
+  artifactsDir,
+  extraArgs = [],
+  useMockEsptool = false,
+  envOverrides = {},
+}) {
   const scriptPath = new URL("../../scripts/prepare_release.sh", import.meta.url).pathname;
   if (!artifactsDir) throw new Error("artifactsDir is required (must be a tmp path)");
   const repoRoot = new URL("../../", import.meta.url).pathname;
@@ -2261,17 +2276,35 @@ function runPrepare({ variant, tag, buildDir, artifactsDir }) {
       || artifactsDir.startsWith(path.join(repoRoot, "artifacts") + "/")) {
     throw new Error("artifactsDir must not point at the repository artifacts tree");
   }
+  const env = { ...process.env, ALIRO_ARTIFACTS_DIR: artifactsDir, ...envOverrides };
+  if (useMockEsptool) {
+    // Prepend a shim dir with an `esptool.py` symlink to the mock. Every
+    // subshell that inherits PATH resolves esptool.py to the mock.
+    const shim = mkdtempSync(path.join(tmpdir(), "prep-shim-"));
+    const shimEsptool = path.join(shim, "esptool.py");
+    writeFileSync(
+      shimEsptool,
+      `#!/bin/sh\nexec ${JSON.stringify("python3")} ${JSON.stringify(MOCK_ESPTOOL)} "$@"\n`,
+      { mode: 0o755 },
+    );
+    env.PATH = shim + path.delimiter + env.PATH;
+    env._ALIRO_TEST_SHIM_DIR = shim;
+    // Remove IDF_PATH so the script's IDF fallback does not shadow the
+    // shim when both are present.
+    delete env.IDF_PATH;
+  }
+  const args = ["bash", scriptPath];
+  if (extraArgs.length) {
+    args.push(...extraArgs);
+  } else {
+    args.push("--variant", variant, "--tag", tag, "--build-dir", buildDir);
+  }
   try {
-    const stdout = execFileSync("bash", [
-      scriptPath,
-      "--variant", variant,
-      "--tag", tag,
-      "--build-dir", buildDir,
-    ], {
+    const stdout = execFileSync(args[0], args.slice(1), {
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       timeout: 15000,
-      env: { ...process.env, ALIRO_ARTIFACTS_DIR: artifactsDir },
+      env,
     });
     return { status: 0, stdout, stderr: "" };
   } catch (error) {
@@ -2280,6 +2313,10 @@ function runPrepare({ variant, tag, buildDir, artifactsDir }) {
       stdout: error.stdout?.toString() || "",
       stderr: error.stderr?.toString() || String(error),
     };
+  } finally {
+    if (env._ALIRO_TEST_SHIM_DIR) {
+      rmSync(env._ALIRO_TEST_SHIM_DIR, { recursive: true, force: true });
+    }
   }
 }
 
@@ -2474,6 +2511,207 @@ test("prepare_release.sh fixture tests never touch the repository artifacts tree
   const after = snapshot();
   assert.deepEqual(after, before,
     "prepare_release.sh must not create, replace, or remove anything under repo/artifacts when ALIRO_ARTIFACTS_DIR points elsewhere");
+});
+
+// Helper: patch variants.json so the fixture's forged partition hash is
+// accepted, run the callback, then restore the file.
+function withForgedPartition(partitionBytes, callback) {
+  const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
+  const originalVariants = readFileSync(variantsPath, "utf8");
+  const forgedHash = createHash("sha256").update(partitionBytes).digest("hex");
+  const patched = JSON.parse(originalVariants);
+  patched.variants["nanoc6-thread"].partition_table_sha256 = forgedHash;
+  patched.variants["nanoc6-wifi"].partition_table_sha256 = forgedHash;
+  writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+  try {
+    return callback();
+  } finally {
+    writeFileSync(variantsPath, originalVariants);
+  }
+}
+
+test("prepare_release.sh publishes the complete five-file set in one atomic directory rename", () => {
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  withForgedPartition(partitionBytes, () => {
+    withFixture({}, ({ build, artifactsDir }) => {
+      writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+      const result = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const outDir = path.join(artifactsDir, "aliro-v0.0.6-devkit", "nanoc6-thread");
+      const files = readdirSync(outDir).sort();
+      assert.deepEqual(files, [
+        "aliro-v0.0.6-devkit-nanoc6-thread-app.bin",
+        "aliro-v0.0.6-devkit-nanoc6-thread-app.bin.sha256",
+        "aliro-v0.0.6-devkit-nanoc6-thread-factory.bin",
+        "aliro-v0.0.6-devkit-nanoc6-thread-factory.bin.sha256",
+        "aliro-v0.0.6-devkit-nanoc6-thread-manifest.txt",
+      ], "the published directory must contain exactly the five-file matrix package");
+      // No stage-dir leaves should remain under the tag directory.
+      const tagDir = path.join(artifactsDir, "aliro-v0.0.6-devkit");
+      const tagEntries = readdirSync(tagDir).sort();
+      assert.deepEqual(tagEntries, ["nanoc6-thread"],
+        "the tag directory must only contain the per-variant subdirectory (no stage leftovers)");
+    });
+  });
+});
+
+test("prepare_release.sh failed publication leaves no partial final directory", () => {
+  // Approved-hash mismatch is caught AFTER the mock esptool writes the
+  // staged binary. Cleanup must remove the stage dir; no partial final
+  // directory may be published.
+  withFixture({}, ({ build, artifactsDir }) => {
+    const partitionBytes = Buffer.alloc(0xC00, 0x00);
+    writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+      artifactsDir,
+      // No forged partition hash this time, so the pristine variants.json
+      // still rejects the partition. That fires BEFORE staging even
+      // begins, so no final directory may be created.
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not the approved layout for nanoc6-thread/);
+    // No final variant directory, no stage residue, no tag directory
+    // beyond what was created for the failed run.
+    const tagDir = path.join(artifactsDir, "aliro-v0.0.6-devkit");
+    let residue = [];
+    try {
+      residue = readdirSync(tagDir);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    assert.deepEqual(residue, [],
+      `no partial final directory allowed under ${tagDir} after a failed run`);
+    // Nothing shall exist at all under artifactsDir either — stage
+    // cleanup runs on exit.
+    const roots = readdirSync(artifactsDir);
+    for (const entry of roots) {
+      assert.doesNotMatch(entry, /\.stage\./,
+        `no stage-dir residue allowed: found ${entry}`);
+    }
+  });
+});
+
+test("prepare_release.sh refuses to overwrite an existing package and leaves it byte-for-byte unchanged", () => {
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  withForgedPartition(partitionBytes, () => {
+    withFixture({}, ({ build, artifactsDir }) => {
+      writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+      // Publish once.
+      const first = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      const outDir = path.join(artifactsDir, "aliro-v0.0.6-devkit", "nanoc6-thread");
+      const originalDigest = {};
+      for (const file of readdirSync(outDir)) {
+        originalDigest[file] = createHash("sha256")
+          .update(readFileSync(path.join(outDir, file)))
+          .digest("hex");
+      }
+      // Re-publish the same variant + tag: must refuse and touch nothing.
+      const second = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.notEqual(second.status, 0);
+      assert.match(second.stderr, /refusing to overwrite an existing package/);
+      const afterDigest = {};
+      for (const file of readdirSync(outDir)) {
+        afterDigest[file] = createHash("sha256")
+          .update(readFileSync(path.join(outDir, file)))
+          .digest("hex");
+      }
+      assert.deepEqual(afterDigest, originalDigest,
+        "existing package must remain byte-for-byte unchanged after a refused republish");
+    });
+  });
+});
+
+test("prepare_release.sh keeps two variants independent under one tag", () => {
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  withForgedPartition(partitionBytes, () => {
+    // First variant: nanoc6-thread
+    withFixture({}, ({ build: buildA, artifactsDir }) => {
+      writeFileSync(path.join(buildA, "partition_table/partition-table.bin"), partitionBytes);
+      const first = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: buildA,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      // Second variant under the SAME tag: nanoc6-wifi
+      // (uses the same fixture project layout but with the correct
+      // variant name).
+      const { root: rootB, build: buildB } = makeFixtureBuild({
+        projectName: "aliro-nanoc6-wifi",
+        appBin: "aliro-nanoc6-wifi.bin",
+      });
+      writeFileSync(path.join(buildB, "partition_table/partition-table.bin"), partitionBytes);
+      try {
+        const second = runPrepare({
+          variant: "nanoc6-wifi",
+          tag: "aliro-v0.0.6-devkit",
+          buildDir: buildB,
+          artifactsDir,
+          useMockEsptool: true,
+        });
+        assert.equal(second.status, 0, second.stderr || second.stdout);
+      } finally {
+        rmSync(rootB, { recursive: true, force: true });
+      }
+      const tagDir = path.join(artifactsDir, "aliro-v0.0.6-devkit");
+      const variants = readdirSync(tagDir).sort();
+      assert.deepEqual(variants, ["nanoc6-thread", "nanoc6-wifi"],
+        "each variant must live in its own subdirectory under the tag");
+      for (const variantId of variants) {
+        const files = readdirSync(path.join(tagDir, variantId)).sort();
+        assert.equal(files.length, 5,
+          `variant ${variantId} must publish exactly five files (got ${files.length})`);
+        for (const file of files) {
+          assert.ok(file.startsWith(`aliro-v0.0.6-devkit-${variantId}-`),
+            `variant ${variantId} file must be namespaced: ${file}`);
+        }
+      }
+    });
+  });
+});
+
+test("prepare_release.sh rejects positional arguments", () => {
+  const tmpArtifacts = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
+  try {
+    // Positional call form: <BUILD_DIR> <TAG>
+    const result = runPrepare({
+      variant: "unused-because-extraargs-overrides",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: "/tmp/does-not-matter",
+      artifactsDir: tmpArtifacts,
+      extraArgs: ["/tmp/build", "aliro-c6-v0.0.5-devkit"],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /positional arguments are rejected/);
+    assert.match(result.stderr, /--variant/);
+    assert.match(result.stderr, /--tag/);
+  } finally {
+    rmSync(tmpArtifacts, { recursive: true, force: true });
+  }
 });
 
 test("runPrepare refuses to point at the repository artifacts tree", () => {

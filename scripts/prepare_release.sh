@@ -14,17 +14,24 @@
 #   --build-dir <path>   idf.py build/ directory to package.
 #                        Default: <ESP_MATTER_SRC>/examples/door_lock/build
 #
-# Legacy positional form (kept only for the nanoc6-thread variant with
-# an aliro-c6-vX.Y.Z-devkit tag, so bench workflows built before
-# Phase 1B keep working):
-#   scripts/prepare_release.sh <BUILD_DIR> [<LEGACY_TAG>]
+# --variant and --tag are required for every call. Positional arguments
+# are rejected: the legacy positional form cannot satisfy the current
+# safe identity checks (variant project_name, chip, partition hash).
 #
 # Outputs (relative to the repo root):
-#   artifacts/<TAG>/<TAG>-<variant>-factory.bin
-#   artifacts/<TAG>/<TAG>-<variant>-factory.bin.sha256
-#   artifacts/<TAG>/<TAG>-<variant>-app.bin
-#   artifacts/<TAG>/<TAG>-<variant>-app.bin.sha256
-#   artifacts/<TAG>/<TAG>-<variant>-manifest.txt
+#   artifacts/<TAG>/<VARIANT>/<TAG>-<VARIANT>-factory.bin
+#   artifacts/<TAG>/<VARIANT>/<TAG>-<VARIANT>-factory.bin.sha256
+#   artifacts/<TAG>/<VARIANT>/<TAG>-<VARIANT>-app.bin
+#   artifacts/<TAG>/<VARIANT>/<TAG>-<VARIANT>-app.bin.sha256
+#   artifacts/<TAG>/<VARIANT>/<TAG>-<VARIANT>-manifest.txt
+#
+# The five files are published as ONE atomic directory rename: the
+# packager stages every file into a private tmpdir under
+# <ARTIFACTS_DIR>/.<tag>-<variant>.stage.XXXXXX/ and, only after all
+# checks pass, renames that tmpdir to <ARTIFACTS_DIR>/<TAG>/<VARIANT>/.
+# The script refuses to overwrite an existing final variant directory;
+# a failed run leaves no partial final directory and does not change
+# any existing package.
 
 set -euo pipefail
 
@@ -35,10 +42,19 @@ if [[ ! -f "$VARIANTS_JSON" ]]; then
   exit 2
 fi
 
+usage() {
+  cat >&2 <<'USAGE'
+usage: scripts/prepare_release.sh --variant <id> --tag <matrix-tag> [--build-dir <path>]
+
+--variant and --tag are required. Positional arguments are rejected;
+the legacy positional form cannot satisfy the current safe identity
+checks (variant project_name, chip, partition hash).
+USAGE
+}
+
 VARIANT_ID=""
 TAG=""
 BUILD_DIR=""
-POSITIONAL=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --variant) VARIANT_ID="${2:?--variant requires a value}"; shift 2 ;;
@@ -47,58 +63,37 @@ while [[ "$#" -gt 0 ]]; do
     --tag=*) TAG="${1#--tag=}"; shift ;;
     --build-dir) BUILD_DIR="${2:?--build-dir requires a value}"; shift 2 ;;
     --build-dir=*) BUILD_DIR="${1#--build-dir=}"; shift ;;
-    -h|--help) sed -n '1,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '1,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --) shift; break ;;
     -*)
       echo "error: unknown option $1" >&2
-      echo "usage: $0 --variant <id> --tag <matrix-tag> [--build-dir <path>]" >&2
+      usage
       exit 2
       ;;
-    *) POSITIONAL+=("$1"); shift ;;
+    *)
+      echo "error: positional arguments are rejected; use --variant and --tag" >&2
+      usage
+      exit 2
+      ;;
   esac
 done
 
-# Preserve the legacy positional form ONLY for nanoc6-thread with the
-# aliro-c6-* tag, so bench builds cut before Phase 1B still work. Any
-# other combination must use --variant + --tag.
-if [[ "${#POSITIONAL[@]}" -gt 0 ]]; then
-  if [[ -n "$VARIANT_ID" || -n "$BUILD_DIR" ]]; then
-    echo "error: legacy positional call may not be mixed with --variant / --build-dir" >&2
-    exit 2
-  fi
-  BUILD_DIR="${POSITIONAL[0]}"
-  if [[ "${#POSITIONAL[@]}" -ge 2 ]]; then
-    TAG="${POSITIONAL[1]}"
-  fi
-  if [[ -z "$TAG" ]]; then
-    TAG="aliro-c6-v0.0.5-devkit"
-  fi
-  if [[ ! "$TAG" =~ ^aliro-c6-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
-    echo "error: legacy positional call only accepts aliro-c6-vX.Y.Z-devkit tags; use --variant + --tag for matrix releases" >&2
-    exit 2
-  fi
-  VARIANT_ID="nanoc6-thread"
-fi
-
 if [[ -z "$VARIANT_ID" ]]; then
-  echo "error: --variant is required (matrix tag) or use the legacy positional form" >&2
+  echo "error: --variant is required" >&2
+  usage
   exit 2
 fi
 if [[ -z "$TAG" ]]; then
   echo "error: --tag is required" >&2
+  usage
   exit 2
 fi
 
-# The matrix tag pattern is authoritative for --variant + --tag calls.
-# Legacy positional call already validated its own tag above.
-if [[ "${#POSITIONAL[@]}" -eq 0 ]]; then
-  if [[ ! "$TAG" =~ ^aliro-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
-    echo "error: matrix tag must match aliro-vX.Y.Z-devkit (got $TAG)" >&2
-    exit 2
-  fi
+if [[ ! "$TAG" =~ ^aliro-v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
+  echo "error: --tag must match aliro-vX.Y.Z-devkit (got $TAG)" >&2
+  exit 2
 fi
-FIRMWARE_VERSION="${TAG#aliro-c6-v}"
-FIRMWARE_VERSION="${FIRMWARE_VERSION#aliro-v}"
+FIRMWARE_VERSION="${TAG#aliro-v}"
 if [[ "${#FIRMWARE_VERSION}" -gt 31 ]]; then
   echo "error: firmware version exceeds the 31-character app descriptor limit: $FIRMWARE_VERSION" >&2
   exit 2
@@ -241,23 +236,25 @@ fi
 # override this with ALIRO_ARTIFACTS_DIR so a normal host test run never
 # creates, replaces, or removes anything inside the repository tree.
 ARTIFACTS_DIR="${ALIRO_ARTIFACTS_DIR:-$REPO_ROOT/artifacts}"
-OUT_DIR="$ARTIFACTS_DIR/$TAG"
-mkdir -p "$ARTIFACTS_DIR" "$OUT_DIR"
+TAG_DIR="$ARTIFACTS_DIR/$TAG"
+OUT_DIR="$TAG_DIR/$VARIANT_ID"
+
+# Refuse to overwrite an existing final variant directory. Callers that
+# want to republish must delete the existing directory first — an
+# explicit action, not a silent replacement.
+if [[ -e "$OUT_DIR" ]]; then
+  echo "error: $OUT_DIR already exists; refusing to overwrite an existing package" >&2
+  echo "       Delete the directory explicitly to republish." >&2
+  exit 3
+fi
+
+mkdir -p "$ARTIFACTS_DIR" "$TAG_DIR"
 STAGE_DIR="$(mktemp -d "$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.stage.XXXXXX")"
-BACKUP_DIR=""
 
 cleanup() {
   if [[ -n "${STAGE_DIR:-}" && -d "$STAGE_DIR" &&
         "$(dirname "$STAGE_DIR")" == "$ARTIFACTS_DIR" ]]; then
     rm -R -- "$STAGE_DIR"
-  fi
-  if [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" &&
-        "$(dirname "$BACKUP_DIR")" == "$ARTIFACTS_DIR" ]]; then
-    for item in "$BACKUP_DIR"/*; do
-      [[ -e "$item" ]] || continue
-      mv "$item" "$OUT_DIR/"
-    done
-    rmdir "$BACKUP_DIR" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -391,31 +388,30 @@ fi
   echo
 } > "$OUT_MANIFEST"
 
-# Move each staged asset into $OUT_DIR, first backing up any per-variant
-# assets that a previous run of THIS variant left behind. Variants share
-# the tag directory, so never touch unrelated variant files.
-BACKUP_DIR="$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.backup.$$"
-mkdir -p "$BACKUP_DIR"
-shopt -s nullglob
-for existing in "$OUT_DIR/${ASSET_STEM}"*; do
-  mv "$existing" "$BACKUP_DIR/"
+# Verify the complete five-file set is present in the staging directory
+# before we publish. Missing any one aborts and cleanup removes STAGE_DIR;
+# no partial final directory is created.
+for required in "$OUT_BIN" "$OUT_SHA" "$OUT_APP" "$OUT_APP_SHA" "$OUT_MANIFEST"; do
+  if [[ ! -s "$required" ]]; then
+    echo "error: staged asset missing or empty: $required" >&2
+    exit 3
+  fi
 done
-for staged in "$STAGE_DIR"/*; do
-  mv "$staged" "$OUT_DIR/"
-done
-shopt -u nullglob
-STAGE_DIR=""
 
-# Success — drop the backup, don't restore.
-if [[ -d "$BACKUP_DIR" ]]; then
-  rm -R -- "$BACKUP_DIR"
-  BACKUP_DIR=""
+# Publish the complete package as one atomic directory rename. Guard
+# against a racing writer that created the final directory between the
+# earlier pre-flight check and now.
+if [[ -e "$OUT_DIR" ]]; then
+  echo "error: $OUT_DIR appeared during staging; refusing to overwrite" >&2
+  exit 3
 fi
+mv "$STAGE_DIR" "$OUT_DIR"
+STAGE_DIR=""
 
 echo
 echo "Release artifacts for variant $VARIANT_ID under tag $TAG:"
-echo "  $OUT_DIR/$(basename "$OUT_BIN")         ($SIZE bytes)"
-echo "  $OUT_DIR/$(basename "$OUT_SHA")         sha256 = ${SHA}"
-echo "  $OUT_DIR/$(basename "$OUT_APP")         ($APP_SIZE bytes)"
-echo "  $OUT_DIR/$(basename "$OUT_APP_SHA")     sha256 = ${APP_SHA}"
-echo "  $OUT_DIR/$(basename "$OUT_MANIFEST")    (part-by-part audit)"
+for asset in "${ASSET_STEM}-factory.bin" "${ASSET_STEM}-factory.bin.sha256" \
+             "${ASSET_STEM}-app.bin" "${ASSET_STEM}-app.bin.sha256" \
+             "${ASSET_STEM}-manifest.txt"; do
+  echo "  $OUT_DIR/$asset"
+done
