@@ -5174,6 +5174,216 @@ test("phase 2 task 3: patch 0010 keeps scope inside examples/door_lock/main/ onl
   }
 });
 
+// Phase 2 task 5: local Wi-Fi settings API.
+// Patch 0011 adds GET+POST /api/settings, reusing the existing
+// Aliro settings parser, value limits, NVS store, Matter
+// AutoRelockTime update, and rollback path via a single serialized
+// transaction shared by the serial protocol handler and the HTTP
+// handler. Thread stays completely excluded.
+
+const PHASE2_TASK5_PATCH = "firmware/patches/0011-add-wifi-settings-api.patch";
+
+function phase2Task5PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE2_TASK5_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 5: patch 0011 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_TASK5_PATCH),
+      `${id}.source_patches must include ${PHASE2_TASK5_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_TASK5_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only settings-API patch");
+  const patch = phase2Task5PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 5: patch 0011 exposes ONE serialized apply path shared by serial and HTTP", () => {
+  const patch = phase2Task5PatchText();
+  // Header declaration exists.
+  assert.match(patch, /AliroSettingsApplyOutcome\s+AliroSettingsSerializedSetApply\s*\(\s*char\s*\*\s*set_line\s*\)/,
+    "aliro_settings.h must declare AliroSettingsSerializedSetApply(char *)");
+  // The outcome enum covers every parser and runtime failure so
+  // callers surface each specific case.
+  for (const label of ["kOk", "kBadRequest", "kUnknownKey", "kInvalidValue",
+                       "kStorage", "kMatter", "kBusy"]) {
+    assert.ok(patch.includes(label),
+      `AliroSettingsApplyOutcome must include ${label}`);
+  }
+  // No sibling apply-by-snapshot export that could bypass the
+  // shared transaction.
+  assert.doesNotMatch(patch,
+    /AliroSettingsApplyOutcome\s+AliroSettingsApply\s*\(\s*const\s+AliroSettingsSnapshot/,
+    "no bypass path AliroSettingsApply(snapshot) may exist alongside the serialized entry");
+  // Serial ProcessLine calls the same serialized entry.
+  const cppSection = patch.split("aliro_settings.cpp").slice(1).join("aliro_settings.cpp");
+  assert.match(cppSection, /AliroSettingsApplyOutcome\s+outcome\s*=\s*AliroSettingsSerializedSetApply\s*\(\s*line\s*\)/,
+    "serial ProcessLine must route SET lines through AliroSettingsSerializedSetApply");
+  // HTTP handler also calls the same entry.
+  const webSection = patch.split("aliro_local_web.cpp").slice(1).join("aliro_local_web.cpp");
+  assert.match(webSection, /AliroSettingsSerializedSetApply\s*\(\s*line\s*\)/,
+    "settings_post_handler must route the built line through AliroSettingsSerializedSetApply");
+});
+
+test("phase 2 task 5: patch 0011 read-current + parse + apply runs under one apply mutex", () => {
+  const patch = phase2Task5PatchText();
+  // A distinct apply mutex exists alongside g_settings_mutex.
+  assert.match(patch, /SemaphoreHandle_t\s+g_apply_mutex\s*=\s*nullptr/,
+    "patch must declare a distinct g_apply_mutex handle");
+  // AliroSettingsSerializedSetApply must (in this order): take the
+  // apply mutex, check the take result, read current UNDER the lock,
+  // parse against that current, apply, give the mutex back.
+  // Anchor to the definition (opening brace on the next line), not
+  // the header declaration that ends with ";".
+  const funcMatch = patch.match(
+    /\+AliroSettingsApplyOutcome AliroSettingsSerializedSetApply\(char \*set_line\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(funcMatch, "must find the serialized-apply body");
+  const body = funcMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // Guard: check that xSemaphoreTake actually returned pdTRUE before
+  // touching any settings.
+  assert.match(body, /xSemaphoreTake\s*\(\s*g_apply_mutex/,
+    "must take g_apply_mutex on entry");
+  assert.match(body, /xSemaphoreTake\s*\([^)]*\)\s*!=\s*pdTRUE/,
+    "must check xSemaphoreTake's return value before applying");
+  // Ordering: take -> current read -> parse -> apply -> give.
+  const takeIdx    = body.indexOf("xSemaphoreTake");
+  const currentIdx = body.indexOf("AliroSettingsGet()");
+  const parseIdx   = body.indexOf("AliroParseRequest");
+  const applyIdx   = body.indexOf("ApplySettings");
+  const giveIdx    = body.lastIndexOf("xSemaphoreGive");
+  assert.ok(takeIdx > 0 && currentIdx > takeIdx,
+    "current settings must be read AFTER the apply mutex is taken");
+  assert.ok(parseIdx > currentIdx,
+    "parse must run AFTER the current read");
+  assert.ok(applyIdx > parseIdx,
+    "apply must run AFTER the parse");
+  assert.ok(giveIdx > applyIdx,
+    "the mutex must be given back only after apply completes");
+});
+
+test("phase 2 task 5: HTTP handler bounds body length as size_t and validates Content-Type", () => {
+  const patch = phase2Task5PatchText();
+  // The diff sometimes emits the closing brace of the last new
+  // function as a CONTEXT line (leading space) if the following
+  // line in the original file is also `}`. Accept either marker.
+  const handlerMatch = patch.match(
+    /\+esp_err_t settings_post_handler\(httpd_req_t \* req\)[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(handlerMatch, "must find settings_post_handler body");
+  const body = handlerMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // content_len is captured as size_t (never narrowed to int).
+  assert.match(body, /const\s+size_t\s+declared\s*=\s*req->content_len\s*;/,
+    "declared body length must be size_t");
+  assert.doesNotMatch(body, /const\s+int\s+declared\s*=\s*req->content_len/,
+    "declared length must not be narrowed to int");
+  // Zero-length body → bad_request; oversize → over_limit.
+  assert.match(body, /if\s*\(\s*declared\s*==\s*0\s*\)/,
+    "zero-length body must be rejected");
+  assert.match(body, /if\s*\(\s*declared\s*>\s*kMaxBodyBytes\s*\)/,
+    "over-limit declared length must be rejected before any read");
+  // Content-Type check: must be application/x-www-form-urlencoded
+  // (with optional charset suffix). 415 uses a LITERAL status line
+  // because ESP-IDF's httpd_err_code_t has no 415 value.
+  assert.match(body, /application\/x-www-form-urlencoded/,
+    "handler must check for application/x-www-form-urlencoded");
+  assert.match(body, /"415 Unsupported Media Type"/,
+    "unsupported Content-Type must return literal 415 status line");
+  assert.doesNotMatch(patch, /HTTPD_415_TYPE_NOT_SUPPORTED/,
+    "no reference to the non-existent HTTPD_415_TYPE_NOT_SUPPORTED enum");
+  // Bounded retry on short reads / timeouts (no unbounded loop).
+  assert.match(body, /kMaxRecvRetries/,
+    "read loop must have a bounded retry cap");
+  assert.match(body, /HTTPD_SOCK_ERR_TIMEOUT/,
+    "read loop must handle HTTPD_SOCK_ERR_TIMEOUT explicitly");
+});
+
+test("phase 2 task 5: GET /api/settings emits all seven values with lowercase six-hex RGB", () => {
+  const patch = phase2Task5PatchText();
+  const emitMatch = patch.match(
+    /\+esp_err_t emit_settings_json\(httpd_req_t \* req[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(emitMatch, "must find emit_settings_json body");
+  const body = emitMatch[0];
+  for (const key of ["auto_relock_seconds", "success_rgb", "success_ms",
+                     "failure_rgb", "failure_ms", "other_rgb", "other_ms"]) {
+    assert.ok(body.includes(`\\"${key}\\":`),
+      `settings JSON must include the ${key} key`);
+  }
+  // Six lowercase hex chars for RGB, decimal for durations and
+  // auto_relock_seconds.
+  const rgbFormatCount = (body.match(/%06x/g) || []).length;
+  assert.equal(rgbFormatCount, 3, "must format exactly three RGB fields as %06x");
+  assert.match(patch, /application\/json/,
+    "settings JSON must be served with Content-Type application/json");
+  // GET handler wraps AliroSettingsGet() → emit_settings_json.
+  const getMatch = patch.match(
+    /\+esp_err_t settings_get_handler\(httpd_req_t \* req\)[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(getMatch, "must find settings_get_handler body");
+  assert.match(getMatch[0], /emit_settings_json\(req,\s*AliroSettingsGet\(\)\)/,
+    "GET handler must emit AliroSettingsGet() through emit_settings_json");
+});
+
+test("phase 2 task 5: settings routes are registered as the 5th and 6th URI handlers", () => {
+  const patch = phase2Task5PatchText();
+  // Route paths and methods.
+  assert.match(patch, /"\/api\/settings",\s+HTTP_GET/,
+    "GET /api/settings must be declared");
+  assert.match(patch, /"\/api\/settings",\s+HTTP_POST/,
+    "POST /api/settings must be declared");
+  // max_uri_handlers bumped to 6.
+  assert.match(patch, /max_uri_handlers\s*=\s*6/,
+    "max_uri_handlers must be bumped to 6");
+  // Both registered in the same atomic branch.
+  assert.match(patch, /httpd_register_uri_handler\s*\(\s*s_server\s*,\s*&kSettingsGet\s*\)/,
+    "start_server must register the GET handler");
+  assert.match(patch, /httpd_register_uri_handler\s*\(\s*s_server\s*,\s*&kSettingsPost\s*\)/,
+    "start_server must register the POST handler");
+});
+
+test("phase 2 task 5: patch 0011 introduces no forbidden subsystem and no new runtime dependency", () => {
+  const patch = phase2Task5PatchText();
+  const addedLines = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  const forbidden = [
+    { name: "cJSON runtime dependency",  pattern: /#include\s+["<]cJSON\.h[">]|cJSON_/ },
+    { name: "settings page/form UI",     pattern: /<form\b|multipart\/form-data/ },
+    { name: "logs endpoint",             pattern: /"\/(api\/)?logs"|esp_log_set_vprintf/ },
+    { name: "OTA route",                 pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "reset route",               pattern: /"\/(api\/)?factory(reset|-reset)?"|"\/api\/reset"/ },
+    { name: "reboot route",              pattern: /"\/(api\/)?reboot"|esp_restart\s*\(/ },
+    { name: "HTTP Basic/Bearer auth",    pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate/ },
+    { name: "authentication middleware", pattern: /httpd_basic_auth|httpd_auth_/ },
+    { name: "second settings store",     pattern: /nvs_open\s*\(\s*"aliro_settings"/ },
+    { name: "partition table change",    pattern: /partitions\.csv|CONFIG_PARTITION_TABLE_/ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0011 must not introduce ${name}`);
+  }
+});
+
+test("phase 2 task 5: patch 0011 keeps scope inside examples/door_lock/main/ only", () => {
+  const patch = phase2Task5PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  for (const p of modifiedPaths) {
+    assert.match(p, /^examples\/door_lock\/main\//,
+      `patch must only touch examples/door_lock/main/; got ${p}`);
+  }
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_settings.h",
+    "examples/door_lock/main/aliro_settings.cpp",
+    "examples/door_lock/main/aliro_local_web.cpp",
+  ]));
+});
+
 test("phase 2 task 1 correction 1: stop_server keeps the live handle when httpd_stop fails", () => {
   const patch = phase2PatchText();
   const stopMatch = patch.match(

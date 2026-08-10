@@ -78,7 +78,8 @@
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
         "firmware/patches/0008-generalize-board-pins.patch",
         "firmware/patches/0009-add-wifi-local-web.patch",
-        "firmware/patches/0010-add-wifi-local-pairing-qr.patch"
+        "firmware/patches/0010-add-wifi-local-pairing-qr.patch",
+        "firmware/patches/0011-add-wifi-settings-api.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -129,7 +130,8 @@
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
         "firmware/patches/0008-generalize-board-pins.patch",
         "firmware/patches/0009-add-wifi-local-web.patch",
-        "firmware/patches/0010-add-wifi-local-pairing-qr.patch"
+        "firmware/patches/0010-add-wifi-local-pairing-qr.patch",
+        "firmware/patches/0011-add-wifi-settings-api.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"

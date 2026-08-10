@@ -1,0 +1,457 @@
+Add GET/POST /api/settings to the Wi-Fi variants' local trusted-LAN
+HTTP server, reusing the existing Aliro settings parser, value
+limits, NVS store, Matter AutoRelockTime update, and rollback
+path. Applied only to nanoc6-wifi and atoms3-lite-wifi via
+variants.json; nanoc6-thread never applies, compiles, links, or
+serves any of the new code.
+
+Scope:
+  * MODIFY main/aliro_settings.h: export
+      enum class AliroSettingsApplyOutcome
+          { kOk, kBadRequest, kUnknownKey, kInvalidValue,
+            kStorage, kMatter, kBusy };
+      AliroSettingsApplyOutcome
+          AliroSettingsSerializedSetApply(char *set_line);
+    The outcome enum lets callers surface each specific parser
+    rejection alongside NVS or Matter failures. The declared
+    entry point handles the read-current + parse + apply as one
+    serialized transaction under an internal apply mutex.
+  * MODIFY main/aliro_settings.cpp: add a second FreeRTOS mutex
+    g_apply_mutex that serializes concurrent applies from the
+    serial protocol task and the HTTP settings handler
+    (g_settings_mutex remains the fast getter lock).
+    AliroSettingsSerializedSetApply checks the xSemaphoreTake
+    result, re-reads current UNDER the lock, calls AliroParse
+    Request against the fresh baseline, then hands the resulting
+    candidate to the existing ApplySettings (unchanged: same NVS
+    write, Matter attribute update, and rollback). The detailed
+    ESP_LOGE with esp_err_to_name(error) survives inside the
+    shared apply path so console debugging keeps its original
+    context regardless of the caller. Init/teardown handles both
+    mutexes. Serial ProcessLine now dispatches GET vs SET, sending
+    SET through the same serialized entry point so a concurrent
+    HTTP + serial partial apply cannot lose either request's
+    updates. Serial error codes are unchanged.
+  * MODIFY main/aliro_local_web.cpp: add GET /api/settings and
+    POST /api/settings. Both emit the seven values as JSON with
+    lowercase six-hex RGB. POST accepts a bounded
+    application/x-www-form-urlencoded body (256 bytes max);
+    declared body length is read as size_t (never narrowed to
+    int) so a very large content_len cannot wrap before the
+    over-limit check. Short reads and receive timeouts retry
+    with a bounded cap. The body is validated against a strict
+    allowlist ([a-zA-Z0-9_] plus '=' and '&') and rewritten into
+    an "ALIRO/1 SET k=v ..." protocol line, then handed to
+    AliroSettingsSerializedSetApply so the read + parse + apply
+    happen atomically. Every rejection path surfaces a JSON
+    error body under the right HTTP status. Status strings are
+    literals (esp_http_server's httpd_err_code_t enum has no 415
+    value in ESP-IDF v5.5, so send_json_error takes a literal
+    status line). httpd_config max_uri_handlers bumped from 4 to
+    6; the two new register calls ride the same atomic URI-
+    registration failure branch that already retains s_server
+    when httpd_stop also fails.
+
+Explicit non-goals for this patch: no settings form / page UI, no
+logs, no OTA, no reset, no reboot, no authentication, no
+redaction, no cJSON or new runtime dependency, no partition
+change, no second settings store, no duplicated validation.
+
+diff --git a/examples/door_lock/main/aliro_settings.h b/examples/door_lock/main/aliro_settings.h
+--- a/examples/door_lock/main/aliro_settings.h
++++ b/examples/door_lock/main/aliro_settings.h
+@@ -8,3 +8,26 @@
+ esp_err_t AliroSettingsInit();
+ AliroSettingsSnapshot AliroSettingsGet();
+ esp_err_t AliroSettingsStartSerial(uint16_t door_lock_endpoint_id);
++
++// Outcome of a serialized set-apply attempt. Parser rejections and
++// runtime failures share one enum so callers (serial protocol, local
++// Wi-Fi HTTP API) can map each case to their own error format.
++enum class AliroSettingsApplyOutcome : uint8_t {
++    kOk,
++    kBadRequest,     // parser: malformed input, empty request, duplicate key
++    kUnknownKey,     // parser: key outside the seven known settings
++    kInvalidValue,   // parser: value fails the shared range or hex check
++    kStorage,        // NVS write / rollback failure
++    kMatter,         // Matter attribute-update failure
++    kBusy,           // internal state not ready (mutex missing)
++};
++
++// The single settings-apply entry point shared by the serial "ALIRO/1
++// SET" protocol handler and the local HTTP POST /api/settings
++// handler. Takes an internal apply mutex, re-reads current settings
++// UNDER the mutex, hands the mutable `set_line` (which must already
++// have the "ALIRO/1 SET " prefix) to AliroParseRequest, then applies
++// the resulting candidate. This keeps the read-current + parse +
++// apply sequence one serialized transaction so a concurrent partial
++// apply cannot land based on a stale snapshot.
++AliroSettingsApplyOutcome AliroSettingsSerializedSetApply(char *set_line);
+diff --git a/examples/door_lock/main/aliro_settings.cpp b/examples/door_lock/main/aliro_settings.cpp
+--- a/examples/door_lock/main/aliro_settings.cpp
++++ b/examples/door_lock/main/aliro_settings.cpp
+@@ -31,6 +31,13 @@
+ static_assert(sizeof(PersistedSettings) == 8 * sizeof(uint32_t));
+
+ SemaphoreHandle_t g_settings_mutex = nullptr;
++// Separate from g_settings_mutex: g_settings_mutex is taken briefly
++// by every getter, so holding it across the multi-step apply path
++// (NVS write, Matter attribute update, possible rollback) would
++// stall readers. g_apply_mutex serializes concurrent applies from
++// the serial protocol task and the HTTP settings handler without
++// blocking AliroSettingsGet.
++SemaphoreHandle_t g_apply_mutex = nullptr;
+ AliroSettingsSnapshot g_settings = kAliroDefaultSettings;
+ uint16_t g_door_lock_endpoint_id = 0;
+
+@@ -140,27 +147,41 @@
+     return ESP_OK;
+ }
+
++// Serial ProcessLine dispatches GET vs SET without reading current
++// for SET — the current snapshot for a SET is re-read inside
++// AliroSettingsSerializedSetApply so the read + parse + apply happen
++// atomically under the shared apply mutex.
+ void ProcessLine(char *line)
+ {
+-    AliroParsedRequest request;
+-    AliroParseError parse_error = AliroParseRequest(line, AliroSettingsGet(), request);
+-    if (parse_error != AliroParseError::kNone) {
+-        EmitError(AliroParseErrorCode(parse_error));
++    if (strcmp(line, "ALIRO/1 GET") == 0) {
++        EmitStatus();
+         return;
+     }
+-    if (request.kind == AliroRequestKind::kGet) {
++    AliroSettingsApplyOutcome outcome = AliroSettingsSerializedSetApply(line);
++    switch (outcome) {
++    case AliroSettingsApplyOutcome::kOk:
+         EmitStatus();
+         return;
+-    }
+-
+-    bool storage_error;
+-    esp_err_t error = ApplySettings(request.settings, storage_error);
+-    if (error != ESP_OK) {
+-        ESP_LOGE(kTag, "Could not apply settings: %s", esp_err_to_name(error));
+-        EmitError(storage_error ? "storage" : "matter");
++    case AliroSettingsApplyOutcome::kBadRequest:
++        EmitError("bad_request");
+         return;
++    case AliroSettingsApplyOutcome::kUnknownKey:
++        EmitError("unknown_key");
++        return;
++    case AliroSettingsApplyOutcome::kInvalidValue:
++        EmitError("invalid_value");
++        return;
++    case AliroSettingsApplyOutcome::kStorage:
++        EmitError("storage");
++        return;
++    case AliroSettingsApplyOutcome::kMatter:
++        EmitError("matter");
++        return;
++    case AliroSettingsApplyOutcome::kBusy:
++    default:
++        EmitError("internal");
++        return;
+     }
+-    EmitStatus();
+ }
+
+ void SerialTask(void *)
+@@ -214,6 +235,12 @@
+     if (!g_settings_mutex) {
+         return ESP_ERR_NO_MEM;
+     }
++    g_apply_mutex = xSemaphoreCreateMutex();
++    if (!g_apply_mutex) {
++        vSemaphoreDelete(g_settings_mutex);
++        g_settings_mutex = nullptr;
++        return ESP_ERR_NO_MEM;
++    }
+
+     AliroSettingsSnapshot settings;
+     esp_err_t error = LoadSettings(settings);
+@@ -228,6 +255,8 @@
+     if (error != ESP_OK) {
+         vSemaphoreDelete(g_settings_mutex);
+         g_settings_mutex = nullptr;
++        vSemaphoreDelete(g_apply_mutex);
++        g_apply_mutex = nullptr;
+         return error;
+     }
+
+@@ -235,6 +264,52 @@
+     return ESP_OK;
+ }
+
++AliroSettingsApplyOutcome AliroSettingsSerializedSetApply(char *set_line)
++{
++    if (!g_apply_mutex) {
++        return AliroSettingsApplyOutcome::kBusy;
++    }
++    if (xSemaphoreTake(g_apply_mutex, portMAX_DELAY) != pdTRUE) {
++        return AliroSettingsApplyOutcome::kBusy;
++    }
++
++    // Re-read current settings UNDER the apply mutex so a concurrent
++    // partial-apply cannot land based on a stale snapshot: the read,
++    // parse, and apply below run as one serialized transaction.
++    const AliroSettingsSnapshot current = AliroSettingsGet();
++
++    AliroParsedRequest request;
++    AliroParseError parse_error = AliroParseRequest(set_line, current, request);
++    if (parse_error != AliroParseError::kNone) {
++        (void)xSemaphoreGive(g_apply_mutex);
++        switch (parse_error) {
++        case AliroParseError::kUnknownKey:   return AliroSettingsApplyOutcome::kUnknownKey;
++        case AliroParseError::kInvalidValue: return AliroSettingsApplyOutcome::kInvalidValue;
++        case AliroParseError::kBadRequest:
++        default:                             return AliroSettingsApplyOutcome::kBadRequest;
++        }
++    }
++    if (request.kind != AliroRequestKind::kSet) {
++        // Callers must pass an "ALIRO/1 SET ..." line; a GET here is
++        // a caller bug, not a client input error.
++        (void)xSemaphoreGive(g_apply_mutex);
++        return AliroSettingsApplyOutcome::kBadRequest;
++    }
++
++    bool storage_error = true;
++    esp_err_t error = ApplySettings(request.settings, storage_error);
++    (void)xSemaphoreGive(g_apply_mutex);
++    if (error == ESP_OK) {
++        return AliroSettingsApplyOutcome::kOk;
++    }
++    // Preserve the detailed ESP_LOGE so console debugging keeps the
++    // original esp_err_to_name(error) context regardless of which
++    // caller (serial or HTTP) triggered the failure.
++    ESP_LOGE(kTag, "Could not apply settings (%s): %s",
++             storage_error ? "storage" : "matter", esp_err_to_name(error));
++    return storage_error ? AliroSettingsApplyOutcome::kStorage : AliroSettingsApplyOutcome::kMatter;
++}
++
+ AliroSettingsSnapshot AliroSettingsGet()
+ {
+     AliroSettingsSnapshot settings = kAliroDefaultSettings;
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+--- a/examples/door_lock/main/aliro_local_web.cpp
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -42,6 +42,9 @@
+ #include <setup_payload/OnboardingCodesUtil.h>
+ #include <setup_payload/SetupPayload.h>
+
++#include "aliro_settings.h"
++#include "aliro_settings_protocol.h"
++
+ #ifndef ALIRO_VARIANT_ID
+ #define ALIRO_VARIANT_ID "unknown"
+ #endif
+@@ -239,6 +242,171 @@
+     httpd_resp_set_type(req, "text/html; charset=utf-8");
+     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+     return httpd_resp_send(req, kIndexHtml, HTTPD_RESP_USE_STRLEN);
++}
++
++// ---- /api/settings ----
++
++// Emit the seven settings values as a compact JSON object with RGB
++// values as six lowercase hex characters. Both GET and successful
++// POST paths reuse this to return the authoritative current state.
++esp_err_t emit_settings_json(httpd_req_t * req, const AliroSettingsSnapshot & s)
++{
++    char body[256];
++    int n = snprintf(body, sizeof(body),
++        "{\"auto_relock_seconds\":%u,"
++        "\"success_rgb\":\"%06x\",\"success_ms\":%u,"
++        "\"failure_rgb\":\"%06x\",\"failure_ms\":%u,"
++        "\"other_rgb\":\"%06x\",\"other_ms\":%u}",
++        static_cast<unsigned>(s.auto_relock_seconds),
++        static_cast<unsigned>(s.success_rgb), static_cast<unsigned>(s.success_ms),
++        static_cast<unsigned>(s.failure_rgb), static_cast<unsigned>(s.failure_ms),
++        static_cast<unsigned>(s.other_rgb),   static_cast<unsigned>(s.other_ms));
++    if (n < 0 || static_cast<size_t>(n) >= sizeof(body))
++    {
++        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "internal");
++    }
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, body, n);
++}
++
++// Compose a JSON error body under a caller-supplied HTTP status line.
++// Uses literal status strings (esp_http_server's httpd_err_code_t
++// enum has no 415 value in ESP-IDF v5.5, so we never route through
++// httpd_resp_send_err for the media-type case).
++esp_err_t send_json_error(httpd_req_t * req, const char * status_line, const char * code)
++{
++    char body[96];
++    int n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", code);
++    if (n < 0 || static_cast<size_t>(n) >= sizeof(body)) n = 0;
++    httpd_resp_set_status(req, status_line);
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, body, n);
++}
++
++esp_err_t settings_get_handler(httpd_req_t * req)
++{
++    return emit_settings_json(req, AliroSettingsGet());
++}
++
++esp_err_t settings_post_handler(httpd_req_t * req)
++{
++    // Bounded body. 256 bytes easily fits every legal 7-key SET line
++    // (about 145 chars fully specified) with no room for pathological
++    // padding. Anything larger is refused outright.
++    constexpr size_t kMaxBodyBytes = 256;
++
++    // Content-Type must be application/x-www-form-urlencoded, with
++    // an optional trailing charset/parameter suffix. Anything else,
++    // including missing / empty / multipart, is 415.
++    char content_type[64] = { 0 };
++    esp_err_t hdr_err = httpd_req_get_hdr_value_str(req, "Content-Type",
++                                                    content_type, sizeof(content_type));
++    if (hdr_err != ESP_OK)
++    {
++        return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++    }
++    static const char kExpectedCT[] = "application/x-www-form-urlencoded";
++    const size_t kCtLen = sizeof(kExpectedCT) - 1;
++    if (strncmp(content_type, kExpectedCT, kCtLen) != 0 ||
++        (content_type[kCtLen] != '\0' && content_type[kCtLen] != ';' &&
++         content_type[kCtLen] != ' '))
++    {
++        return send_json_error(req, "415 Unsupported Media Type", "unsupported_content_type");
++    }
++
++    // Body length checks. httpd_req_t::content_len is size_t; do NOT
++    // narrow to int, because a very large declared length would wrap
++    // to a negative int before the over-limit check runs.
++    const size_t declared = req->content_len;
++    if (declared == 0)
++    {
++        return send_json_error(req, "400 Bad Request", "bad_request");
++    }
++    if (declared > kMaxBodyBytes)
++    {
++        return send_json_error(req, "413 Payload Too Large", "over_limit");
++    }
++
++    // Bounded read with retries for short reads / timeouts. Cap the
++    // retry count so a stalled peer cannot loop the httpd task.
++    char body[kMaxBodyBytes + 1] = { 0 };
++    size_t total_read = 0;
++    int retries = 0;
++    constexpr int kMaxRecvRetries = 8;
++    while (total_read < declared)
++    {
++        int n = httpd_req_recv(req, body + total_read,
++                               declared - total_read);
++        if (n > 0)
++        {
++            total_read += static_cast<size_t>(n);
++            continue;
++        }
++        if (n == HTTPD_SOCK_ERR_TIMEOUT && retries++ < kMaxRecvRetries)
++        {
++            continue;
++        }
++        if (n == HTTPD_SOCK_ERR_TIMEOUT)
++        {
++            return send_json_error(req, "408 Request Timeout", "recv_timeout");
++        }
++        return send_json_error(req, "400 Bad Request", "recv_failed");
++    }
++    body[total_read] = '\0';
++
++    // Strict allowlist: key chars, '=' as key/value separator, '&'
++    // between pairs. Rejects percent-escapes, '+' (form space),
++    // whitespace, control bytes, and anything else. Our keys and
++    // values (decimals + six-char RGB) never require any escape.
++    for (size_t i = 0; i < total_read; ++i)
++    {
++        char c = body[i];
++        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                  (c >= '0' && c <= '9') || c == '_' || c == '=' || c == '&';
++        if (!ok)
++        {
++            return send_json_error(req, "400 Bad Request", "bad_request");
++        }
++    }
++
++    // Rewrite into the existing "ALIRO/1 SET k=v ..." protocol line
++    // and hand it to AliroSettingsSerializedSetApply, which re-reads
++    // the current snapshot AND applies the resulting candidate under
++    // one apply mutex. The serial protocol takes the same path, so
++    // a concurrent serial and HTTP partial-apply cannot lose either
++    // request's updates.
++    static const char kPrefix[] = "ALIRO/1 SET ";
++    const size_t kPrefixLen = sizeof(kPrefix) - 1;
++    char line[kPrefixLen + kMaxBodyBytes + 1];
++    memcpy(line, kPrefix, kPrefixLen);
++    memcpy(line + kPrefixLen, body, total_read);
++    line[kPrefixLen + total_read] = '\0';
++    for (size_t i = kPrefixLen; i < kPrefixLen + total_read; ++i)
++    {
++        if (line[i] == '&') line[i] = ' ';
++    }
++
++    AliroSettingsApplyOutcome outcome = AliroSettingsSerializedSetApply(line);
++    switch (outcome)
++    {
++    case AliroSettingsApplyOutcome::kOk:
++        return emit_settings_json(req, AliroSettingsGet());
++    case AliroSettingsApplyOutcome::kBadRequest:
++        return send_json_error(req, "400 Bad Request", "bad_request");
++    case AliroSettingsApplyOutcome::kUnknownKey:
++        return send_json_error(req, "400 Bad Request", "unknown_key");
++    case AliroSettingsApplyOutcome::kInvalidValue:
++        return send_json_error(req, "400 Bad Request", "invalid_value");
++    case AliroSettingsApplyOutcome::kStorage:
++        return send_json_error(req, "500 Internal Server Error", "storage");
++    case AliroSettingsApplyOutcome::kMatter:
++        return send_json_error(req, "500 Internal Server Error", "matter");
++    case AliroSettingsApplyOutcome::kBusy:
++    default:
++        return send_json_error(req, "500 Internal Server Error", "busy");
++    }
+ }
+
+ esp_err_t qrcode_get_handler(httpd_req_t * req)
+@@ -383,7 +551,7 @@
+     }
+
+     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+-    cfg.max_uri_handlers = 4;
++    cfg.max_uri_handlers = 6;
+     cfg.max_open_sockets = 4;
+     cfg.stack_size       = 6144;
+     cfg.lru_purge_enable = true;
+@@ -397,14 +565,18 @@
+         return err;
+     }
+
+-    static const httpd_uri_t kRoot    = { "/",             HTTP_GET, root_get_handler,    nullptr };
+-    static const httpd_uri_t kStatus  = { "/api/status",   HTTP_GET, status_get_handler,  nullptr };
+-    static const httpd_uri_t kPairing = { "/api/pairing",  HTTP_GET, pairing_get_handler, nullptr };
+-    static const httpd_uri_t kQrcode  = { "/qrcode.js",    HTTP_GET, qrcode_get_handler,  nullptr };
+-    if (httpd_register_uri_handler(s_server, &kRoot)    != ESP_OK ||
+-        httpd_register_uri_handler(s_server, &kStatus)  != ESP_OK ||
+-        httpd_register_uri_handler(s_server, &kPairing) != ESP_OK ||
+-        httpd_register_uri_handler(s_server, &kQrcode)  != ESP_OK)
++    static const httpd_uri_t kRoot         = { "/",              HTTP_GET,  root_get_handler,         nullptr };
++    static const httpd_uri_t kStatus       = { "/api/status",    HTTP_GET,  status_get_handler,       nullptr };
++    static const httpd_uri_t kPairing      = { "/api/pairing",   HTTP_GET,  pairing_get_handler,      nullptr };
++    static const httpd_uri_t kQrcode       = { "/qrcode.js",     HTTP_GET,  qrcode_get_handler,       nullptr };
++    static const httpd_uri_t kSettingsGet  = { "/api/settings",  HTTP_GET,  settings_get_handler,     nullptr };
++    static const httpd_uri_t kSettingsPost = { "/api/settings",  HTTP_POST, settings_post_handler,    nullptr };
++    if (httpd_register_uri_handler(s_server, &kRoot)         != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kStatus)       != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kPairing)      != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kQrcode)       != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kSettingsGet)  != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kSettingsPost) != ESP_OK)
+     {
+         ESP_LOGW(TAG, "URI handler register failed");
+         esp_err_t stop_err = httpd_stop(s_server);
