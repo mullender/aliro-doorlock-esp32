@@ -5589,8 +5589,8 @@ test("phase 2 task 6: all dynamic text goes through textContent or input.value (
   assert.match(added, /el\.textContent=text/,
     "status text must be assigned via textContent");
   // Form values use input.value.
-  assert.match(added, /input\.value='#'\+hex\.toLowerCase\(\)/,
-    "RGB inputs must be populated via input.value");
+  assert.match(added, /input\.value='#'\+String\(v\)\.toLowerCase\(\)/,
+    "RGB inputs must be populated via input.value from the raw response value");
   assert.match(added, /input\.value=String\(v\)/,
     "number inputs must be populated via input.value");
 });
@@ -5693,6 +5693,192 @@ test("phase 2 task 6 runtime: populate rejects malformed response values", () =>
     assert.equal(phase2Task6ValidatePopulate(d), false,
       `must reject ${JSON.stringify(d)}`);
   }
+});
+
+// Phase 2 task 6 correction 1: extract the actual JS embedded in
+// kIndexHtml (after patch 0012) and execute it against a minimal
+// DOM + fetch mock to prove:
+//   1. populate rejects a "#00ff00" response value (leading # is a
+//      schema violation; the API emits bare six-hex only).
+//   2. A malformed JSON body from GET load surfaces as
+//      "Settings: invalid response." — NOT the generic
+//      "Settings load failed:" text.
+//   3. A malformed JSON body from POST save surfaces as
+//      "Settings: invalid response." — NOT the generic
+//      "Settings save failed:" text.
+
+function extractPhase2SettingsScript() {
+  // The kIndexHtml literal ends up as many "..." C++ string chunks
+  // joined by the compiler. To reconstruct the JS the browser will
+  // run, walk every added line in patch 0012 that lives inside the
+  // second <script>...</script> block and unquote it.
+  //
+  // Patch 0012 ADDS the entire settings <script> block; we cannot
+  // rely on context lines. Anchor the search on the added
+  // "<script>" and "</script>" markers.
+  const patch = phase2Task6PatchText();
+  const added = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1));
+  const openIdx = added.findIndex((line) => /^\s*"<script>"$/.test(line));
+  const closeIdx = added.findIndex((line, i) =>
+    i > openIdx && /^\s*"<\/script>"$/.test(line));
+  assert.ok(openIdx > 0 && closeIdx > openIdx,
+    "expected patch 0012 to add exactly one <script>...</script> block");
+  const bodyLines = added.slice(openIdx + 1, closeIdx);
+  const chunks = bodyLines.map((line) => {
+    const m = line.match(/^\s*"(.*)"\s*$/);
+    if (!m) return "";
+    let s = m[1];
+    // Unescape the C string escapes we actually emit.
+    s = s.replace(/\\\\/g, "\x00__BS__\x00");
+    s = s.replace(/\\"/g, '"');
+    s = s.replace(/\\n/g, "\n");
+    s = s.replace(/\\t/g, "\t");
+    s = s.replace(/\\u([0-9a-fA-F]{4})/g,
+      (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    s = s.replace(/\x00__BS__\x00/g, "\\");
+    return s;
+  });
+  return chunks.join("");
+}
+
+function runPhase2SettingsScript({ fetchImpl }) {
+  const script = extractPhase2SettingsScript();
+  const inputIds = [
+    "s-auto_relock_seconds", "s-success_rgb", "s-success_ms",
+    "s-failure_rgb", "s-failure_ms", "s-other_rgb", "s-other_ms",
+  ];
+  const elements = new Map();
+  for (const id of inputIds) {
+    elements.set(id, { id, value: "", style: {} });
+  }
+  const statusEl = { id: "settings-status", textContent: "", style: {} };
+  elements.set("settings-status", statusEl);
+  let submitHandler = null;
+  const formEl = {
+    id: "settings-form",
+    addEventListener(ev, h) { if (ev === "submit") submitHandler = h; },
+    reportValidity: () => true,
+  };
+  elements.set("settings-form", formEl);
+  const doc = {
+    readyState: "complete",
+    getElementById(id) { return elements.get(id) || null; },
+    addEventListener() {},
+  };
+  const runner = new Function("document", "fetch", "URLSearchParams", "console", script);
+  runner(doc, fetchImpl, URLSearchParams, console);
+  async function submit() {
+    // Ensure valid inputs so form-side validation passes.
+    elements.get("s-auto_relock_seconds").value = "5";
+    elements.get("s-success_ms").value = "1000";
+    elements.get("s-failure_ms").value = "1000";
+    elements.get("s-other_ms").value = "1000";
+    elements.get("s-success_rgb").value = "#00ff00";
+    elements.get("s-failure_rgb").value = "#ff0000";
+    elements.get("s-other_rgb").value = "#0000ff";
+    submitHandler({ preventDefault() {} });
+    // Drain microtasks + one macrotask so promise chains settle.
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  async function settle() {
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  return { elements, statusEl, submit, settle };
+}
+
+test("phase 2 task 6 correction 1: embedded populate rejects a '#00ff00' response value", async () => {
+  const badResponse = {
+    auto_relock_seconds: 5,
+    success_rgb: "#00ff00", // leading '#' is a schema violation
+    success_ms: 1000,
+    failure_rgb: "ff0000",
+    failure_ms: 1000,
+    other_rgb: "0000ff",
+    other_ms: 1000,
+  };
+  const { statusEl, settle } = runPhase2SettingsScript({
+    fetchImpl: async () => ({ ok: true, json: async () => badResponse }),
+  });
+  await settle();
+  assert.equal(statusEl.textContent, "Settings: invalid response.",
+    `expected 'Settings: invalid response.', got ${JSON.stringify(statusEl.textContent)}`);
+});
+
+test("phase 2 task 6 correction 1: embedded load classifies malformed JSON as invalid response", async () => {
+  const { statusEl, settle } = runPhase2SettingsScript({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => { throw new SyntaxError("Unexpected end of JSON input"); },
+    }),
+  });
+  await settle();
+  assert.equal(statusEl.textContent, "Settings: invalid response.",
+    `expected 'Settings: invalid response.' on malformed GET, got ${JSON.stringify(statusEl.textContent)}`);
+});
+
+test("phase 2 task 6 correction 1: embedded save classifies malformed JSON as invalid response", async () => {
+  // GET first returns a valid response so populate succeeds and the
+  // form is wired up; POST then returns malformed JSON.
+  const validResponse = {
+    auto_relock_seconds: 5,
+    success_rgb: "00ff00",
+    success_ms: 1000,
+    failure_rgb: "ff0000",
+    failure_ms: 1000,
+    other_rgb: "0000ff",
+    other_ms: 1000,
+  };
+  let call = 0;
+  const { statusEl, submit } = runPhase2SettingsScript({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) {
+        return { ok: true, json: async () => validResponse };
+      }
+      return {
+        ok: true,
+        json: async () => { throw new SyntaxError("Unexpected end of JSON input"); },
+      };
+    },
+  });
+  await submit();
+  assert.equal(statusEl.textContent, "Settings: invalid response.",
+    `expected 'Settings: invalid response.' on malformed POST, got ${JSON.stringify(statusEl.textContent)}`);
+});
+
+test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and adds SyntaxError classification", () => {
+  const patch = phase2Task6PatchText();
+  // populate no longer strips a leading '#' from the response.
+  const populateFrag = patch.match(
+    /"var populate=function\(data\)\{"[\s\S]*?"return true;"/,
+  );
+  assert.ok(populateFrag, "must find the embedded populate function");
+  assert.doesNotMatch(populateFrag[0], /replace\(\/\^#\/,''\)/,
+    "populate must no longer strip a leading '#' from response RGB values");
+  assert.match(populateFrag[0], /if\(!isSixHex\(v\)\)/,
+    "populate must validate the raw RGB value with isSixHex");
+  // Submit still strips '#' before POSTing (color input value is '#RRGGBB').
+  assert.match(patch,
+    /"var hex=String\(val\)\.replace\(\/\^#\/,''\);"/,
+    "submit must still strip a leading '#' before POSTing");
+  // Both load and save translate SyntaxError to invalid-response.
+  const invalidJsonBranches = (patch.match(
+    /if\(err&&err\.name==='SyntaxError'\)\{setStatus\('Settings: invalid response\.',true\);\}/g,
+  ) || []).length;
+  assert.equal(invalidJsonBranches, 2,
+    "both load and save catch blocks must map SyntaxError to the invalid-response text");
+  // Both fetch chains wrap r.json() with a tag-as-SyntaxError catch.
+  const jsonWrapCount = (patch.match(
+    /"return r\.json\(\)\.catch\(function\(\)\{var e=new Error\('invalid_json'\);e\.name='SyntaxError';throw e;\}\);"/g,
+  ) || []).length;
+  assert.equal(jsonWrapCount, 2,
+    "both load and save must wrap r.json() to tag the parse error as SyntaxError");
 });
 
 test("phase 2 task 5 correction 1: patch 0011 mirrors the OWS-then-semicolon rule in C++", () => {

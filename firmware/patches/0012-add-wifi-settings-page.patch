@@ -18,17 +18,23 @@ Scope:
     /api/settings on load and populates the form via
     input.value only. populate rejects malformed numeric values
     (auto_relock_seconds must be an integer in 0..3600; each
-    *_ms must be an integer in 0..10000; each *_rgb must be
-    exactly six hex chars) before reporting loaded or saved.
-    On submit, native form.reportValidity() runs first, then
-    each of the seven inputs is re-validated in JS; any missing
-    or out-of-range value surfaces a clear error and returns
-    without a POST, so every POST body contains all seven
-    valid values. The POST is application/x-www-form-urlencoded
-    (URLSearchParams), RGB stripped of the leading '#'. Every
-    status message uses textContent; no dynamic innerHTML is
-    introduced. /api/settings is added to the machine-endpoint
-    list. Existing QR rendering and error paths are unchanged.
+    *_ms must be an integer in 0..10000) before reporting
+    loaded or saved, and rejects any RGB value that is not
+    exactly six hex chars — a leading '#' in the response is a
+    schema violation and is refused (form submit still strips
+    '#' from the color input's value before POSTing). A
+    malformed JSON body from either GET load or POST save
+    surfaces as 'Settings: invalid response.' rather than the
+    generic load/save network failure text. On submit, native
+    form.reportValidity() runs first, then each of the seven
+    inputs is re-validated in JS; any missing or out-of-range
+    value surfaces a clear error and returns without a POST, so
+    every POST body contains all seven valid values. The POST
+    is application/x-www-form-urlencoded (URLSearchParams), RGB
+    stripped of the leading '#'. Every status message uses
+    textContent; no dynamic innerHTML is introduced.
+    /api/settings is added to the machine-endpoint list.
+    Existing QR rendering and error paths are unchanged.
 
 Explicit non-goals for this patch: no settings backend change,
 no second store, no cJSON, no external asset or network
@@ -81,7 +87,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
      "<li><a href=\"/qrcode.js\"><code>/qrcode.js</code></a> "
      "(local MIT-licensed QR generator, gzip-encoded)</li>"
      "</ul>"
-@@ -154,6 +187,112 @@
+@@ -154,6 +187,122 @@
      "}else{render();}"
      "})();"
      "</script>"
@@ -112,9 +118,11 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    "var input=document.getElementById('s-'+k);"
 +    "if(!input){setStatus('Settings: invalid response.',true);return false;}"
 +    "if(isRgbKey(k)){"
-+    "var hex=typeof v==='string'?v.replace(/^#/,''):'';"
-+    "if(!isSixHex(hex)){setStatus('Settings: invalid response.',true);return false;}"
-+    "input.value='#'+hex.toLowerCase();"
++    // Response RGB must be exactly six hex chars. Do NOT strip a
++    // leading '#' — the /api/settings JSON emits bare six-hex, and
++    // a '#RRGGBB' value in the response is a schema violation.
++    "if(!isSixHex(v)){setStatus('Settings: invalid response.',true);return false;}"
++    "input.value='#'+String(v).toLowerCase();"
 +    "}else{"
 +    "var lim=INT_LIMITS[k];"
 +    "if(!lim||!isIntInRange(v,lim[0],lim[1])){"
@@ -129,11 +137,16 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    "setStatus('Loading settings\\u2026');"
 +    "fetch('/api/settings').then(function(r){"
 +    "if(!r.ok)throw new Error('HTTP '+r.status);"
-+    "return r.json();"
++    // A malformed JSON body is a schema violation, not a network
++    // failure. r.json() rejects with a SyntaxError; tag it so the
++    // catch below classifies it as invalid-response instead of the
++    // generic 'load failed' text.
++    "return r.json().catch(function(){var e=new Error('invalid_json');e.name='SyntaxError';throw e;});"
 +    "}).then(function(d){"
 +    "if(populate(d))setStatus('Settings loaded.');"
 +    "}).catch(function(err){"
-+    "setStatus('Settings load failed: '+err.message,true);"
++    "if(err&&err.name==='SyntaxError'){setStatus('Settings: invalid response.',true);}"
++    "else{setStatus('Settings load failed: '+err.message,true);}"
 +    "});"
 +    "};"
 +    "var submit=function(ev){"
@@ -173,11 +186,14 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    "body:params.toString()"
 +    "}).then(function(r){"
 +    "if(!r.ok)throw new Error('HTTP '+r.status);"
-+    "return r.json();"
++    // Same classification as load: a malformed response body is
++    // 'invalid response', not a network failure.
++    "return r.json().catch(function(){var e=new Error('invalid_json');e.name='SyntaxError';throw e;});"
 +    "}).then(function(d){"
 +    "if(populate(d))setStatus('Settings saved.');"
 +    "}).catch(function(err){"
-+    "setStatus('Settings save failed: '+err.message,true);"
++    "if(err&&err.name==='SyntaxError'){setStatus('Settings: invalid response.',true);}"
++    "else{setStatus('Settings save failed: '+err.message,true);}"
 +    "});"
 +    "};"
 +    "var wire=function(){"
