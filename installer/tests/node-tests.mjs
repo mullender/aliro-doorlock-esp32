@@ -5424,6 +5424,277 @@ test("phase 2 task 5 correction 1: Content-Type validation rejects space-suffix 
   }
 });
 
+// Phase 2 task 6: local settings page.
+// Patch 0012 extends the Wi-Fi variants' root page with a settings
+// form and JS that GETs /api/settings on load and POSTs
+// application/x-www-form-urlencoded on submit. Backend is unchanged.
+// Thread stays completely excluded.
+
+const PHASE2_TASK6_PATCH = "firmware/patches/0012-add-wifi-settings-page.patch";
+
+function phase2Task6PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE2_TASK6_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 6: patch 0012 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_TASK6_PATCH),
+      `${id}.source_patches must include ${PHASE2_TASK6_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_TASK6_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only settings-page patch");
+  const patch = phase2Task6PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 6: patch 0012 keeps scope inside examples/door_lock/main/ only (one file)", () => {
+  const patch = phase2Task6PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  for (const p of modifiedPaths) {
+    assert.match(p, /^examples\/door_lock\/main\//,
+      `patch must only touch examples/door_lock/main/; got ${p}`);
+  }
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_local_web.cpp",
+  ]));
+});
+
+test("phase 2 task 6: patch 0012 adds seven form fields with correct types and native limits", () => {
+  const patch = phase2Task6PatchText();
+  // Number inputs: auto_relock_seconds 0..3600, each *_ms 0..10000.
+  assert.match(patch,
+    /id=\\"s-auto_relock_seconds\\"[^>]*type=\\"number\\"[^>]*min=\\"0\\"[^>]*max=\\"3600\\"/,
+    "auto_relock_seconds must be a number input with min 0 and max 3600");
+  for (const k of ["success_ms", "failure_ms", "other_ms"]) {
+    const re = new RegExp(
+      `id=\\\\"s-${k}\\\\"[^>]*type=\\\\"number\\\\"[^>]*min=\\\\"0\\\\"[^>]*max=\\\\"10000\\\\"`);
+    assert.match(patch, re,
+      `${k} must be a number input with min 0 and max 10000`);
+  }
+  // Color inputs for RGB.
+  for (const k of ["success_rgb", "failure_rgb", "other_rgb"]) {
+    const re = new RegExp(`id=\\\\"s-${k}\\\\"[^>]*type=\\\\"color\\\\"`);
+    assert.match(patch, re, `${k} must be a color input`);
+  }
+  // Every field is required.
+  const requireCount = (patch.match(/required/g) || []).length;
+  assert.ok(requireCount >= 7,
+    "all seven form fields must carry the required attribute");
+});
+
+test("phase 2 task 6: /api/settings is added to the machine-endpoint list", () => {
+  const patch = phase2Task6PatchText();
+  assert.match(patch,
+    /<a href=\\"\/api\/settings\\">/,
+    "settings endpoint must be linked from the endpoint list");
+});
+
+test("phase 2 task 6: JS loads settings and POSTs form-urlencoded with response.ok required", () => {
+  const patch = phase2Task6PatchText();
+  // GET on load.
+  assert.ok(patch.includes("fetch('/api/settings')"),
+    "load path must fetch /api/settings");
+  assert.match(patch, /if\(!r\.ok\)throw new Error\('HTTP '\+r\.status\)/,
+    "load path must require response.ok");
+  // POST body via URLSearchParams.
+  assert.match(patch, /new URLSearchParams\(\)/,
+    "POST must build the body via URLSearchParams");
+  assert.match(patch,
+    /'Content-Type':'application\/x-www-form-urlencoded'/,
+    "POST must send application/x-www-form-urlencoded Content-Type");
+  assert.match(patch, /method:'POST'/,
+    "POST route must use HTTP POST");
+  // Both fetch chains require response.ok (two occurrences).
+  const okChecks = (patch.match(/if\(!r\.ok\)throw new Error\('HTTP '\+r\.status\)/g) || []).length;
+  assert.equal(okChecks, 2,
+    "both load and save must require response.ok before parsing JSON");
+});
+
+test("phase 2 task 6: populate validates numeric + rgb response fields before reporting success", () => {
+  const patch = phase2Task6PatchText();
+  // The per-key limits table exists.
+  assert.match(patch, /INT_LIMITS\s*=\s*\{/,
+    "populate must key off an INT_LIMITS table");
+  assert.match(patch, /auto_relock_seconds:\[0,3600\]/,
+    "auto_relock_seconds limit must be [0, 3600]");
+  for (const k of ["success_ms", "failure_ms", "other_ms"]) {
+    const re = new RegExp(`${k}:\\[0,10000\\]`);
+    assert.match(patch, re, `${k} limit must be [0, 10000]`);
+  }
+  // Integer/range check function present.
+  assert.match(patch,
+    /isIntInRange\s*=\s*function\s*\(\s*v\s*,\s*lo\s*,\s*hi\s*\)/,
+    "populate must define isIntInRange for numeric checks");
+  assert.match(patch,
+    /Math\.floor\(v\)===v/,
+    "isIntInRange must require an integer (Math.floor(v)===v)");
+  // Six-hex validation for RGB.
+  assert.match(patch, /\/\^\[0-9a-f\]\{6\}\$\/i/,
+    "populate must validate RGB as six hex chars");
+  // Populate returns invalid response error on failure.
+  const populateMatches = patch.match(/setStatus\('Settings: invalid response\.',true\)/g) || [];
+  assert.ok(populateMatches.length >= 3,
+    "populate must call setStatus('Settings: invalid response.', true) on every validation failure path");
+});
+
+test("phase 2 task 6: submit validates every field before POSTing and reports missing/out-of-range", () => {
+  const patch = phase2Task6PatchText();
+  // form.reportValidity() is invoked (native constraint validation).
+  assert.match(patch, /form\.reportValidity\s*&&\s*!\s*form\.reportValidity\s*\(\s*\)/,
+    "submit must preserve native form validation via form.reportValidity()");
+  // Explicit JS checks per field: required and range.
+  assert.match(patch, /'Settings not saved: '\+k\+' is required\.'/,
+    "submit must surface a 'required' error when a value is empty");
+  assert.match(patch, /'Settings not saved: '\+k\+' out of range\.'/,
+    "submit must surface an 'out of range' error when a value fails isIntInRange");
+  assert.match(patch, /'Settings not saved: invalid '\+k\+'\.'/,
+    "submit must surface an 'invalid' error when an RGB value fails the hex check");
+  // These branches return WITHOUT fetching /api/settings. The
+  // string literal in kIndexHtml is concatenated left-to-right,
+  // so ordering in the raw patch text reflects JS execution order
+  // inside the submit handler.
+  const submitOpen = patch.indexOf("var submit=function(ev)");
+  assert.ok(submitOpen > 0, "must find the submit handler declaration");
+  // Every "Settings not saved" branch and the "Saving settings" +
+  // fetch call sit inside the submit body — search the tail from
+  // submitOpen only.
+  const submitTail = patch.slice(submitOpen);
+  const savingIdx = submitTail.indexOf("Saving settings");
+  const fetchIdx = submitTail.indexOf("fetch('/api/settings'");
+  const firstNotSavedIdx = submitTail.indexOf("Settings not saved");
+  assert.ok(firstNotSavedIdx > 0,
+    "submit must include at least one 'Settings not saved' branch");
+  assert.ok(fetchIdx > firstNotSavedIdx,
+    "the 'Settings not saved' branches must appear BEFORE the fetch call");
+  assert.ok(savingIdx > firstNotSavedIdx && savingIdx < fetchIdx,
+    "'Saving settings' must be emitted only after every validation branch has returned");
+});
+
+test("phase 2 task 6: all dynamic text goes through textContent or input.value (no dynamic innerHTML)", () => {
+  const patch = phase2Task6PatchText();
+  // Extract only the added lines from patch 0012 (avoid mismatching
+  // context lines that carry the QR code's inner innerHTML assignment
+  // preserved from patch 0010).
+  const added = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .join("\n");
+  // No innerHTML assignment in the settings JS.
+  assert.doesNotMatch(added, /\binnerHTML\s*=/,
+    "patch 0012 must not introduce any innerHTML assignment");
+  // Status updates use textContent.
+  assert.match(added, /el\.textContent=text/,
+    "status text must be assigned via textContent");
+  // Form values use input.value.
+  assert.match(added, /input\.value='#'\+hex\.toLowerCase\(\)/,
+    "RGB inputs must be populated via input.value");
+  assert.match(added, /input\.value=String\(v\)/,
+    "number inputs must be populated via input.value");
+});
+
+test("phase 2 task 6: patch 0012 introduces no forbidden subsystem or new runtime dependency", () => {
+  const patch = phase2Task6PatchText();
+  const addedLines = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  const forbidden = [
+    { name: "cJSON runtime dependency",  pattern: /#include\s+["<]cJSON\.h[">]|cJSON_/ },
+    { name: "external URL / CDN",        pattern: /["'](https?:\/\/|\/\/)[^"']*["']/ },
+    { name: "external script src",       pattern: /<script[^>]*src\s*=\s*['"]https?:\/\// },
+    { name: "OTA route",                 pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "reset route",               pattern: /"\/(api\/)?factory(reset|-reset)?"|"\/api\/reset"/ },
+    { name: "reboot route",              pattern: /"\/(api\/)?reboot"|esp_restart\s*\(/ },
+    { name: "logs endpoint",             pattern: /"\/(api\/)?logs"|esp_log_set_vprintf/ },
+    { name: "HTTP Basic/Bearer auth",    pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate/ },
+    { name: "second settings store",     pattern: /nvs_open\s*\(\s*"aliro_settings"/ },
+    { name: "partition table change",    pattern: /partitions\.csv|CONFIG_PARTITION_TABLE_/ },
+    { name: "second settings JSON path", pattern: /AliroSettingsSerializedSetApply|AliroSettingsApply\b/ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0012 must not introduce ${name}`);
+  }
+});
+
+// Runtime tests: mirror the browser-side logic and exercise it
+// against handcrafted responses. These do not run the C++ handlers;
+// they run the JS the patch injects, checked against the intended
+// input/output contract.
+
+function phase2Task6ValidatePopulate(data) {
+  const INT_LIMITS = {
+    auto_relock_seconds: [0, 3600],
+    success_ms: [0, 10000],
+    failure_ms: [0, 10000],
+    other_ms: [0, 10000],
+  };
+  const KEYS = ["auto_relock_seconds","success_rgb","success_ms",
+                "failure_rgb","failure_ms","other_rgb","other_ms"];
+  const isSixHex = (s) => typeof s === "string" && /^[0-9a-f]{6}$/i.test(s);
+  const isIntInRange = (v, lo, hi) =>
+    typeof v === "number" && Number.isFinite(v) && Math.floor(v) === v && v >= lo && v <= hi;
+  if (!data || typeof data !== "object") return false;
+  for (const k of KEYS) {
+    const v = data[k];
+    if (k.endsWith("_rgb")) {
+      const hex = typeof v === "string" ? v.replace(/^#/, "") : "";
+      if (!isSixHex(hex)) return false;
+    } else {
+      const lim = INT_LIMITS[k];
+      if (!lim || !isIntInRange(v, lim[0], lim[1])) return false;
+    }
+  }
+  return true;
+}
+
+test("phase 2 task 6 runtime: populate accepts every well-formed response", () => {
+  const good = [
+    { auto_relock_seconds: 5,   success_rgb: "00ff00", success_ms: 1000,
+      failure_rgb: "ff0000", failure_ms: 1000, other_rgb: "0000ff", other_ms: 1000 },
+    { auto_relock_seconds: 3600, success_rgb: "FFFFFF", success_ms: 0,
+      failure_rgb: "000000", failure_ms: 10000, other_rgb: "AbCdEf", other_ms: 5000 },
+    // API emits lowercase hex without '#'; JSON strings around it are fine.
+    { auto_relock_seconds: 0,   success_rgb: "abcdef", success_ms: 250,
+      failure_rgb: "123456", failure_ms: 750, other_rgb: "789abc", other_ms: 10000 },
+  ];
+  for (const d of good) {
+    assert.equal(phase2Task6ValidatePopulate(d), true,
+      `must accept ${JSON.stringify(d)}`);
+  }
+});
+
+test("phase 2 task 6 runtime: populate rejects malformed response values", () => {
+  const base = { auto_relock_seconds: 5, success_rgb: "00ff00", success_ms: 1000,
+                 failure_rgb: "ff0000", failure_ms: 1000, other_rgb: "0000ff", other_ms: 1000 };
+  const bad = [
+    { ...base, auto_relock_seconds: -1 },       // below range
+    { ...base, auto_relock_seconds: 3601 },     // above range
+    { ...base, auto_relock_seconds: 5.5 },      // non-integer
+    { ...base, auto_relock_seconds: "5" },      // string, not number
+    { ...base, success_ms: 10001 },             // above range
+    { ...base, failure_ms: -1 },                // below range
+    { ...base, other_ms: NaN },                 // NaN
+    { ...base, other_ms: Infinity },            // infinite
+    { ...base, success_rgb: "GG0000" },         // non-hex
+    { ...base, failure_rgb: "12345" },          // too short
+    { ...base, other_rgb: "1234567" },          // too long
+    { ...base, other_rgb: 0 },                  // wrong type
+    null,
+    "not-an-object",
+    {},                                          // missing keys
+    { ...base, auto_relock_seconds: undefined }, // missing key
+  ];
+  for (const d of bad) {
+    assert.equal(phase2Task6ValidatePopulate(d), false,
+      `must reject ${JSON.stringify(d)}`);
+  }
+});
+
 test("phase 2 task 5 correction 1: patch 0011 mirrors the OWS-then-semicolon rule in C++", () => {
   const patch = phase2Task5PatchText();
   const handlerMatch = patch.match(

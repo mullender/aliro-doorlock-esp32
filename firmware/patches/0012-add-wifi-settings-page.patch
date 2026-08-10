@@ -1,0 +1,196 @@
+Extend the Wi-Fi variants' local trusted-LAN root page with a
+small settings form for the seven values already accepted by
+GET/POST /api/settings from patch 0011. Applied only to
+nanoc6-wifi and atoms3-lite-wifi via variants.json;
+nanoc6-thread never applies, compiles, links, or serves any of
+this.
+
+Scope:
+  * MODIFY main/aliro_local_web.cpp: extend kIndexHtml with a
+    <form id="settings-form"> that carries seven inputs — one
+    number input per timing value with the existing 0..3600
+    (auto_relock_seconds) and 0..10000 (*_ms) limits, and one
+    color input per RGB field (success/failure/other). A new
+    #settings-status element carries the loading / success /
+    HTTP-error / invalid-response / network-error text. A new
+    <script> block, separate from the existing QR IIFE so a
+    settings bug cannot break QR rendering, fetches
+    /api/settings on load and populates the form via
+    input.value only. populate rejects malformed numeric values
+    (auto_relock_seconds must be an integer in 0..3600; each
+    *_ms must be an integer in 0..10000; each *_rgb must be
+    exactly six hex chars) before reporting loaded or saved.
+    On submit, native form.reportValidity() runs first, then
+    each of the seven inputs is re-validated in JS; any missing
+    or out-of-range value surfaces a clear error and returns
+    without a POST, so every POST body contains all seven
+    valid values. The POST is application/x-www-form-urlencoded
+    (URLSearchParams), RGB stripped of the leading '#'. Every
+    status message uses textContent; no dynamic innerHTML is
+    introduced. /api/settings is added to the machine-endpoint
+    list. Existing QR rendering and error paths are unchanged.
+
+Explicit non-goals for this patch: no settings backend change,
+no second store, no cJSON, no external asset or network
+request, no logs, no OTA, no reset or reboot, no partition
+change.
+
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+--- a/examples/door_lock/main/aliro_local_web.cpp
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -105,9 +105,42 @@
+     "<p><span class=\"manual\" id=\"manual\">&mdash;</span></p>"
+     "<h2>MT payload</h2>"
+     "<p><code id=\"mt\">&mdash;</code></p>"
++    "<h2>Update settings</h2>"
++    "<form id=\"settings-form\">"
++    "<p>"
++    "<label for=\"s-auto_relock_seconds\">Auto-relock seconds (0&ndash;3600)</label><br>"
++    "<input id=\"s-auto_relock_seconds\" name=\"auto_relock_seconds\" type=\"number\" "
++    "min=\"0\" max=\"3600\" step=\"1\" required inputmode=\"numeric\">"
++    "</p>"
++    "<p>"
++    "<label for=\"s-success_rgb\">Success LED color</label> "
++    "<input id=\"s-success_rgb\" name=\"success_rgb\" type=\"color\" required> "
++    "<label for=\"s-success_ms\">duration (ms, 0&ndash;10000)</label> "
++    "<input id=\"s-success_ms\" name=\"success_ms\" type=\"number\" "
++    "min=\"0\" max=\"10000\" step=\"1\" required inputmode=\"numeric\">"
++    "</p>"
++    "<p>"
++    "<label for=\"s-failure_rgb\">Failure LED color</label> "
++    "<input id=\"s-failure_rgb\" name=\"failure_rgb\" type=\"color\" required> "
++    "<label for=\"s-failure_ms\">duration (ms, 0&ndash;10000)</label> "
++    "<input id=\"s-failure_ms\" name=\"failure_ms\" type=\"number\" "
++    "min=\"0\" max=\"10000\" step=\"1\" required inputmode=\"numeric\">"
++    "</p>"
++    "<p>"
++    "<label for=\"s-other_rgb\">Other-tag LED color</label> "
++    "<input id=\"s-other_rgb\" name=\"other_rgb\" type=\"color\" required> "
++    "<label for=\"s-other_ms\">duration (ms, 0&ndash;10000)</label> "
++    "<input id=\"s-other_ms\" name=\"other_ms\" type=\"number\" "
++    "min=\"0\" max=\"10000\" step=\"1\" required inputmode=\"numeric\">"
++    "</p>"
++    "<p><button type=\"submit\" id=\"settings-submit\">Save settings</button></p>"
++    "</form>"
++    "<p id=\"settings-status\" role=\"status\" aria-live=\"polite\"></p>"
+     "<h2>Machine endpoints</h2><ul>"
+     "<li><a href=\"/api/status\"><code>/api/status</code></a></li>"
+     "<li><a href=\"/api/pairing\"><code>/api/pairing</code></a></li>"
++    "<li><a href=\"/api/settings\"><code>/api/settings</code></a> "
++    "(GET and POST application/x-www-form-urlencoded)</li>"
+     "<li><a href=\"/qrcode.js\"><code>/qrcode.js</code></a> "
+     "(local MIT-licensed QR generator, gzip-encoded)</li>"
+     "</ul>"
+@@ -154,6 +187,112 @@
+     "}else{render();}"
+     "})();"
+     "</script>"
++    "<script>"
++    "(function(){"
++    "var KEYS=['auto_relock_seconds','success_rgb','success_ms',"
++    "'failure_rgb','failure_ms','other_rgb','other_ms'];"
++    "var INT_LIMITS={"
++    "auto_relock_seconds:[0,3600],"
++    "success_ms:[0,10000],"
++    "failure_ms:[0,10000],"
++    "other_ms:[0,10000]"
++    "};"
++    "var isRgbKey=function(k){return k.slice(-4)==='_rgb';};"
++    "var isSixHex=function(s){return typeof s==='string'&&/^[0-9a-f]{6}$/i.test(s);};"
++    "var isIntInRange=function(v,lo,hi){"
++    "return typeof v==='number'&&isFinite(v)&&Math.floor(v)===v&&v>=lo&&v<=hi;"
++    "};"
++    "var setStatus=function(text,isError){"
++    "var el=document.getElementById('settings-status');"
++    "el.textContent=text;"
++    "el.style.color=isError?'#a11':'';"
++    "};"
++    "var populate=function(data){"
++    "if(!data||typeof data!=='object'){setStatus('Settings: invalid response.',true);return false;}"
++    "for(var i=0;i<KEYS.length;i++){"
++    "var k=KEYS[i];var v=data[k];"
++    "var input=document.getElementById('s-'+k);"
++    "if(!input){setStatus('Settings: invalid response.',true);return false;}"
++    "if(isRgbKey(k)){"
++    "var hex=typeof v==='string'?v.replace(/^#/,''):'';"
++    "if(!isSixHex(hex)){setStatus('Settings: invalid response.',true);return false;}"
++    "input.value='#'+hex.toLowerCase();"
++    "}else{"
++    "var lim=INT_LIMITS[k];"
++    "if(!lim||!isIntInRange(v,lim[0],lim[1])){"
++    "setStatus('Settings: invalid response.',true);return false;"
++    "}"
++    "input.value=String(v);"
++    "}"
++    "}"
++    "return true;"
++    "};"
++    "var load=function(){"
++    "setStatus('Loading settings\\u2026');"
++    "fetch('/api/settings').then(function(r){"
++    "if(!r.ok)throw new Error('HTTP '+r.status);"
++    "return r.json();"
++    "}).then(function(d){"
++    "if(populate(d))setStatus('Settings loaded.');"
++    "}).catch(function(err){"
++    "setStatus('Settings load failed: '+err.message,true);"
++    "});"
++    "};"
++    "var submit=function(ev){"
++    "ev.preventDefault();"
++    "var form=document.getElementById('settings-form');"
++    // Native constraint validation runs first: honours the number
++    // input min/max and required attributes.
++    "if(form.reportValidity&&!form.reportValidity()){"
++    "setStatus('Settings not saved: fix the highlighted fields.',true);return;"
++    "}"
++    "var params=new URLSearchParams();"
++    "for(var i=0;i<KEYS.length;i++){"
++    "var k=KEYS[i];"
++    "var input=document.getElementById('s-'+k);"
++    "if(!input){setStatus('Settings not saved: form field missing.',true);return;}"
++    "var val=input.value;"
++    "if(isRgbKey(k)){"
++    "var hex=String(val).replace(/^#/,'');"
++    "if(!isSixHex(hex)){setStatus('Settings not saved: invalid '+k+'.',true);return;}"
++    "params.append(k,hex);"
++    "}else{"
++    "if(val===''||val===null){"
++    "setStatus('Settings not saved: '+k+' is required.',true);return;"
++    "}"
++    "var n=Number(val);"
++    "var lim=INT_LIMITS[k];"
++    "if(!lim||!isIntInRange(n,lim[0],lim[1])){"
++    "setStatus('Settings not saved: '+k+' out of range.',true);return;"
++    "}"
++    "params.append(k,String(n));"
++    "}"
++    "}"
++    "setStatus('Saving settings\\u2026');"
++    "fetch('/api/settings',{"
++    "method:'POST',"
++    "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
++    "body:params.toString()"
++    "}).then(function(r){"
++    "if(!r.ok)throw new Error('HTTP '+r.status);"
++    "return r.json();"
++    "}).then(function(d){"
++    "if(populate(d))setStatus('Settings saved.');"
++    "}).catch(function(err){"
++    "setStatus('Settings save failed: '+err.message,true);"
++    "});"
++    "};"
++    "var wire=function(){"
++    "var form=document.getElementById('settings-form');"
++    "if(!form){return;}"
++    "form.addEventListener('submit',submit);"
++    "load();"
++    "};"
++    "if(document.readyState==='loading'){"
++    "document.addEventListener('DOMContentLoaded',wire);"
++    "}else{wire();}"
++    "})();"
++    "</script>"
+     "</html>";
+
+ // Embedded local QR generator asset (installer/vendor/qrcode.js,
