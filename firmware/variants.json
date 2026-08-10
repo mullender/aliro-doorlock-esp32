@@ -76,7 +76,8 @@
         "firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch",
         "firmware/patches/0006-add-aliro-settings.patch",
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
-        "firmware/patches/0008-generalize-board-pins.patch"
+        "firmware/patches/0008-generalize-board-pins.patch",
+        "firmware/patches/0009-add-wifi-local-web.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -125,7 +126,8 @@
         "firmware/patches/0004-wire-aliro-ecp-and-generic-tags.patch",
         "firmware/patches/0006-add-aliro-settings.patch",
         "firmware/patches/0007-toggle-lock-on-aliro-tap.patch",
-        "firmware/patches/0008-generalize-board-pins.patch"
+        "firmware/patches/0008-generalize-board-pins.patch",
+        "firmware/patches/0009-add-wifi-local-web.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"

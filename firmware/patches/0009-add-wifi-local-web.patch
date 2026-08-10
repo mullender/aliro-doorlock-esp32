@@ -1,0 +1,418 @@
+Add a trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
+door-lock reader firmware.
+
+This patch is applied only to the Wi-Fi variants (nanoc6-wifi and
+atoms3-lite-wifi); the Thread variant never applies, compiles, links
+or starts any of the code introduced here.
+
+Scope:
+  * new main/aliro_local_web.h and main/aliro_local_web.cpp implementing
+    a native esp_http_server on the Matter Wi-Fi station;
+  * three read-only routes: GET /, GET /api/status, GET /api/pairing;
+  * server lifecycle tied to IP_EVENT_STA_GOT_IP / _LOST_IP and
+    WIFI_EVENT_STA_DISCONNECTED so it is only up while the station has
+    a valid assigned IP; failure is logged and swallowed;
+  * one call from app_main() that registers the lifecycle handler after
+    Matter start.
+
+Explicit non-goals for this patch: no Arduino runtime, no LittleFS,
+no captive AP, no TLS/SSL, no authentication, no compiled-in Wi-Fi
+credentials, no settings / logs / reboot / factory-reset / OTA /
+WebSocket endpoints. Trusted-LAN HTTP is intentional.
+
+diff --git a/examples/door_lock/main/aliro_local_web.h b/examples/door_lock/main/aliro_local_web.h
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_local_web.h
+@@ -0,0 +1,34 @@
++/*
++   Trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
++   door-lock reader firmware.
++
++   The interface is intentionally minimal: bind one esp_event handler
++   to the Matter Wi-Fi station lifecycle and start / stop a native
++   esp_http_server accordingly. This header is only present in Wi-Fi
++   variants; the Thread variant never sees or links to it.
++*/
++
++#pragma once
++
++#include <esp_err.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++   Register the HTTP server's start / stop callbacks against the Matter
++   Wi-Fi station lifecycle.
++
++   Start:  IP_EVENT_STA_GOT_IP           (server up on port 80).
++   Stop:   IP_EVENT_STA_LOST_IP          (assigned IP is gone).
++           WIFI_EVENT_STA_DISCONNECTED   (link is down).
++
++   Return non-ESP_OK if the esp_event handler could not be registered;
++   the caller must treat that as non-fatal to Matter and Aliro.
++*/
++esp_err_t aliro_local_web_bind_wifi_lifecycle(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/main/aliro_local_web.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_local_web.cpp
+@@ -0,0 +1,330 @@
++/*
++   Trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
++   door-lock reader firmware.
++
++   Scope, and only this scope:
++     * native ESP-IDF `esp_http_server` on the Matter Wi-Fi station;
++     * three read-only routes: GET /, GET /api/status, GET /api/pairing;
++     * lifecycle bound to IP_EVENT_STA_GOT_IP / _LOST_IP and
++       WIFI_EVENT_STA_DISCONNECTED so the server is up only when the
++       station has a valid assigned IP;
++     * failure is logged and swallowed; Matter and Aliro must keep
++       running regardless.
++
++   Explicit non-goals for this task:
++     * no Arduino runtime, no LittleFS, no captive AP, no TLS/SSL, no
++       authentication, no compiled-in Wi-Fi credentials;
++     * no settings / logs / reboot / factory-reset / OTA / WebSocket
++       endpoints (those belong to a later, separately-audited task).
++
++   Trusted-LAN HTTP is intentional: the server is only reachable while
++   the device sits on the same Wi-Fi as its owner, and it exposes only
++   information that is already advertised on the Matter fabric.
++*/
++
++#include "aliro_local_web.h"
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <esp_app_desc.h>
++#include <esp_event.h>
++#include <esp_http_server.h>
++#include <esp_log.h>
++#include <esp_netif.h>
++#include <esp_wifi.h>
++
++#include <lib/support/Span.h>
++#include <setup_payload/OnboardingCodesUtil.h>
++#include <setup_payload/SetupPayload.h>
++
++#ifndef ALIRO_VARIANT_ID
++#define ALIRO_VARIANT_ID "unknown"
++#endif
++#ifndef ALIRO_TRANSPORT_ID
++#define ALIRO_TRANSPORT_ID "unknown"
++#endif
++
++namespace {
++
++const char * const TAG = "aliro_web";
++
++httpd_handle_t s_server = nullptr;
++
++// Small text page. Deliberately no visual QR rendering — that lands
++// in a later task. Everything is a literal so nothing dynamic is
++// interpolated into the HTML.
++const char kIndexHtml[] =
++    "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"/>"
++    "<title>Aliro door lock</title>"
++    "<style>body{font-family:system-ui,sans-serif;max-width:36rem;"
++    "margin:2rem auto;padding:1rem;line-height:1.5}"
++    "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
++    "word-break:break-all}h1{font-size:1.3rem}"
++    "ul{padding-left:1.25rem}</style>"
++    "<h1>Aliro door lock &mdash; local status</h1>"
++    "<p>This device serves a trusted-LAN HTTP endpoint on your Wi-Fi. "
++    "There is no authentication. Do not expose this device to the "
++    "public internet.</p>"
++    "<h2>Machine endpoints</h2><ul>"
++    "<li><a href=\"/api/status\"><code>/api/status</code></a> &mdash; "
++    "variant, transport, project version, hostname, station IP, link.</li>"
++    "<li><a href=\"/api/pairing\"><code>/api/pairing</code></a> &mdash; "
++    "current Matter QR payload and manual pairing code.</li>"
++    "</ul></html>";
++
++// Append one JSON-escaped string into a bounded buffer. Returns the
++// updated write position, never exceeding `cap - 1`; the caller
++// terminates. Every code point below 0x20 is emitted as \uXXXX, so
++// binary data cannot break out of the string.
++size_t append_json_string(char * out, size_t cap, size_t pos, const char * s)
++{
++    auto put = [&](char c) {
++        if (pos + 1 < cap) {
++            out[pos++] = c;
++        }
++    };
++    put('"');
++    for (const char * p = s; *p != '\0'; ++p)
++    {
++        unsigned char c = static_cast<unsigned char>(*p);
++        switch (c)
++        {
++        case '"':  put('\\'); put('"'); break;
++        case '\\': put('\\'); put('\\'); break;
++        case '\b': put('\\'); put('b'); break;
++        case '\f': put('\\'); put('f'); break;
++        case '\n': put('\\'); put('n'); break;
++        case '\r': put('\\'); put('r'); break;
++        case '\t': put('\\'); put('t'); break;
++        default:
++            if (c < 0x20)
++            {
++                char esc[8];
++                int n = snprintf(esc, sizeof(esc), "\\u%04x", c);
++                for (int i = 0; i < n; ++i) put(esc[i]);
++            }
++            else
++            {
++                put(c);
++            }
++        }
++    }
++    put('"');
++    return pos;
++}
++
++size_t append_literal(char * out, size_t cap, size_t pos, const char * s)
++{
++    for (const char * p = s; *p != '\0'; ++p)
++    {
++        if (pos + 1 < cap) out[pos++] = *p;
++    }
++    return pos;
++}
++
++// Best-effort hostname + IP lookup for the Matter Wi-Fi station netif.
++void current_hostname(char * out, size_t cap)
++{
++    const char * h = nullptr;
++    esp_netif_t * sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
++    if (sta != nullptr && esp_netif_get_hostname(sta, &h) == ESP_OK && h != nullptr)
++    {
++        snprintf(out, cap, "%s", h);
++        return;
++    }
++    snprintf(out, cap, "unknown");
++}
++
++bool current_station_ip(char * out, size_t cap)
++{
++    esp_netif_t * sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
++    if (sta == nullptr) return false;
++    esp_netif_ip_info_t info;
++    if (esp_netif_get_ip_info(sta, &info) != ESP_OK) return false;
++    if (info.ip.addr == 0) return false;
++    snprintf(out, cap, IPSTR, IP2STR(&info.ip));
++    return true;
++}
++
++// ---- Route handlers ----
++
++esp_err_t root_get_handler(httpd_req_t * req)
++{
++    httpd_resp_set_type(req, "text/html; charset=utf-8");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, kIndexHtml, HTTPD_RESP_USE_STRLEN);
++}
++
++esp_err_t status_get_handler(httpd_req_t * req)
++{
++    char host[64] = { 0 };
++    char ip[32]   = { 0 };
++    bool have_ip  = current_station_ip(ip, sizeof(ip));
++    current_hostname(host, sizeof(host));
++
++    const esp_app_desc_t * app = esp_app_get_description();
++    const char * version = (app != nullptr && app->version[0] != '\0') ? app->version : "";
++
++    char body[512];
++    size_t pos = 0;
++    pos = append_literal(body, sizeof(body), pos, "{");
++    pos = append_json_string(body, sizeof(body), pos, "variant");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, ALIRO_VARIANT_ID);
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "transport");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, ALIRO_TRANSPORT_ID);
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "project_version");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, version);
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "hostname");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, host);
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "station_ip");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, have_ip ? ip : "");
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "link_up");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_literal(body, sizeof(body), pos, have_ip ? "true" : "false");
++    pos = append_literal(body, sizeof(body), pos, "}");
++
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, body, pos);
++}
++
++esp_err_t pairing_get_handler(httpd_req_t * req)
++{
++    chip::RendezvousInformationFlags flags(chip::RendezvousInformationFlag::kBLE);
++    char qr[128]     = { 0 };
++    char manual[32]  = { 0 };
++    chip::MutableCharSpan qrSpan(qr);
++    chip::MutableCharSpan manualSpan(manual);
++
++    CHIP_ERROR qr_err     = GetQRCode(qrSpan, flags);
++    CHIP_ERROR manual_err = GetManualPairingCode(manualSpan, flags);
++    if (qr_err != CHIP_NO_ERROR || manual_err != CHIP_NO_ERROR)
++    {
++        httpd_resp_set_status(req, "503 Service Unavailable");
++        httpd_resp_set_type(req, "application/json");
++        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++        return httpd_resp_send(req, "{\"error\":\"pairing_unavailable\"}",
++                               HTTPD_RESP_USE_STRLEN);
++    }
++
++    // Copy the spans into locally-null-terminated buffers before we
++    // JSON-encode them; the spans themselves are not null-terminated.
++    char qr_out[130];
++    char manual_out[34];
++    size_t qr_len = qrSpan.size();
++    if (qr_len >= sizeof(qr_out)) qr_len = sizeof(qr_out) - 1;
++    memcpy(qr_out, qrSpan.data(), qr_len);
++    qr_out[qr_len] = '\0';
++    size_t manual_len = manualSpan.size();
++    if (manual_len >= sizeof(manual_out)) manual_len = sizeof(manual_out) - 1;
++    memcpy(manual_out, manualSpan.data(), manual_len);
++    manual_out[manual_len] = '\0';
++
++    char body[256];
++    size_t pos = 0;
++    pos = append_literal(body, sizeof(body), pos, "{");
++    pos = append_json_string(body, sizeof(body), pos, "qr");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, qr_out);
++    pos = append_literal(body, sizeof(body), pos, ",");
++    pos = append_json_string(body, sizeof(body), pos, "manual_code");
++    pos = append_literal(body, sizeof(body), pos, ":");
++    pos = append_json_string(body, sizeof(body), pos, manual_out);
++    pos = append_literal(body, sizeof(body), pos, "}");
++
++    httpd_resp_set_type(req, "application/json");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, body, pos);
++}
++
++// ---- Server lifecycle ----
++
++esp_err_t start_server(void)
++{
++    if (s_server != nullptr) return ESP_OK;
++
++    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
++    cfg.max_uri_handlers = 3;
++    cfg.max_open_sockets = 4;
++    cfg.stack_size       = 6144;
++    cfg.lru_purge_enable = true;
++
++    esp_err_t err = httpd_start(&s_server, &cfg);
++    if (err != ESP_OK)
++    {
++        ESP_LOGW(TAG, "httpd_start failed: %s", esp_err_to_name(err));
++        s_server = nullptr;
++        return err;
++    }
++
++    static const httpd_uri_t kRoot    = { "/",             HTTP_GET, root_get_handler,    nullptr };
++    static const httpd_uri_t kStatus  = { "/api/status",   HTTP_GET, status_get_handler,  nullptr };
++    static const httpd_uri_t kPairing = { "/api/pairing",  HTTP_GET, pairing_get_handler, nullptr };
++    if (httpd_register_uri_handler(s_server, &kRoot)    != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kStatus)  != ESP_OK ||
++        httpd_register_uri_handler(s_server, &kPairing) != ESP_OK)
++    {
++        ESP_LOGW(TAG, "URI handler register failed");
++        httpd_stop(s_server);
++        s_server = nullptr;
++        return ESP_FAIL;
++    }
++
++    ESP_LOGI(TAG, "aliro-web listening on port 80");
++    return ESP_OK;
++}
++
++void stop_server(void)
++{
++    if (s_server == nullptr) return;
++    httpd_stop(s_server);
++    s_server = nullptr;
++    ESP_LOGI(TAG, "aliro-web stopped");
++}
++
++void wifi_lifecycle_handler(void * /*ctx*/, esp_event_base_t base, int32_t id, void * /*data*/)
++{
++    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
++    {
++        (void) start_server();
++    }
++    else if ((base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) ||
++             (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED))
++    {
++        stop_server();
++    }
++}
++
++} // namespace
++
++extern "C" esp_err_t aliro_local_web_bind_wifi_lifecycle(void)
++{
++    esp_err_t err = esp_event_handler_instance_register(
++        IP_EVENT, ESP_EVENT_ANY_ID, &wifi_lifecycle_handler, nullptr, nullptr);
++    if (err != ESP_OK)
++    {
++        ESP_LOGW(TAG, "IP_EVENT register failed: %s", esp_err_to_name(err));
++        return err;
++    }
++    err = esp_event_handler_instance_register(
++        WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
++        &wifi_lifecycle_handler, nullptr, nullptr);
++    if (err != ESP_OK)
++    {
++        ESP_LOGW(TAG, "WIFI_EVENT register failed: %s", esp_err_to_name(err));
++        return err;
++    }
++    return ESP_OK;
++}
+diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
+--- a/examples/door_lock/main/app_main.cpp
++++ b/examples/door_lock/main/app_main.cpp
+@@ -29,6 +29,8 @@
+ #include <aliro_door_lock_delegate.h>
+ #endif
+ 
++#include "aliro_local_web.h"
++
+ static const char *TAG = "app_main";
+ uint16_t door_lock_endpoint_id = 0;
+ 
+@@ -211,6 +213,9 @@
+     /* do nothing now */
+     door_lock_init();
+ 
++    /* Trusted-LAN HTTP foundation (Wi-Fi variants only). Non-fatal on error. */
++    aliro_local_web_bind_wifi_lifecycle();
++
+ #if CONFIG_ENABLE_ENCRYPTED_OTA
+     err = esp_matter_ota_requestor_encrypted_init(s_decryption_key, s_decryption_key_len);
+     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialized the encrypted OTA, err: %d", err));

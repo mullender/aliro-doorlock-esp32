@@ -4578,6 +4578,147 @@ test("installer page keeps connection at the top and logs at the bottom", () => 
   assert.ok(serialLog < footer);
 });
 
+// Phase 2 task 1: Wi-Fi-only HTTP foundation.
+// Patch 0009 is applied ONLY to nanoc6-wifi and atoms3-lite-wifi; the
+// Thread variant never applies, compiles, links, or starts any web
+// code. These tests lock the patch scope, the route / lifecycle
+// contract, and the forbidden-subsystem list.
+
+const PHASE2_PATCH = "firmware/patches/0009-add-wifi-local-web.patch";
+
+function phase2VariantsJson() {
+  return JSON.parse(
+    readFileSync(new URL("../../firmware/variants.json", import.meta.url), "utf8"),
+  );
+}
+
+function phase2PatchText() {
+  return readFileSync(new URL(`../../${PHASE2_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 1: patch 0009 is wired to exactly the two Wi-Fi variants; Thread is excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_PATCH),
+      `${id}.source_patches must include ${PHASE2_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only web patch");
+  // Sanity: the patch file exists on disk.
+  const patch = phase2PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 1: patch 0009 uses native esp_http_server and declares the three routes", () => {
+  const patch = phase2PatchText();
+  // Native ESP-IDF HTTP server include.
+  assert.match(patch, /#include\s+<esp_http_server\.h>/,
+    "patch must include native <esp_http_server.h>");
+  // Route strings.
+  for (const route of ["\"/\"", "\"/api/status\"", "\"/api/pairing\""]) {
+    assert.ok(patch.includes(route),
+      `patch must declare an httpd_uri_t for route ${route}`);
+  }
+  assert.match(patch, /httpd_register_uri_handler/,
+    "patch must register URI handlers with httpd_register_uri_handler");
+  assert.match(patch, /HTTP_GET/, "the three routes must be GET-only");
+  assert.doesNotMatch(patch, /\bHTTP_(POST|PUT|DELETE|PATCH)\b/,
+    "no non-GET routes allowed in this task");
+});
+
+test("phase 2 task 1: patch 0009 obtains pairing codes from OnboardingCodesUtil via BLE rendezvous", () => {
+  const patch = phase2PatchText();
+  assert.match(patch, /#include\s+<setup_payload\/OnboardingCodesUtil\.h>/,
+    "patch must include the OnboardingCodesUtil header");
+  assert.match(patch, /RendezvousInformationFlag::kBLE/,
+    "pairing must use BLE rendezvous flags");
+  assert.match(patch, /GetQRCode\s*\(/,
+    "patch must call GetQRCode()");
+  assert.match(patch, /GetManualPairingCode\s*\(/,
+    "patch must call GetManualPairingCode()");
+});
+
+test("phase 2 task 1: patch 0009 ties the HTTP server lifecycle to the Matter Wi-Fi station IP", () => {
+  const patch = phase2PatchText();
+  assert.match(patch, /IP_EVENT_STA_GOT_IP/,
+    "server start must key on IP_EVENT_STA_GOT_IP");
+  assert.match(patch, /(IP_EVENT_STA_LOST_IP|WIFI_EVENT_STA_DISCONNECTED)/,
+    "server stop must key on LOST_IP or DISCONNECTED");
+  assert.match(patch, /esp_event_handler_instance_register/,
+    "lifecycle must go through esp_event_handler_instance_register");
+  assert.match(patch, /aliro_local_web_bind_wifi_lifecycle/,
+    "patch must export the one-shot bind entry point");
+  // The bind must be non-fatal: the code paths must swallow errors,
+  // and the app_main hunk must not ABORT_APP_ON_FAILURE around the
+  // call.
+  const bindHunk = patch.split("app_main.cpp").pop();
+  assert.match(bindHunk, /aliro_local_web_bind_wifi_lifecycle\(\)/,
+    "app_main hunk must call the bind function");
+  assert.doesNotMatch(bindHunk, /ABORT_APP_ON_FAILURE[^\n]*aliro_local_web/,
+    "the bind call must NOT abort the app on failure");
+});
+
+test("phase 2 task 1: patch 0009 has no forbidden subsystems", () => {
+  // The commentary at the top of the patch (and the source comment
+  // block it introduces) lists the non-goals in prose. Strip prose
+  // and only look for tokens on `+` diff lines so we do not
+  // false-positive on the very list of forbidden things.
+  const addedLines = phase2PatchText().split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    // Drop C++ single-line and block-body comment lines so the
+    // annotated non-goal list in aliro_local_web.cpp does not match.
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  const forbidden = [
+    { name: "Arduino runtime",           pattern: /#include\s+<Arduino\.h>|ArduinoOTA|WiFiClient\.h/ },
+    { name: "LittleFS",                  pattern: /<LittleFS\.h>|<esp_littlefs\.h>|LittleFS::/ },
+    { name: "captive-portal AP",         pattern: /esp_wifi_set_mode\s*\(\s*WIFI_MODE_AP|WIFI_IF_AP|softAP|dns_server_start/ },
+    { name: "TLS/SSL server",            pattern: /esp_https_server|httpd_ssl_start|mbedtls_ssl_/ },
+    { name: "HTTP Basic/Bearer auth",    pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate/ },
+    { name: "WebSocket",                 pattern: /HTTPD_WS_|is_websocket|Sec-WebSocket|handle_ws_req|httpd_ws_/ },
+    { name: "OTA route",                 pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "factory-reset route",       pattern: /"\/(api\/)?factory(reset|-reset)?"|esp_matter::factory_reset/ },
+    { name: "reboot route",              pattern: /"\/(api\/)?reboot"|esp_restart\s*\(/ },
+    { name: "settings mutation route",   pattern: /"\/(api\/)?settings"/ },
+    { name: "logs endpoint",             pattern: /"\/(api\/)?logs"|esp_log_set_vprintf/ },
+    { name: "compiled Wi-Fi creds",      pattern: /CONFIG_WIFI_SSID|CONFIG_WIFI_PASSWORD|wifi_config_t\.sta\.ssid\s*=/ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0009 must not introduce ${name}`);
+  }
+});
+
+test("phase 2 task 1: patch 0009 keeps scope inside examples/door_lock/main/ only", () => {
+  const patch = phase2PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  for (const p of modifiedPaths) {
+    assert.match(p, /^examples\/door_lock\/main\//,
+      `patch must only touch examples/door_lock/main/; got ${p}`);
+  }
+  // Exactly three touched files: new .h, new .cpp, one modified .cpp.
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_local_web.h",
+    "examples/door_lock/main/aliro_local_web.cpp",
+    "examples/door_lock/main/app_main.cpp",
+  ]));
+});
+
+test("phase 2 task 1: patch 0009 escapes JSON strings and bounds output buffers", () => {
+  const patch = phase2PatchText();
+  // Every value we emit passes through append_json_string, and the
+  // helper handles control characters via \uXXXX.
+  assert.match(patch, /append_json_string/,
+    "patch must funnel string values through append_json_string");
+  assert.match(patch, /\\\\u%04x/,
+    "append_json_string must escape control bytes as \\uXXXX");
+  // HTML page is a compile-time literal — no dynamic interpolation.
+  assert.match(patch, /kIndexHtml\[\]\s*=/,
+    "the HTML page must be a static const array");
+});
+
 // The update-dialog guard reaches into ESP Web Tools' private DOM. It is
 // pinned to PR 733 commit cf6936234a6a37a5028bd2e39eca899bed8a0cd9. This
 // invariant test locks the vendor source contract (manifestPath forwarding,
