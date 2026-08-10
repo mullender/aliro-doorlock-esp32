@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -2192,6 +2196,190 @@ test("build_release.sh forwards VARIANT_PROJECT_NAME to idf.py and rejects the p
   // The validator must require the CMake CLI setup and the project() rewrite.
   assert.match(script, /set\(CLI_ALIRO_PROJECT_NAME "aliro-nanoc6-thread"\)/);
   assert.match(script, /project\(\$\{CLI_ALIRO_PROJECT_NAME\}\)/);
+});
+
+// --- prepare_release.sh fixture tests ---
+// These build a synthetic ESP-IDF build/ directory (fake
+// project_description.json, flasher_args.json, partition table, and app
+// binary) and check that the script accepts the valid combination and
+// refuses each specific bad case. No real toolchain is invoked; the
+// script exits before esptool.py runs for every negative test.
+
+function makeFixtureBuild({
+  projectName = "aliro-nanoc6-thread",
+  projectVersion = "0.0.6-devkit",
+  chip = "esp32c6",
+  appBin = "aliro-nanoc6-thread.bin",
+  partitionBytes = null, // if null, use 0xC00 zero bytes (will not match approved hash)
+  omitProjectDescription = false,
+  omitFlasherArgs = false,
+} = {}) {
+  const root = mkdtempSync(path.join(tmpdir(), "prep-fixture-"));
+  const build = path.join(root, "build");
+  mkdirSync(path.join(build, "partition_table"), { recursive: true });
+  mkdirSync(path.join(build, "bootloader"), { recursive: true });
+  writeFileSync(
+    path.join(build, "partition_table/partition-table.bin"),
+    partitionBytes || Buffer.alloc(0xC00),
+  );
+  writeFileSync(path.join(build, "bootloader/bootloader.bin"), Buffer.alloc(0x8000, 66));
+  writeFileSync(path.join(build, appBin), Buffer.alloc(0x10000, 65));
+  if (!omitProjectDescription) {
+    writeFileSync(
+      path.join(build, "project_description.json"),
+      JSON.stringify({
+        project_name: projectName,
+        project_version: projectVersion,
+        app_bin: appBin,
+      }),
+    );
+  }
+  if (!omitFlasherArgs) {
+    writeFileSync(
+      path.join(build, "flasher_args.json"),
+      JSON.stringify({
+        extra_esptool_args: { chip },
+        flash_files: {
+          "0x0": "bootloader/bootloader.bin",
+          "0xC000": "partition_table/partition-table.bin",
+          "0x20000": appBin,
+        },
+      }),
+    );
+  }
+  return { root, build };
+}
+
+function runPrepare({ variant, tag, buildDir }) {
+  const scriptPath = new URL("../../scripts/prepare_release.sh", import.meta.url).pathname;
+  try {
+    const stdout = execFileSync("bash", [
+      scriptPath,
+      "--variant", variant,
+      "--tag", tag,
+      "--build-dir", buildDir,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      timeout: 15000,
+    });
+    return { status: 0, stdout, stderr: "" };
+  } catch (error) {
+    return {
+      status: typeof error.status === "number" ? error.status : -1,
+      stdout: error.stdout?.toString() || "",
+      stderr: error.stderr?.toString() || String(error),
+    };
+  }
+}
+
+test("prepare_release.sh rejects a wrong project_name", () => {
+  const { root, build } = makeFixtureBuild({ projectName: "door_lock" });
+  try {
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /project_name is 'door_lock'.*aliro-nanoc6-thread/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("prepare_release.sh rejects a wrong project_version", () => {
+  const { root, build } = makeFixtureBuild({ projectVersion: "0.0.5-devkit" });
+  try {
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /project_version is '0\.0\.5-devkit'.*0\.0\.6-devkit/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("prepare_release.sh rejects a wrong chip", () => {
+  const { root, build } = makeFixtureBuild({ chip: "esp32s3" });
+  try {
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /build chip is 'esp32s3'.*esp32c6/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("prepare_release.sh fails closed when the approved partition hash is null", () => {
+  // atoms3-lite-wifi variants.json has partition_table_sha256=null.
+  const { root, build } = makeFixtureBuild({
+    projectName: "aliro-atoms3-lite-wifi",
+    projectVersion: "0.0.6-devkit",
+    chip: "esp32s3",
+    appBin: "aliro-atoms3-lite-wifi.bin",
+  });
+  try {
+    const result = runPrepare({
+      variant: "atoms3-lite-wifi",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /no approved partition_table_sha256/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("prepare_release.sh rejects a partition-table SHA-256 mismatch", () => {
+  const { root, build } = makeFixtureBuild({
+    partitionBytes: Buffer.alloc(0xC00, 0x00), // hashes to a known non-approved value
+  });
+  try {
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not the approved layout for nanoc6-thread/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("prepare_release.sh valid path passes every fail-closed check before esptool", () => {
+  // Construct a partition-table blob whose SHA-256 matches the approved hash for
+  // nanoc6-thread. Since we do not have the real partition table available in
+  // the repo tree, we forge a placeholder file, patch variants.json to point at
+  // its actual hash, package, then restore variants.json. This proves the
+  // check is exercised, not that the placeholder is a real ESP32-C6 layout.
+  const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
+  const originalVariants = readFileSync(variantsPath, "utf8");
+  const { root, build } = makeFixtureBuild();
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+  const forgedHash = createHash("sha256").update(partitionBytes).digest("hex");
+  const patched = JSON.parse(originalVariants);
+  patched.variants["nanoc6-thread"].partition_table_sha256 = forgedHash;
+  writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+  try {
+    const result = runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+    });
+    // The script gets past every fail-closed check and only fails when it
+    // tries to invoke esptool.py (which is not on this test host). That is
+    // proof the valid path reached asset assembly.
+    if (result.status === 0) {
+      // If esptool is present, packaging succeeds.
+      assert.match(result.stdout, /Release artifacts for variant nanoc6-thread/);
+    } else {
+      assert.match(result.stderr, /esptool\.py not on PATH|merge_bin|IDF_PATH/);
+    }
+  } finally {
+    writeFileSync(variantsPath, originalVariants);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("README and installer link to each other", () => {
