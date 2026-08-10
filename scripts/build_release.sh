@@ -281,6 +281,150 @@ for SOURCE_PATCH in "${SOURCE_PATCHES[@]}"; do
   fi
 done
 
+validate_variant_transport_exclusivity() {
+  # Every variant must ship a transport that is mutually exclusive with the
+  # other transport in its overlay + base sdkconfig, and no variant may
+  # enable Improv (Matter commissioning runs over BLE, then Wi-Fi/Thread).
+  local overlay_source="$OVERLAY"
+  local base_source
+  if [[ "$VARIANT_BASE_SDKCONFIG_SOURCE" != "upstream" ]]; then
+    base_source="$REPO_ROOT/$VARIANT_BASE_SDKCONFIG_SOURCE"
+  else
+    base_source="$APP_DIR/$VARIANT_BASE_SDKCONFIG"
+  fi
+  if [[ ! -f "$overlay_source" ]]; then
+    echo "error: overlay $overlay_source not readable" >&2
+    return 2
+  fi
+  if [[ ! -f "$base_source" ]]; then
+    echo "error: base sdkconfig $base_source not readable" >&2
+    return 2
+  fi
+
+  # Effective config = base then overlay. Compute the last set value for
+  # each transport key so an overlay override wins.
+  local effective_wifi
+  local effective_thread
+  local effective_improv
+  effective_wifi="$(cat "$base_source" "$overlay_source" |
+    awk -F= '/^CONFIG_ENABLE_WIFI_STATION=/ {v=$2} END{print v}')"
+  effective_thread="$(cat "$base_source" "$overlay_source" |
+    awk -F= '/^CONFIG_OPENTHREAD_ENABLED=/ {v=$2} END{print v}')"
+  effective_improv="$(cat "$base_source" "$overlay_source" |
+    awk -F= '/^CONFIG_(IMPROV_|.*_IMPROV_).*=/ {v=$2} END{print v}')"
+
+  case "$VARIANT_TRANSPORT" in
+    thread)
+      if [[ "$effective_thread" != "y" ]]; then
+        echo "error: variant $VARIANT_ID declares transport=thread but OpenThread is not enabled" >&2
+        return 2
+      fi
+      if [[ "$effective_wifi" == "y" ]]; then
+        echo "error: variant $VARIANT_ID declares transport=thread but Wi-Fi station is also enabled" >&2
+        return 2
+      fi
+      ;;
+    wifi)
+      if [[ "$effective_wifi" != "y" ]]; then
+        echo "error: variant $VARIANT_ID declares transport=wifi but Wi-Fi station is not enabled" >&2
+        return 2
+      fi
+      if [[ "$effective_thread" == "y" ]]; then
+        echo "error: variant $VARIANT_ID declares transport=wifi but OpenThread is also enabled" >&2
+        return 2
+      fi
+      ;;
+    *)
+      echo "error: variant $VARIANT_ID has unknown transport '$VARIANT_TRANSPORT'" >&2
+      return 2
+      ;;
+  esac
+  if [[ "$effective_improv" == "y" ]]; then
+    echo "error: variant $VARIANT_ID must not enable an Improv wire (Matter commissioning is BLE-only)" >&2
+    return 2
+  fi
+  echo "=== Transport exclusivity ($VARIANT_ID): $VARIANT_TRANSPORT-only, no Improv ==="
+}
+
+validate_variant_board_map() {
+  # Cross-check the selected variant's rgb_data_gpio, rgb_power_gpio, and
+  # has_rgb_power_pin against the ALIRO_BOARD_* macros in the chosen board
+  # header. A drift in either half would silently mis-drive the AtomS3
+  # Lite pin during a future build.
+  if [[ -z "$VARIANT_BOARD_CONFIG_HEADER" ]]; then
+    echo "error: variant $VARIANT_ID has no board_config_header entry" >&2
+    return 2
+  fi
+  local header="$BOARD_CONFIG_HEADER"
+  if [[ ! -f "$header" ]]; then
+    echo "error: board header $header not readable" >&2
+    return 2
+  fi
+
+  local rgb_data_gpio
+  local has_power
+  local rgb_power_gpio
+  rgb_data_gpio="$(VARIANT_JSON="$VARIANT_JSON" python3 - <<'PY'
+import json, os
+entry = json.loads(os.environ["VARIANT_JSON"])
+print(entry.get("rgb_data_gpio", ""))
+PY
+)"
+  has_power="$(VARIANT_JSON="$VARIANT_JSON" python3 - <<'PY'
+import json, os
+entry = json.loads(os.environ["VARIANT_JSON"])
+print("1" if entry.get("has_rgb_power_pin", False) else "0")
+PY
+)"
+  rgb_power_gpio="$(VARIANT_JSON="$VARIANT_JSON" python3 - <<'PY'
+import json, os
+entry = json.loads(os.environ["VARIANT_JSON"])
+value = entry.get("rgb_power_gpio", None)
+print("" if value is None else str(value))
+PY
+)"
+
+  local header_data
+  local header_has_power
+  local header_power
+  header_data="$(awk '$1=="#define" && $2=="ALIRO_BOARD_RGB_DATA_GPIO" {print $3; exit}' "$header")"
+  header_has_power="$(awk '$1=="#define" && $2=="ALIRO_BOARD_HAS_RGB_POWER" {print $3; exit}' "$header")"
+  header_power="$(awk '$1=="#define" && $2=="ALIRO_BOARD_RGB_POWER_GPIO" {print $3; exit}' "$header")"
+
+  if [[ -z "$rgb_data_gpio" ]]; then
+    echo "error: variant $VARIANT_ID has no rgb_data_gpio in variants.json" >&2
+    return 2
+  fi
+  if [[ "$header_data" != "$rgb_data_gpio" ]]; then
+    echo "error: $VARIANT_ID variants.json rgb_data_gpio=$rgb_data_gpio, but $header defines ALIRO_BOARD_RGB_DATA_GPIO=$header_data" >&2
+    return 2
+  fi
+  if [[ "$header_has_power" != "$has_power" ]]; then
+    echo "error: $VARIANT_ID variants.json has_rgb_power_pin=$has_power, but $header defines ALIRO_BOARD_HAS_RGB_POWER=$header_has_power" >&2
+    return 2
+  fi
+  if [[ "$has_power" == "1" ]]; then
+    if [[ -z "$rgb_power_gpio" ]]; then
+      echo "error: $VARIANT_ID has_rgb_power_pin=true but rgb_power_gpio is null in variants.json" >&2
+      return 2
+    fi
+    if [[ "$header_power" != "$rgb_power_gpio" ]]; then
+      echo "error: $VARIANT_ID variants.json rgb_power_gpio=$rgb_power_gpio, but $header defines ALIRO_BOARD_RGB_POWER_GPIO=$header_power" >&2
+      return 2
+    fi
+  else
+    if [[ -n "$header_power" ]]; then
+      echo "error: $VARIANT_ID has no power pin but $header still defines ALIRO_BOARD_RGB_POWER_GPIO=$header_power" >&2
+      return 2
+    fi
+    if [[ -n "$rgb_power_gpio" ]]; then
+      echo "error: $VARIANT_ID has_rgb_power_pin=false but variants.json still lists rgb_power_gpio=$rgb_power_gpio" >&2
+      return 2
+    fi
+  fi
+  echo "=== Board map ($VARIANT_ID): data GPIO $header_data, power GPIO ${header_power:-none} match variants.json ==="
+}
+
 validate_aliro_feature_map() {
   local app_source="$APP_DIR/main/app_main.cpp"
   local feature_source="$ESP_MATTER_SRC/components/esp_matter/data_model/legacy/esp_matter_feature.cpp"
@@ -541,6 +685,8 @@ validate_aliro_tap_toggle() {
 validate_aliro_feature_map
 validate_aliro_settings
 validate_aliro_tap_toggle
+validate_variant_transport_exclusivity
+validate_variant_board_map
 
 if [[ "$SOURCE_CHECK_ONLY" == "1" ]]; then
   echo "=== Source patch check complete for variant $VARIANT_ID; idf.py was not run ==="

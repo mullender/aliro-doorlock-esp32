@@ -2040,6 +2040,111 @@ test("firmware source checks require conditional tap-to-lock behavior", () => {
   }
 });
 
+test("build_release.sh runs variant-only checks before the source-check early exit", () => {
+  const script = readFileSync(new URL("../../scripts/build_release.sh", import.meta.url), "utf8");
+
+  // The new variant-scoped validators must exist as functions in the script.
+  assert.match(script, /validate_variant_transport_exclusivity\(\) \{/);
+  assert.match(script, /validate_variant_board_map\(\) \{/);
+
+  // They must run BEFORE the SOURCE_CHECK_ONLY==1 early exit. Otherwise
+  // --source-check will keep letting a broken overlay or drifted board
+  // header through until a full idf.py build.
+  const transportCall = script.search(/^validate_variant_transport_exclusivity$/m);
+  const boardCall = script.search(/^validate_variant_board_map$/m);
+  const exitBlock = script.search(/if \[\[ "\$SOURCE_CHECK_ONLY" == "1" \]\]; then/);
+  assert.ok(transportCall > 0, "transport-exclusivity validator must be invoked");
+  assert.ok(boardCall > 0, "board-map validator must be invoked");
+  assert.ok(exitBlock > 0, "source-check early exit block must exist");
+  assert.ok(transportCall < exitBlock,
+    "transport-exclusivity validator must run before the --source-check exit");
+  assert.ok(boardCall < exitBlock,
+    "board-map validator must run before the --source-check exit");
+
+  // Full-build-only operations must stay after the source-check boundary
+  // so a source-check does not need idf.py or a network fetch.
+  const idfSetTarget = script.search(/^\s*set-target /m);
+  const idfBuild = script.search(/echo "=== build ==="/);
+  assert.ok(idfSetTarget > exitBlock, "idf.py set-target must stay after --source-check exit");
+  assert.ok(idfBuild > exitBlock, "idf.py build must stay after --source-check exit");
+});
+
+test("variants.json board pin fields match the selected board header", () => {
+  const rootUrl = (rel) => new URL(`../../${rel}`, import.meta.url);
+  const variants = JSON.parse(readFileSync(rootUrl("firmware/variants.json"), "utf8"));
+
+  function readMacro(header, name) {
+    const match = new RegExp(`^#define\\s+${name}\\s+(\\S+)`, "m").exec(header);
+    return match ? match[1] : null;
+  }
+
+  for (const [variantId, entry] of Object.entries(variants.variants || {})) {
+    const headerPath = entry.board_config_header;
+    assert.ok(headerPath, `variant ${variantId} must name a board_config_header`);
+    const header = readFileSync(rootUrl(headerPath), "utf8");
+
+    const dataGpio = readMacro(header, "ALIRO_BOARD_RGB_DATA_GPIO");
+    const hasPower = readMacro(header, "ALIRO_BOARD_HAS_RGB_POWER");
+    const powerGpio = readMacro(header, "ALIRO_BOARD_RGB_POWER_GPIO");
+
+    assert.equal(dataGpio, String(entry.rgb_data_gpio),
+      `${variantId}: variants.json rgb_data_gpio must match ${headerPath}`);
+    assert.equal(hasPower, entry.has_rgb_power_pin ? "1" : "0",
+      `${variantId}: variants.json has_rgb_power_pin must match ${headerPath}`);
+    if (entry.has_rgb_power_pin) {
+      assert.equal(powerGpio, String(entry.rgb_power_gpio),
+        `${variantId}: variants.json rgb_power_gpio must match ${headerPath}`);
+    } else {
+      assert.equal(powerGpio, null,
+        `${variantId}: board without a power pin must not define ALIRO_BOARD_RGB_POWER_GPIO`);
+      assert.equal(entry.rgb_power_gpio, null,
+        `${variantId}: variants.json rgb_power_gpio must be null when has_rgb_power_pin=false`);
+    }
+  }
+});
+
+test("variant overlays honor transport exclusivity and disable Improv", () => {
+  const rootUrl = (rel) => new URL(`../../${rel}`, import.meta.url);
+  const variants = JSON.parse(readFileSync(rootUrl("firmware/variants.json"), "utf8"));
+
+  function lastValue(text, key) {
+    const re = new RegExp(`^${key}\\s*=\\s*(\\S+)$`, "gm");
+    let value = null;
+    let match;
+    while ((match = re.exec(text)) !== null) value = match[1];
+    return value;
+  }
+
+  for (const [variantId, entry] of Object.entries(variants.variants || {})) {
+    const overlay = readFileSync(rootUrl(entry.release_overlay), "utf8");
+    let base;
+    if (entry.base_sdkconfig_source === "upstream") {
+      // Upstream base ships esp32c6.aliro with Thread on / Wi-Fi off.
+      // Encode the two settings the overlay may inherit.
+      base = "CONFIG_OPENTHREAD_ENABLED=y\nCONFIG_ENABLE_WIFI_STATION=n\n";
+    } else {
+      base = readFileSync(rootUrl(entry.base_sdkconfig_source), "utf8");
+    }
+    const effective = base + "\n" + overlay;
+    const wifi = lastValue(effective, "CONFIG_ENABLE_WIFI_STATION");
+    const thread = lastValue(effective, "CONFIG_OPENTHREAD_ENABLED");
+
+    if (entry.transport === "thread") {
+      assert.equal(thread, "y", `${variantId}: OpenThread must be enabled`);
+      assert.notEqual(wifi, "y", `${variantId}: Wi-Fi station must NOT be enabled for thread variant`);
+    } else if (entry.transport === "wifi") {
+      assert.equal(wifi, "y", `${variantId}: Wi-Fi station must be enabled`);
+      assert.notEqual(thread, "y", `${variantId}: OpenThread must NOT be enabled for wifi variant`);
+    } else {
+      assert.fail(`${variantId}: unknown transport ${entry.transport}`);
+    }
+    // No overlay may enable Improv. This is a lightweight check for any
+    // CONFIG symbol whose name contains IMPROV.
+    assert.doesNotMatch(overlay, /^CONFIG_.*IMPROV.*=y/m,
+      `${variantId}: overlay must not enable an Improv wire`);
+  }
+});
+
 test("README and installer link to each other", () => {
   const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
