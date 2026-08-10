@@ -115,10 +115,13 @@
 
 <h1>Aliro door-lock installer</h1>
 <p>
-  Flash the <strong>Aliro door-lock reader</strong> firmware to an
-  <strong>M5Stack NanoC6</strong> (or any compatible ESP32-C6 board) over
-  USB, then commission it into Apple Home, Google Home, or Home Assistant
-  as a Matter door-lock over Thread.
+  Flash the <strong>Aliro door-lock reader</strong> firmware to a
+  supported ESP32 board over USB, then commission it into Apple Home,
+  Google Home, or Home Assistant as a Matter door lock. The installer
+  ships three variants: M5Stack NanoC6 over Thread, M5Stack NanoC6 over
+  Wi-Fi, and M5Stack AtomS3 Lite over Wi-Fi. Thread variants need a
+  Thread border router on your LAN; Wi-Fi variants need a 2.4 GHz Wi-Fi
+  network the phone can also see.
 </p>
 
 <section class="hardware-card" aria-labelledby="hardware-heading">
@@ -330,13 +333,21 @@
 
 <h2>Before you start</h2>
 <ul>
-  <li>A USB-C data-capable cable and an M5 NanoC6 with the Unit NFC
-    (ST25R3916) attached over Grove.</li>
+  <li>A USB-C data-capable cable and one supported board with the Unit
+    NFC (ST25R3916) attached over Grove: an M5Stack NanoC6 for the
+    Thread or the Wi-Fi variant, or an M5Stack AtomS3 Lite for the
+    Wi-Fi variant.</li>
   <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
     Safari and Firefox do not support Web Serial.</li>
-  <li>A Thread border router on your LAN (Home Assistant + SkyConnect /
-    ZBT-1 / ZBT-2, Apple HomePod mini or second-generation HomePod, or
-    Google Nest Hub 2nd gen).</li>
+  <li>The Matter transport your chosen variant uses:
+    <ul>
+      <li>Thread variant: a Thread border router on your LAN
+        (Home Assistant + SkyConnect / ZBT-1 / ZBT-2, Apple HomePod mini
+        or second-generation HomePod, or Google Nest Hub 2nd gen).</li>
+      <li>Wi-Fi variant: a 2.4 GHz Wi-Fi network the phone that
+        commissions the lock can also reach.</li>
+    </ul>
+  </li>
   <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
 </ul>
 
@@ -347,20 +358,19 @@
     <span>Latest: <strong id="latest-version">Checking…</strong></span>
   </div>
   <p class="success-state" id="firmware-current" hidden>✓ Firmware is current</p>
-  <p id="update-reason">Connect the lock to compare its installed firmware with the latest release.</p>
+  <p id="update-reason">Connect the lock to see whether a preserving update is available.</p>
   <p>
-    Use this update only on a device that was previously installed from this
-    repository with the approved
-    <code>esp32c6-door-lock-4mb-v1</code> partition layout. If the device uses
-    a different layout, or if you are not certain, you must use Factory
-    install below.
+    A preserving update is offered only when the connected firmware reports
+    a supported variant and its matching Matter transport. The installer
+    picks the exact matching update package; a mismatch or an unknown
+    variant leaves the button off and Factory install is the only path.
   </p>
-  <p>This update always keeps Matter fabrics, Thread credentials, and Aliro
-    reader configuration. The installer forces the keep-setup choice in the
-    ESP Web Tools dialog.</p>
-  <div class="install-row" id="update-action">
+  <p>This update always keeps Matter fabrics, the Matter transport
+    credentials (Thread network keys or Wi-Fi credentials, depending on
+    the variant), and Aliro reader configuration. The installer forces
+    the keep-setup choice in the ESP Web Tools dialog.</p>
+  <div class="install-row" id="update-action" hidden>
     <esp-web-install-button
-      manifest="./manifest-update.json"
       id="update-button"
       data-install-mode="update"
       inert>
@@ -393,11 +403,25 @@
 <section class="install-card danger-card" aria-labelledby="factory-heading">
   <h2 id="factory-heading">Factory install — erase everything</h2>
   <p><strong>Use this for a first install or recovery.</strong> It erases the
-    entire flash. You will lose Matter fabrics, Thread credentials, and Aliro
-    reader configuration.</p>
+    entire flash. You will lose Matter fabrics, Matter transport
+    credentials, and Aliro reader configuration.</p>
+  <p>
+    <label for="factory-variant"><strong>Board and Matter transport</strong></label>
+  </p>
+  <p>
+    <select id="factory-variant" aria-describedby="factory-warning">
+      <option value="nanoc6-thread">M5Stack NanoC6 — Matter over Thread</option>
+      <option value="nanoc6-wifi">M5Stack NanoC6 — Matter over Wi-Fi</option>
+      <option value="atoms3-lite-wifi">M5Stack AtomS3 Lite — Matter over Wi-Fi</option>
+    </select>
+  </p>
+  <div class="warn" id="factory-warning" role="status" aria-live="polite">
+    Factory install erases the whole flash. Changing the board or the
+    Matter transport removes the current pairing; you must add the device
+    to your smart home again after the install.
+  </div>
   <div class="install-row">
     <esp-web-install-button
-      manifest="./manifest.json"
       id="factory-button"
       data-install-mode="factory"
       inert>
@@ -474,6 +498,8 @@ const flashMsgEl = document.getElementById("flash-msg");
 const devBannerEl = document.getElementById("dev-banner");
 const factoryButton = document.getElementById("factory-button");
 const updateButton = document.getElementById("update-button");
+const factoryVariantSelector = document.getElementById("factory-variant");
+const factoryWarning = document.getElementById("factory-warning");
 const setupFlow = createSetupFlow({
   elements: {
     pairing: pairingEl,
@@ -573,6 +599,8 @@ customElements.whenDefined("esp-web-install-button").then(() => {
     setupFlow,
     serialMonitor,
     deviceSettings,
+    factoryVariantSelector,
+    factoryWarning,
   });
 });
 

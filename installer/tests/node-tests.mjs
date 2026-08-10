@@ -113,6 +113,7 @@ class FakeInstallButton extends EventTarget {
   }
 
   getAttribute(name) { return this.attributes.get(name) ?? null; }
+  setAttribute(name, value) { this.attributes.set(name, String(value ?? "")); }
   removeAttribute(name) { this.attributes.delete(name); }
   querySelector(selector) { return selector === '[slot="activate"]' ? this.activator : null; }
 }
@@ -332,6 +333,11 @@ const VALID_STATUS = {
   other_rgb: "#0000ff",
   other_ms: 500,
 };
+
+// A modern device announces both fields explicitly. Tests that need the
+// preserving-update guard to admit the status (device-settings latest-
+// version fetch, controller enable path) use this fixture.
+const EXPLICIT_STATUS = { ...VALID_STATUS, variantExplicit: true, transportExplicit: true };
 
 class FakeSerial extends EventTarget {
   constructor(results, authorizedPorts = []) {
@@ -791,21 +797,40 @@ test("commissioned guidance maps services and combines Apple instructions", () =
   assert.match(elements.fabricList.innerHTML, /0x1384/);
 });
 
-test("installer buttons enable and clear their inert state", () => {
+test("factory button enables at boot; update button stays inert until STATUS is eligible", () => {
   const factoryButton = new FakeInstallButton();
   const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
   const setupFlow = {
     begin: () => new AbortController().signal,
     finish() {},
     finishPreservedUpdate() {},
   };
-  configureInstallButtons({ factoryButton, updateButton, setupFlow });
-  assert.equal(factoryButton.inert, false);
-  assert.equal(updateButton.inert, false);
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow,
+    serialMonitor,
+    attachDialogGuard: () => ({ disconnect() {} }),
+  });
+  assert.equal(factoryButton.inert, false, "factory button un-inerted at boot");
   assert.equal(factoryButton.activator.disabled, false);
-  assert.equal(updateButton.activator.disabled, false);
   assert.equal(factoryButton.getAttribute("inert"), null);
-  assert.equal(updateButton.getAttribute("inert"), null);
+  assert.equal(factoryButton.manifest, "manifest-nanoc6-thread.json",
+    "factory button gets the default variant's manifest");
+
+  assert.equal(updateButton.inert, true, "update button stays inert until STATUS");
+  assert.equal(updateButton.activator.disabled, true);
+  assert.equal(updateButton.getAttribute("inert"), "");
+  assert.equal(updateButton.manifest ?? null, null,
+    "update button starts with no usable manifest");
+
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: { ...EXPLICIT_STATUS, variant: "nanoc6-thread", transport: "thread" },
+  }));
+  assert.equal(updateButton.inert, false, "eligible STATUS un-inerts the update button");
+  assert.equal(updateButton.activator.disabled, false);
+  assert.equal(updateButton.manifest, "manifest-update-nanoc6-thread.json");
 });
 
 test("installer page starts install buttons disabled and inert", () => {
@@ -1340,26 +1365,31 @@ test("devkit versions compare after release-tag normalization", () => {
 test("device settings stay hidden until a valid status and confirm one SET line", async () => {
   const elements = fakeSettingsElements();
   const serialMonitor = new FakeProtocolMonitor();
+  const fetchCalls = [];
   const settings = createDeviceSettings({
     elements,
     serialMonitor,
-    fetchImpl: async () => ({
-      ok: true,
-      json: async () => ({ version: "aliro-c6-v0.0.4-devkit" }),
-    }),
+    fetchImpl: async (url) => {
+      fetchCalls.push(url);
+      return { ok: true, json: async () => ({ version: "aliro-c6-v0.0.4-devkit" }) };
+    },
   });
   await nextTask();
 
   assert.equal(elements.panel.hidden, true);
+  assert.deepEqual(fetchCalls, [], "no manifest fetch before identity is known");
   serialMonitor.dispatchEvent(new CustomEvent("serial-connected"));
   await nextTask();
   assert.deepEqual(serialMonitor.writes, ["ALIRO/1 GET"]);
-  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", { detail: VALID_STATUS }));
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", { detail: EXPLICIT_STATUS }));
+  await nextTask();
   assert.equal(elements.panel.hidden, false);
   assert.equal(elements.installed.textContent, "0.0.4-devkit");
   assert.equal(elements.latest.textContent, "0.0.4-devkit");
   assert.equal(elements.current.hidden, false);
   assert.equal(elements.updateAction.hidden, true);
+  assert.deepEqual(fetchCalls, ["manifest-update-nanoc6-thread.json"],
+    "device-settings fetches only the eligible variant's manifest");
 
   elements.autoLock.checked = false;
   elements.autoLock.dispatchEvent(new Event("change"));
@@ -1367,7 +1397,7 @@ test("device settings stay hidden until a valid status and confirm one SET line"
   await nextTask();
   assert.equal(serialMonitor.writes[1], "ALIRO/1 SET auto_relock_seconds=0");
   serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
-    detail: { ...VALID_STATUS, auto_relock_seconds: 0 },
+    detail: { ...EXPLICIT_STATUS, auto_relock_seconds: 0 },
   }));
   assert.equal(elements.result.textContent, "Settings saved.");
   assert.match(elements.result.className, /success/);
@@ -1397,8 +1427,9 @@ test("older or unknown latest firmware keeps the update action visible", async (
     });
     await nextTask();
     serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
-      detail: { ...VALID_STATUS, firmware: testCase.installed },
+      detail: { ...EXPLICIT_STATUS, firmware: testCase.installed },
     }));
+    await nextTask();
     assert.equal(elements.updateAction.hidden, false, testCase.installed);
     assert.match(elements.updateReason.textContent, testCase.reason, testCase.installed);
     settings.destroy();
@@ -1415,8 +1446,9 @@ test("newer installed firmware hides the downgrade action", async () => {
   });
   await nextTask();
   serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
-    detail: { ...VALID_STATUS, firmware: "0.0.5-devkit" },
+    detail: { ...EXPLICIT_STATUS, firmware: "0.0.5-devkit" },
   }));
+  await nextTask();
   assert.equal(elements.updateAction.hidden, true);
   assert.match(elements.current.textContent, /newer than the latest release/);
   settings.destroy();
@@ -3710,6 +3742,334 @@ test("firmware-matrix rejects every inherited object key on the VARIANTS lookup"
       || denied.reason === matrixInternals.REASON.MALFORMED_STATUS,
       `unexpected refusal reason for ${key}: ${denied.reason}`);
   }
+});
+
+// Phase 1B task 6B: matrix safety model wired into the installer UI.
+// The controller drives one factory variant selector and a preserving-
+// update button. The button starts inert without a manifest; only a
+// complete, explicit, supported STATUS with a matching transport ever
+// gives it a manifest and enables it. Every other STATUS (legacy,
+// malformed, unknown, mismatch) and every disconnect must invalidate
+// the target and re-inert the button. The dialog guard follows the
+// exact dynamic manifest and never leaves a duplicate observer.
+
+function fakeVariantSelector(initial = "nanoc6-thread") {
+  const control = new FakeControl();
+  control.value = initial;
+  return control;
+}
+
+function explicitStatusFor(variant, transport, extras = {}) {
+  return {
+    ...EXPLICIT_STATUS,
+    variant,
+    transport,
+    ...extras,
+  };
+}
+
+function bootedController({
+  attachDialogGuard = () => ({ disconnect() {} }),
+  factoryVariantSelector,
+  factoryWarning,
+} = {}) {
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const serialMonitor = new FakeProtocolMonitor();
+  const setupFlow = {
+    begin: () => new AbortController().signal,
+    finish() {},
+    finishPreservedUpdate() {},
+  };
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow,
+    serialMonitor,
+    factoryVariantSelector,
+    factoryWarning,
+    attachDialogGuard,
+  });
+  return { factoryButton, updateButton, serialMonitor, setupFlow };
+}
+
+test("factory selector wires each of the three shipped variants to its factory manifest", () => {
+  const selector = fakeVariantSelector("nanoc6-thread");
+  const warning = new FakeControl();
+  const { factoryButton } = bootedController({
+    factoryVariantSelector: selector,
+    factoryWarning: warning,
+  });
+
+  // Default selection is applied at boot.
+  assert.equal(factoryButton.manifest, "manifest-nanoc6-thread.json");
+  assert.equal(warning.hidden, false, "warning must be visible");
+  assert.match(warning.textContent, /erases the whole flash/i);
+  assert.match(warning.textContent, /add the device to your smart home again/i);
+
+  const rows = [
+    ["nanoc6-thread",    "manifest-nanoc6-thread.json"],
+    ["nanoc6-wifi",      "manifest-nanoc6-wifi.json"],
+    ["atoms3-lite-wifi", "manifest-atoms3-lite-wifi.json"],
+  ];
+  for (const [id, expected] of rows) {
+    selector.value = id;
+    selector.dispatchEvent(new Event("change"));
+    assert.equal(factoryButton.manifest, expected,
+      `selection ${id} must set factory manifest ${expected}`);
+    assert.equal(factoryButton.getAttribute("manifest"), expected,
+      `selection ${id} must mirror the manifest attribute for esp-web-tools`);
+    assert.match(warning.textContent, /erases the whole flash/i,
+      `selection ${id} must keep the erase-and-recommission warning visible`);
+    assert.equal(warning.hidden, false, `selection ${id} keeps the warning visible`);
+  }
+});
+
+test("update button starts inert with no manifest and every deny path re-inerts it", () => {
+  const attaches = [];
+  const disconnects = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() { disconnects.push(updateManifestPath); } };
+  };
+  const { updateButton, serialMonitor } = bootedController({ attachDialogGuard });
+
+  // Boot: inert, no manifest, no observer attached.
+  assert.equal(updateButton.inert, true);
+  assert.equal(updateButton.activator.disabled, true);
+  assert.equal(updateButton.manifest ?? null, null);
+  assert.equal(updateButton.getAttribute("manifest"), null);
+  assert.deepEqual(attaches, []);
+
+  // Enable once so the deny paths can be observed to un-enable.
+  const enable = () => serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+
+  const denyCases = [
+    ["legacy (variantExplicit=false)", { ...EXPLICIT_STATUS, variantExplicit: false }],
+    ["legacy (transportExplicit=false)", { ...EXPLICIT_STATUS, transportExplicit: false }],
+    ["malformed status (four-field partial)", {
+      variant: "nanoc6-thread", transport: "thread",
+      variantExplicit: true, transportExplicit: true,
+    }],
+    ["null status", null],
+    ["non-object status", "not-a-status"],
+    ["unknown variant", explicitStatusFor("mystery-board", "thread")],
+    ["transport mismatch", explicitStatusFor("nanoc6-wifi", "thread")],
+    ["transport mismatch (thread over wifi)", explicitStatusFor("nanoc6-thread", "wifi")],
+    ["atoms3-lite-wifi shipping thread", explicitStatusFor("atoms3-lite-wifi", "thread")],
+    ["invalid identifier pattern", explicitStatusFor("Not_Valid", "thread")],
+    ["out-of-range setting", explicitStatusFor("nanoc6-thread", "thread",
+      { auto_relock_seconds: 999999 })],
+    ["missing setting field",
+     (() => { const s = explicitStatusFor("nanoc6-thread", "thread"); delete s.success_rgb; return s; })()],
+    ["bad rgb", explicitStatusFor("nanoc6-thread", "thread", { success_rgb: "green" })],
+    ["wrong protocol", explicitStatusFor("nanoc6-thread", "thread", { protocol: 2 })],
+    ["bad firmware string", explicitStatusFor("nanoc6-thread", "thread", { firmware: "1.0" })],
+  ];
+
+  for (const [name, status] of denyCases) {
+    enable();
+    assert.equal(updateButton.inert, false, `precondition failed for ${name}`);
+    serialMonitor.dispatchEvent(new CustomEvent("aliro-status", { detail: status }));
+    assert.equal(updateButton.inert, true, `${name}: update button must be inert`);
+    assert.equal(updateButton.activator.disabled, true,
+      `${name}: activator must be disabled`);
+    assert.equal(updateButton.manifest ?? null, null,
+      `${name}: manifest must be cleared`);
+    assert.equal(updateButton.getAttribute("manifest"), null,
+      `${name}: manifest attribute must be cleared`);
+  }
+
+  // A disconnect from any state must also re-inert.
+  enable();
+  assert.equal(updateButton.inert, false);
+  serialMonitor.dispatchEvent(new CustomEvent("serial-disconnected"));
+  assert.equal(updateButton.inert, true, "disconnect must re-inert the update button");
+  assert.equal(updateButton.manifest ?? null, null,
+    "disconnect must clear the update manifest");
+});
+
+test("each explicit supported STATUS sets the exact matching update manifest", () => {
+  const rows = [
+    ["nanoc6-thread",    "thread", "manifest-update-nanoc6-thread.json"],
+    ["nanoc6-wifi",      "wifi",   "manifest-update-nanoc6-wifi.json"],
+    ["atoms3-lite-wifi", "wifi",   "manifest-update-atoms3-lite-wifi.json"],
+  ];
+  for (const [variant, transport, manifest] of rows) {
+    const { updateButton, serialMonitor } = bootedController();
+    serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+      detail: explicitStatusFor(variant, transport),
+    }));
+    assert.equal(updateButton.manifest, manifest,
+      `${variant}/${transport} must set update manifest to ${manifest}`);
+    assert.equal(updateButton.getAttribute("manifest"), manifest,
+      `${variant}/${transport} must mirror the manifest attribute`);
+    assert.equal(updateButton.inert, false, `${variant}/${transport} enables the button`);
+    assert.equal(updateButton.activator.disabled, false,
+      `${variant}/${transport} enables the activator`);
+  }
+});
+
+test("update-dialog guard follows the dynamic exact manifest without duplicate observers", () => {
+  const attaches = [];
+  let disconnectedTotal = 0;
+  const openHandles = new Set();
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    const handle = {
+      manifest: updateManifestPath,
+      disconnect() {
+        if (!openHandles.has(handle)) return;
+        openHandles.delete(handle);
+        disconnectedTotal += 1;
+      },
+    };
+    openHandles.add(handle);
+    return handle;
+  };
+  const { serialMonitor } = bootedController({ attachDialogGuard });
+
+  // No observer at boot.
+  assert.deepEqual(attaches, []);
+  assert.equal(openHandles.size, 0);
+
+  // First eligible STATUS attaches one observer for the exact manifest.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-thread.json"]);
+  assert.equal(openHandles.size, 1);
+
+  // Repeated identical STATUS must NOT attach a duplicate observer.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-thread", "thread"),
+  }));
+  assert.deepEqual(attaches, ["manifest-update-nanoc6-thread.json"],
+    "same-manifest STATUS must not re-attach the guard");
+  assert.equal(openHandles.size, 1, "only one observer stays open");
+  assert.equal(disconnectedTotal, 0);
+
+  // A different eligible variant swaps the observer atomically.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("nanoc6-wifi", "wifi"),
+  }));
+  assert.deepEqual(attaches, [
+    "manifest-update-nanoc6-thread.json",
+    "manifest-update-nanoc6-wifi.json",
+  ]);
+  assert.equal(openHandles.size, 1, "old observer disconnects, new one attaches");
+  assert.equal(disconnectedTotal, 1);
+  assert.equal([...openHandles][0].manifest, "manifest-update-nanoc6-wifi.json");
+
+  // A deny path disconnects the current observer and leaves none open.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("mystery-board", "thread"),
+  }));
+  assert.equal(openHandles.size, 0, "unknown variant disconnects the guard");
+  assert.equal(disconnectedTotal, 2);
+
+  // A later eligible STATUS attaches a fresh observer without duplicates.
+  serialMonitor.dispatchEvent(new CustomEvent("aliro-status", {
+    detail: explicitStatusFor("atoms3-lite-wifi", "wifi"),
+  }));
+  assert.equal(openHandles.size, 1);
+  assert.equal([...openHandles][0].manifest, "manifest-update-atoms3-lite-wifi.json");
+});
+
+test("factory post-flash STATUS also flows through the preserving-update guard", async () => {
+  const attaches = [];
+  const attachDialogGuard = ({ updateManifestPath }) => {
+    attaches.push(updateManifestPath);
+    return { disconnect() {} };
+  };
+  const factoryButton = new FakeInstallButton();
+  const updateButton = new FakeInstallButton();
+  const setupFlow = {
+    begin: () => new AbortController().signal,
+    finish() {},
+    finishPreservedUpdate() {},
+  };
+  const settingsCalls = [];
+  const deviceSettings = { applyStatus(status) { settingsCalls.push(status); } };
+  const bootLog = new TextEncoder().encode(
+    "I chip[SVR]: SetupQRCode: [MT:Y.K9042C00KA0648G00]\n" +
+    "I chip[SVR]: Manual pairing code: [34970112332]\n",
+  );
+  // The post-flash STATUS announces variant + transport explicitly so
+  // checkPreservingUpdate must accept it and set the exact manifest.
+  const statusLine = new TextEncoder().encode(
+    "ALIRO/1 STATUS firmware=0.0.6-devkit protocol=1 " +
+    "auto_relock_seconds=10 success_rgb=00FF00 success_ms=750 " +
+    "failure_rgb=ff0000 failure_ms=900 other_rgb=0000ff other_ms=500 " +
+    "variant=atoms3-lite-wifi transport=wifi\n",
+  );
+  const port = twoPassSerialPort([bootLog, statusLine]);
+  configureInstallButtons({
+    factoryButton,
+    updateButton,
+    setupFlow,
+    deviceSettings,
+    logger: { log() {}, error() {} },
+    attachDialogGuard,
+    statusTimeoutMs: 200,
+  });
+
+  await factoryButton.onPostFlash(port);
+
+  assert.equal(settingsCalls.length, 1);
+  assert.equal(settingsCalls[0].variant, "atoms3-lite-wifi");
+  assert.equal(updateButton.manifest, "manifest-update-atoms3-lite-wifi.json",
+    "post-flash STATUS must set the exact matching update manifest");
+  assert.equal(updateButton.inert, false);
+  assert.deepEqual(attaches, ["manifest-update-atoms3-lite-wifi.json"],
+    "post-flash STATUS attaches the guard for the exact manifest");
+});
+
+test("HTML wires the three-variant selector, warning, and inert update button without a default manifest", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+
+  // Selector: three options, default nanoc6-thread first.
+  assert.match(html, /<select id="factory-variant"[\s\S]*?<\/select>/,
+    "factory-variant selector must exist");
+  const selector = html.match(/<select id="factory-variant"[\s\S]*?<\/select>/)[0];
+  assert.match(selector, /<option value="nanoc6-thread">M5Stack NanoC6 — Matter over Thread<\/option>/);
+  assert.match(selector, /<option value="nanoc6-wifi">M5Stack NanoC6 — Matter over Wi-Fi<\/option>/);
+  assert.match(selector, /<option value="atoms3-lite-wifi">M5Stack AtomS3 Lite — Matter over Wi-Fi<\/option>/);
+  // Only these three options exist.
+  const options = [...selector.matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(options, ["nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"],
+    "the selector must expose exactly the three shipped variants in order");
+
+  // Erase-and-recommission warning. Allow whitespace between words so the
+  // HTML source can wrap freely without breaking the assertion.
+  const warning = html.match(/id="factory-warning"[^>]*>[\s\S]*?<\/div>/)[0];
+  assert.match(warning, /erases the whole flash/i);
+  assert.match(warning, /add the device\s+to your smart home again/i);
+
+  // Update button starts inert with NO usable manifest attribute.
+  const updateButton = html.match(/<esp-web-install-button\b[^>]*id="update-button"[\s\S]*?<\/esp-web-install-button>/)[0];
+  assert.doesNotMatch(updateButton, /\bmanifest=/,
+    "update button must not carry a manifest attribute at boot");
+  assert.match(updateButton, /\binert\b/,
+    "update button must start inert");
+
+  // Factory button no longer hard-codes a manifest.
+  const factoryButton = html.match(/<esp-web-install-button\b[^>]*id="factory-button"[\s\S]*?<\/esp-web-install-button>/)[0];
+  assert.doesNotMatch(factoryButton, /\bmanifest=/,
+    "factory button must not carry a manifest attribute; the selector wires it");
+  assert.match(factoryButton, /\binert\b/,
+    "factory button must start inert until the controller resolves the selection");
+
+  // Update-action wrapper starts hidden until eligibility is established.
+  assert.match(html, /id="update-action"[^>]*\bhidden\b/,
+    "update-action wrapper must start hidden until STATUS proves eligibility");
+
+  // Prerequisites now describe both transports, not Thread only.
+  assert.match(html, /Thread border router/);
+  assert.match(html, /2\.4 GHz Wi-Fi/);
+  assert.match(html, /AtomS3 Lite/);
 });
 
 test("README and installer link to each other", () => {

@@ -4,6 +4,7 @@ import {
   compareDevkitVersions,
   parseDevkitVersion,
 } from "./device-protocol.js";
+import { checkPreservingUpdate, getVariant } from "./firmware-matrix.js";
 
 const SETTING_KEYS = [
   "auto_relock_seconds",
@@ -26,19 +27,16 @@ export function createDeviceSettings({
   elements,
   serialMonitor,
   fetchImpl = globalThis.fetch,
-  manifestUrl = "./manifest-update.json",
   confirmationTimeoutMs = 3000,
 }) {
   let currentStatus = null;
   let pendingValues = null;
   let confirmationTimer = null;
+  let eligibleVariant = null;
   let latestVersion = null;
   let latestLoaded = false;
+  let latestManifest = null;
   let destroyed = false;
-  // Post-flash values arrive on the ESP Web Tools port before the serial
-  // monitor claims the device. We render them read-only until the monitor
-  // emits `serial-connected` so the user cannot submit changes over a
-  // port they do not own.
   let readOnly = false;
 
   function setResult(message, state = "") {
@@ -59,39 +57,45 @@ export function createDeviceSettings({
   function renderFirmware() {
     const installed = currentStatus?.firmware || null;
     elements.installed.textContent = installed || "Unknown";
-    elements.latest.textContent = latestLoaded ? (latestVersion || "Unknown") : "Checking…";
-    elements.updateAction.hidden = false;
     elements.current.hidden = true;
+    elements.updateAction.hidden = true;
 
     if (!installed) {
-      if (!latestLoaded) {
-        elements.updateReason.textContent =
-          "Connect the lock while the page checks the latest release.";
-      } else if (latestVersion) {
-        elements.updateReason.textContent =
-          "Connect the lock to compare its installed firmware with the latest release.";
-      } else {
-        elements.updateReason.textContent =
-          "The latest release is unknown. The firmware update remains available.";
-      }
+      elements.latest.textContent = "Unknown";
+      elements.updateReason.textContent =
+        "Connect the lock to see whether a preserving update is available.";
       return;
     }
+    if (!eligibleVariant) {
+      elements.latest.textContent = "Unknown";
+      elements.updateReason.textContent =
+        "The connected lock's firmware cannot be updated in-place from this page. " +
+        "Use Factory install below to change the board or the Matter transport.";
+      return;
+    }
+    if (!latestLoaded) {
+      elements.latest.textContent = "Checking…";
+      elements.updateReason.textContent =
+        "Checking the latest release for this variant.";
+      return;
+    }
+    elements.latest.textContent = latestVersion || "Unknown";
     const comparison = compareDevkitVersions(installed, latestVersion);
     if (comparison === 0) {
       elements.current.textContent = "✓ Firmware is current";
       elements.current.hidden = false;
-      elements.updateAction.hidden = true;
       elements.updateReason.textContent = "The installed firmware matches the latest release.";
     } else if (comparison === 1) {
       elements.current.textContent = "✓ Firmware is newer than the latest release";
       elements.current.hidden = false;
-      elements.updateAction.hidden = true;
       elements.updateReason.textContent =
         "The installed firmware is newer than the published release. A normal update would go back to an older version.";
     } else if (comparison === -1) {
+      elements.updateAction.hidden = false;
       elements.updateReason.textContent =
         `Firmware ${installed} is installed. Firmware ${latestVersion} is available.`;
     } else {
+      elements.updateAction.hidden = false;
       elements.updateReason.textContent =
         "The installed and latest versions could not be compared. The firmware update remains available.";
     }
@@ -135,6 +139,28 @@ export function createDeviceSettings({
       .map((key) => [key, values[key]]));
   }
 
+  function evaluateEligibility(status) {
+    const decision = checkPreservingUpdate(status);
+    if (decision.allowed) {
+      const variant = getVariant(decision.targetVariant);
+      const nextManifest = variant?.manifestUpdate || decision.manifest;
+      if (variant && nextManifest !== latestManifest) {
+        eligibleVariant = variant;
+        latestManifest = nextManifest;
+        latestVersion = null;
+        latestLoaded = false;
+        void loadLatestVersion(nextManifest);
+      } else if (variant) {
+        eligibleVariant = variant;
+      }
+    } else {
+      eligibleVariant = null;
+      latestManifest = null;
+      latestVersion = null;
+      latestLoaded = true;
+    }
+  }
+
   function onStatus(event) {
     if (destroyed) return;
     const status = event.detail;
@@ -153,6 +179,7 @@ export function createDeviceSettings({
       pendingValues = null;
     }
     populate(status);
+    evaluateEligibility(status);
     renderFirmware();
   }
 
@@ -186,6 +213,10 @@ export function createDeviceSettings({
     elements.panel.hidden = true;
     currentStatus = null;
     pendingValues = null;
+    eligibleVariant = null;
+    latestManifest = null;
+    latestVersion = null;
+    latestLoaded = false;
     setFormBusy(false);
     setResult("");
     renderFirmware();
@@ -238,22 +269,28 @@ export function createDeviceSettings({
     }
   }
 
-  async function loadLatestVersion() {
+  async function loadLatestVersion(manifestPath) {
+    if (!manifestPath) return;
     if (typeof fetchImpl !== "function") {
+      if (manifestPath !== latestManifest) return;
       latestLoaded = true;
-      renderFirmware();
+      if (!destroyed) renderFirmware();
       return;
     }
+    let version = null;
     try {
-      const response = await fetchImpl(manifestUrl, { cache: "no-store" });
+      const response = await fetchImpl(manifestPath, { cache: "no-store" });
       if (response.ok === false) throw new Error(`HTTP ${response.status}`);
       const manifest = await response.json();
-      latestVersion = parseDevkitVersion(manifest.version)?.normalized || null;
+      version = parseDevkitVersion(manifest.version)?.normalized || null;
     } catch {
-      latestVersion = null;
+      version = null;
     }
+    if (destroyed) return;
+    if (manifestPath !== latestManifest) return;
+    latestVersion = version;
     latestLoaded = true;
-    if (!destroyed) renderFirmware();
+    renderFirmware();
   }
 
   elements.form.addEventListener("submit", onSubmit);
@@ -264,10 +301,8 @@ export function createDeviceSettings({
   serialMonitor.addEventListener("serial-disconnected", onDisconnected);
   setFormBusy(false);
   renderFirmware();
-  void loadLatestVersion();
 
   return {
-    loadLatestVersion,
     applyStatus(status) {
       if (destroyed || !status) return;
       readOnly = true;
