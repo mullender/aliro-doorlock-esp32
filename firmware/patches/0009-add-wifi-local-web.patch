@@ -63,7 +63,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_local_web.cpp
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,438 @@
 +/*
 +   Trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
 +   door-lock reader firmware.
@@ -338,6 +338,17 @@ new file mode 100644
 +    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
 +
 +    if (s_server_ready)
++    {
++        xSemaphoreGive(s_server_mutex);
++        return ESP_OK;
++    }
++    // Locked recheck: if a LOST_IP or DISCONNECT callback took the
++    // mutex first, or if the caller decided to start from a stale
++    // earlier true reading, the netif no longer has a station IP.
++    // Do NOT start HTTP in that case; a fresh GOT_IP will call
++    // start_server again when the address returns.
++    char locked_ip[32] = { 0 };
++    if (!current_station_ip(locked_ip, sizeof(locked_ip)))
 +    {
 +        xSemaphoreGive(s_server_mutex);
 +        return ESP_OK;

@@ -4917,6 +4917,66 @@ test("phase 2 task 1 correction 2: s_server_ready separates complete from partia
     "stop-failure branch must clear s_server_ready");
 });
 
+test("phase 2 task 1 correction 3: start_server revalidates the station IP inside the mutex before any HTTP action", () => {
+  // The reviewer race: bind (or a prior GOT_IP) observed a valid IP,
+  // then LOST_IP took the mutex first (netif now zero), stop_server
+  // ran as a no-op, released the mutex. If start_server then acted
+  // on the cached outer reading, HTTP would come up without an IP.
+  // Fix: start_server must revalidate current_station_ip INSIDE the
+  // mutex, BEFORE any cleanup or httpd_start action, and return
+  // without side effects when the IP is gone.
+  const patch = phase2PatchText();
+  const startMatch = patch.match(
+    /\+esp_err_t start_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(startMatch, "must find start_server body");
+  const startCode = startMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+
+  // Ordering: take -> ready-shortcut -> locked recheck -> cleanup -> httpd_start.
+  const takeIdx        = startCode.indexOf("xSemaphoreTake(s_server_mutex");
+  const currentIpIdx   = startCode.indexOf("current_station_ip");
+  const stalePartialIdx = startCode.indexOf("s_server != nullptr");
+  const httpdStopIdx   = startCode.indexOf("httpd_stop(s_server)");
+  const httpdStartIdx  = startCode.indexOf("httpd_start(&s_server");
+  const uriRegIdx      = startCode.indexOf("httpd_register_uri_handler");
+
+  assert.ok(takeIdx > 0, "start_server must take the mutex");
+  assert.ok(currentIpIdx > takeIdx,
+    "current_station_ip recheck must happen AFTER the mutex is taken");
+  assert.ok(currentIpIdx < stalePartialIdx,
+    "current_station_ip recheck must precede the stale-partial cleanup branch");
+  assert.ok(currentIpIdx < httpdStopIdx,
+    "current_station_ip recheck must precede any httpd_stop call");
+  assert.ok(currentIpIdx < httpdStartIdx,
+    "current_station_ip recheck must precede httpd_start");
+  assert.ok(currentIpIdx < uriRegIdx,
+    "current_station_ip recheck must precede any URI registration");
+
+  // The recheck must have a proper early-return that gives back the
+  // mutex and performs NO side effect (no cleanup, no start).
+  // Extract the block after the ready-shortcut and before the stale-
+  // partial branch — the locked recheck lives there. Start the slice
+  // at the ready-shortcut's give+return so it includes the "if (!"
+  // prefix of the recheck.
+  const readyGiveIdx = startCode.indexOf("if (s_server_ready)");
+  assert.ok(readyGiveIdx > 0 && readyGiveIdx < currentIpIdx,
+    "the ready shortcut must precede the locked recheck");
+  const recheckSlice = startCode.slice(readyGiveIdx, stalePartialIdx);
+  assert.match(recheckSlice, /if\s*\(\s*!\s*current_station_ip\s*\(/,
+    "locked recheck must invert current_station_ip to catch the loss");
+  // Isolate the recheck's own body (skip the ready-shortcut's block).
+  const recheckBodyMatch = recheckSlice.match(
+    /if\s*\(\s*!\s*current_station_ip[\s\S]*?\}\s*(?=\/\/|\S)/,
+  );
+  assert.ok(recheckBodyMatch, "must isolate the locked recheck's if-block");
+  const recheckBody = recheckBodyMatch[0];
+  assert.match(recheckBody, /xSemaphoreGive\s*\(\s*s_server_mutex\s*\)/,
+    "locked recheck's early return must give the mutex back");
+  assert.doesNotMatch(recheckBody, /httpd_stop|httpd_start|httpd_register_uri_handler/,
+    "locked recheck's early return must NOT touch httpd_*");
+});
+
 test("phase 2 task 1 correction 1: stop_server keeps the live handle when httpd_stop fails", () => {
   const patch = phase2PatchText();
   const stopMatch = patch.match(
