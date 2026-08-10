@@ -5852,7 +5852,97 @@ test("phase 2 task 6 correction 1: embedded save classifies malformed JSON as in
     `expected 'Settings: invalid response.' on malformed POST, got ${JSON.stringify(statusEl.textContent)}`);
 });
 
-test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and adds SyntaxError classification", () => {
+// Phase 2 task 6 correction 2: TypeError and AbortError from r.json()
+// (body-read network failure / aborted body read) must keep the
+// existing 'Settings load failed:' / 'Settings save failed:' text
+// and NOT be reclassified as invalid-response.
+
+function makeValidSettingsResponse() {
+  return {
+    auto_relock_seconds: 5,
+    success_rgb: "00ff00", success_ms: 1000,
+    failure_rgb: "ff0000", failure_ms: 1000,
+    other_rgb: "0000ff", other_ms: 1000,
+  };
+}
+
+test("phase 2 task 6 correction 2: embedded load classifies TypeError as network failure", async () => {
+  const { statusEl, settle } = runPhase2SettingsScript({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => { throw new TypeError("network body read failed"); },
+    }),
+  });
+  await settle();
+  assert.match(statusEl.textContent, /^Settings load failed:/,
+    `expected 'Settings load failed:' on TypeError, got ${JSON.stringify(statusEl.textContent)}`);
+  assert.doesNotMatch(statusEl.textContent, /invalid response/,
+    "TypeError must NOT be reclassified as invalid response");
+});
+
+test("phase 2 task 6 correction 2: embedded load classifies AbortError as network failure", async () => {
+  const { statusEl, settle } = runPhase2SettingsScript({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+    }),
+  });
+  await settle();
+  assert.match(statusEl.textContent, /^Settings load failed:/,
+    `expected 'Settings load failed:' on AbortError, got ${JSON.stringify(statusEl.textContent)}`);
+  assert.doesNotMatch(statusEl.textContent, /invalid response/,
+    "AbortError must NOT be reclassified as invalid response");
+});
+
+test("phase 2 task 6 correction 2: embedded save classifies TypeError as network failure", async () => {
+  let call = 0;
+  const validResp = makeValidSettingsResponse();
+  const { statusEl, submit } = runPhase2SettingsScript({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { ok: true, json: async () => validResp };
+      return {
+        ok: true,
+        json: async () => { throw new TypeError("network body read failed"); },
+      };
+    },
+  });
+  await submit();
+  assert.match(statusEl.textContent, /^Settings save failed:/,
+    `expected 'Settings save failed:' on TypeError, got ${JSON.stringify(statusEl.textContent)}`);
+  assert.doesNotMatch(statusEl.textContent, /invalid response/,
+    "TypeError on save must NOT be reclassified as invalid response");
+});
+
+test("phase 2 task 6 correction 2: embedded save classifies AbortError as network failure", async () => {
+  let call = 0;
+  const validResp = makeValidSettingsResponse();
+  const { statusEl, submit } = runPhase2SettingsScript({
+    fetchImpl: async () => {
+      call += 1;
+      if (call === 1) return { ok: true, json: async () => validResp };
+      return {
+        ok: true,
+        json: async () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          throw err;
+        },
+      };
+    },
+  });
+  await submit();
+  assert.match(statusEl.textContent, /^Settings save failed:/,
+    `expected 'Settings save failed:' on AbortError, got ${JSON.stringify(statusEl.textContent)}`);
+  assert.doesNotMatch(statusEl.textContent, /invalid response/,
+    "AbortError on save must NOT be reclassified as invalid response");
+});
+
+test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and outer catch classifies SyntaxError", () => {
   const patch = phase2Task6PatchText();
   // populate no longer strips a leading '#' from the response.
   const populateFrag = patch.match(
@@ -5873,12 +5963,15 @@ test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip
   ) || []).length;
   assert.equal(invalidJsonBranches, 2,
     "both load and save catch blocks must map SyntaxError to the invalid-response text");
-  // Both fetch chains wrap r.json() with a tag-as-SyntaxError catch.
-  const jsonWrapCount = (patch.match(
-    /"return r\.json\(\)\.catch\(function\(\)\{var e=new Error\('invalid_json'\);e\.name='SyntaxError';throw e;\}\);"/g,
-  ) || []).length;
-  assert.equal(jsonWrapCount, 2,
-    "both load and save must wrap r.json() to tag the parse error as SyntaxError");
+  // Correction 2: r.json() must NOT be wrapped by an inner catch that
+  // rebrands every rejection as SyntaxError; TypeError and AbortError
+  // from body-read failures must reach the outer catch unchanged.
+  assert.doesNotMatch(patch,
+    /r\.json\(\)\.catch\(function\([^)]*\)\{[^}]*name='SyntaxError'/,
+    "r.json() must not be wrapped by a catch that rebrands every rejection as SyntaxError");
+  const rJsonCalls = (patch.match(/"return r\.json\(\);"/g) || []).length;
+  assert.equal(rJsonCalls, 2,
+    "both load and save must return r.json() and let it reject with its original error");
 });
 
 test("phase 2 task 5 correction 1: patch 0011 mirrors the OWS-then-semicolon rule in C++", () => {

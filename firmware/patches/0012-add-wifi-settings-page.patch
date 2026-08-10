@@ -22,15 +22,20 @@ Scope:
     loaded or saved, and rejects any RGB value that is not
     exactly six hex chars — a leading '#' in the response is a
     schema violation and is refused (form submit still strips
-    '#' from the color input's value before POSTing). A
-    malformed JSON body from either GET load or POST save
-    surfaces as 'Settings: invalid response.' rather than the
-    generic load/save network failure text. On submit, native
-    form.reportValidity() runs first, then each of the seven
-    inputs is re-validated in JS; any missing or out-of-range
-    value surfaces a clear error and returns without a POST, so
-    every POST body contains all seven valid values. The POST
-    is application/x-www-form-urlencoded (URLSearchParams), RGB
+    '#' from the color input's value before POSTing). r.json()
+    is allowed to reject with its ORIGINAL error: JSON.parse
+    rejects with SyntaxError for a malformed body, a body-read
+    network failure rejects with TypeError, an aborted body
+    read rejects with AbortError. The outer catch on both load
+    and save routes SyntaxError to 'Settings: invalid
+    response.' and every other kind to the generic 'Settings
+    load failed: <msg>' / 'Settings save failed: <msg>' network
+    text. On submit, native form.reportValidity() runs first,
+    then each of the seven inputs is re-validated in JS; any
+    missing or out-of-range value surfaces a clear error and
+    returns without a POST, so every POST body contains all
+    seven valid values. The POST is
+    application/x-www-form-urlencoded (URLSearchParams), RGB
     stripped of the leading '#'. Every status message uses
     textContent; no dynamic innerHTML is introduced.
     /api/settings is added to the machine-endpoint list.
@@ -87,7 +92,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
      "<li><a href=\"/qrcode.js\"><code>/qrcode.js</code></a> "
      "(local MIT-licensed QR generator, gzip-encoded)</li>"
      "</ul>"
-@@ -154,6 +187,122 @@
+@@ -154,6 +187,124 @@
      "}else{render();}"
      "})();"
      "</script>"
@@ -137,11 +142,13 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    "setStatus('Loading settings\\u2026');"
 +    "fetch('/api/settings').then(function(r){"
 +    "if(!r.ok)throw new Error('HTTP '+r.status);"
-+    // A malformed JSON body is a schema violation, not a network
-+    // failure. r.json() rejects with a SyntaxError; tag it so the
-+    // catch below classifies it as invalid-response instead of the
-+    // generic 'load failed' text.
-+    "return r.json().catch(function(){var e=new Error('invalid_json');e.name='SyntaxError';throw e;});"
++    // Let r.json() reject with its original error. JSON.parse
++    // rejects with SyntaxError for a malformed body; a body-read
++    // network failure rejects with TypeError; an aborted body
++    // read rejects with AbortError. The outer catch below routes
++    // SyntaxError to invalid-response and every other kind to the
++    // generic 'Settings load failed' network text.
++    "return r.json();"
 +    "}).then(function(d){"
 +    "if(populate(d))setStatus('Settings loaded.');"
 +    "}).catch(function(err){"
@@ -186,9 +193,9 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 +    "body:params.toString()"
 +    "}).then(function(r){"
 +    "if(!r.ok)throw new Error('HTTP '+r.status);"
-+    // Same classification as load: a malformed response body is
-+    // 'invalid response', not a network failure.
-+    "return r.json().catch(function(){var e=new Error('invalid_json');e.name='SyntaxError';throw e;});"
++    // Let r.json() reject with its original error (same
++    // classification as load).
++    "return r.json();"
 +    "}).then(function(d){"
 +    "if(populate(d))setStatus('Settings saved.');"
 +    "}).catch(function(err){"
