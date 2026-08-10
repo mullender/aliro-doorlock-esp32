@@ -21,8 +21,11 @@ log-capture changes):
       - Begin selects the next OTA partition with
         esp_ota_get_next_update_partition, refuses a declared
         size that is 0 or greater than that partition, and
-        calls esp_ota_begin. On any failure the busy guard is
-        released before returning.
+        calls esp_ota_begin. On esp_ota_begin failure, if it
+        already assigned a nonzero s_handle, esp_ota_abort is
+        called on that handle before the local transaction
+        state is cleared and the busy guard is released; the
+        returned begin error is preserved.
       - Write buffers the first 288 bytes (image header +
         first segment header + full app descriptor) into a
         fixed static prefix; no per-write allocation. Once the
@@ -165,7 +168,7 @@ diff --git a/examples/door_lock/main/aliro_local_ota.cpp b/examples/door_lock/ma
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_local_ota.cpp
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,314 @@
 +/*
 +   Shared Wi-Fi OTA transaction core for the Aliro door-lock reader
 +   firmware. Wi-Fi variants only (nanoc6-wifi, atoms3-lite-wifi);
@@ -341,6 +344,21 @@ new file mode 100644
 +    }
 +    esp_err_t err = esp_ota_begin(s_partition, declared_size, &s_handle);
 +    if (err != ESP_OK) {
++        /*
++           Blocking-Begin cleanup. esp_ota_begin may assign a
++           nonzero s_handle before it returns an error (for
++           example, if the partition is erased and a handle is
++           reserved, but a later check inside the IDF fails).
++           Any live handle must be released with esp_ota_abort
++           before this function returns, else the OTA subsystem
++           leaks the reservation until the next reboot. Clear
++           the local transaction state after the abort. The
++           returned begin error is preserved.
++        */
++        if (s_handle != 0) {
++            esp_ota_abort(s_handle);
++            s_handle = 0;
++        }
 +        s_partition = nullptr;
 +        release_busy();
 +        return err;

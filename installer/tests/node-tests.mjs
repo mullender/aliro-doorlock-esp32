@@ -7060,8 +7060,27 @@ test("phase 3 task 1: Begin selects next OTA partition, refuses 0/over-sized, an
   assert.match(cpp, /esp_ota_begin\s*\(\s*s_partition\s*,\s*declared_size\s*,\s*&\s*s_handle\s*\)/,
     "Begin must call esp_ota_begin(s_partition, declared_size, &s_handle)");
   assert.match(cpp,
-    /esp_ota_begin[\s\S]{0,120}if\s*\(\s*err\s*!=\s*ESP_OK\s*\)\s*\{[\s\S]{0,80}release_busy\s*\(\s*\)\s*;/,
-    "on esp_ota_begin failure, Begin must release the busy guard before returning");
+    /esp_ota_begin[\s\S]{0,200}if\s*\(\s*err\s*!=\s*ESP_OK\s*\)\s*\{[\s\S]*?release_busy\s*\(\s*\)\s*;[\s\S]*?return\s+err\s*;/,
+    "on esp_ota_begin failure, Begin must release the busy guard and then return the original err");
+});
+
+test("phase 3 task 1 correction 1: on late esp_ota_begin failure Begin aborts the reserved handle, clears state, releases guard, preserves err", () => {
+  const cpp = extractPhase3Task1NewFile("aliro_local_ota.cpp");
+  /*
+     esp_ota_begin may assign a nonzero s_handle before returning an
+     error (partition reserved but a later IDF check fails). Every
+     live handle must be released with esp_ota_abort or the OTA
+     subsystem leaks the reservation until reboot.
+
+     The correction requires, on esp_ota_begin != ESP_OK inside
+     Begin (all in this exact order): esp_ota_abort(s_handle) when
+     s_handle != 0, clear s_handle, clear s_partition, release
+     s_busy, and return the ORIGINAL 'err' value (not a rewritten
+     one). The check below matches that exact ordered structure.
+  */
+  assert.match(cpp,
+    /esp_err_t\s+err\s*=\s*esp_ota_begin\s*\([^)]*\)\s*;\s*if\s*\(\s*err\s*!=\s*ESP_OK\s*\)\s*\{[\s\S]{0,800}?if\s*\(\s*s_handle\s*!=\s*0\s*\)\s*\{\s*esp_ota_abort\s*\(\s*s_handle\s*\)\s*;\s*s_handle\s*=\s*0\s*;\s*\}\s*s_partition\s*=\s*nullptr\s*;\s*release_busy\s*\(\s*\)\s*;\s*return\s+err\s*;\s*\}/,
+    "Begin failure cleanup must be: guarded esp_ota_abort of any live s_handle, clear s_handle, clear s_partition, release busy, return the original err");
 });
 
 test("phase 3 task 1: write-size guard is overflow-safe (subtraction against declared, not addition)", () => {
@@ -7177,6 +7196,9 @@ function makeOtaMock({
     partitionSize = 0x1E0000,
     partitionOk = true,
     beginOk = true,
+    beginAssignsHandleThenFails = false,  // simulates IDF esp_ota_begin
+                                          // that reserves the handle
+                                          // but returns an error afterwards
     writeOk = true,
     endOk = true,
     setBootOk = true,
@@ -7227,6 +7249,22 @@ function makeOtaMock({
     state.partition = { size: partitionSize };
     if (declared > partitionSize) { releaseBusy(); return "ESP_ERR_INVALID_SIZE"; }
     calls.begin++;
+    if (beginAssignsHandleThenFails) {
+      /*
+         Simulate an IDF esp_ota_begin that assigned a live
+         handle before returning an error (partition reservation
+         succeeded, a later check inside the IDF failed). Correct
+         cleanup: call esp_ota_abort on the reserved handle,
+         clear s_handle + s_partition, release busy, preserve
+         the original err.
+      */
+      state.handle = 1;
+      calls.abort++;
+      state.handle = 0;
+      state.partition = null;
+      releaseBusy();
+      return "ESP_FAIL";
+    }
     if (!beginOk) { state.partition = null; releaseBusy(); return "ESP_FAIL"; }
     state.handle = 1;
     state.declaredSize = declared;
@@ -7330,6 +7368,25 @@ test("phase 3 task 1 state model: two concurrent Begins — first wins, second r
   assert.equal(ota.Begin(1024), "ESP_ERR_INVALID_STATE");
   assert.equal(ota.state.busy, true, "second Begin must NOT release the first's busy guard");
   assert.equal(ota.state.handle, 1, "second Begin must not clobber the first handle");
+});
+
+test("phase 3 task 1 correction 1 state model: late esp_ota_begin failure aborts the live handle exactly once, clears state, and releases guard", () => {
+  const ota = makeOtaMock({beginAssignsHandleThenFails: true});
+  const r = ota.Begin(1024);
+  assert.equal(r, "ESP_FAIL",
+    "the returned begin error must be preserved (ESP_FAIL from the simulated late failure)");
+  assert.equal(ota.calls.abort, 1,
+    "exactly one esp_ota_abort call on the reserved handle (no leak, no double-abort)");
+  assert.equal(ota.state.handle, 0,
+    "s_handle must be cleared after abort so a later Write cannot reach a dead handle");
+  assert.equal(ota.state.partition, null,
+    "s_partition must be cleared as part of the cleanup");
+  assert.equal(ota.state.busy, false,
+    "the busy guard must be released so a fresh Begin can succeed");
+  // Follow-up Begin must succeed cleanly.
+  const ota2 = makeOtaMock();
+  assert.equal(ota2.Begin(1024), "ESP_OK",
+    "a fresh transaction after a late-fail cleanup must be able to Begin");
 });
 
 test("phase 3 task 1 state model: SIZE_MAX write is rejected without wrap and aborts", () => {
