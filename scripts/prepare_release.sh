@@ -216,15 +216,19 @@ fi
 
 # ---- App binary discovery ----
 
-# Derive the app binary name from project_description.json when available;
-# fall back to <project_name>.bin. Refuse a mismatched or missing file.
+# The app binary must be named exactly `<project_name>.bin`. When
+# project_description.json declares an app_bin, refuse any other value
+# before staging so a build that renamed its output for another purpose
+# never gets shipped under this variant. The fallback (no app_bin) uses
+# the required name directly.
+EXPECTED_APP_BIN_NAME="${VARIANT_PROJECT_NAME}.bin"
 if [[ -n "$BUILD_APP_BIN" ]]; then
-  APP_BIN_NAME="$BUILD_APP_BIN"
-elif [[ -n "$BUILD_APP_ELF" ]]; then
-  APP_BIN_NAME="${BUILD_APP_ELF%.elf}.bin"
-else
-  APP_BIN_NAME="${VARIANT_PROJECT_NAME}.bin"
+  if [[ "$BUILD_APP_BIN" != "$EXPECTED_APP_BIN_NAME" ]]; then
+    echo "error: project_description app_bin is '$BUILD_APP_BIN', variant $VARIANT_ID requires '$EXPECTED_APP_BIN_NAME'" >&2
+    exit 3
+  fi
 fi
+APP_BIN_NAME="$EXPECTED_APP_BIN_NAME"
 APP_SOURCE="$BUILD_DIR/$APP_BIN_NAME"
 if [[ ! -f "$APP_SOURCE" ]]; then
   echo "error: app image not found at $APP_SOURCE (project_description app_bin='$BUILD_APP_BIN')" >&2
@@ -233,7 +237,10 @@ fi
 
 # ---- Atomic staging ----
 
-ARTIFACTS_DIR="$REPO_ROOT/artifacts"
+# Production default writes assets under repo/artifacts. Fixture tests
+# override this with ALIRO_ARTIFACTS_DIR so a normal host test run never
+# creates, replaces, or removes anything inside the repository tree.
+ARTIFACTS_DIR="${ALIRO_ARTIFACTS_DIR:-$REPO_ROOT/artifacts}"
 OUT_DIR="$ARTIFACTS_DIR/$TAG"
 mkdir -p "$ARTIFACTS_DIR" "$OUT_DIR"
 STAGE_DIR="$(mktemp -d "$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.stage.XXXXXX")"

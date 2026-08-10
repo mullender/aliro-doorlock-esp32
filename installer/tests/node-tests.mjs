@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -2250,8 +2250,17 @@ function makeFixtureBuild({
   return { root, build };
 }
 
-function runPrepare({ variant, tag, buildDir }) {
+// Every fixture test routes the packager's output through a temporary
+// artifact root via ALIRO_ARTIFACTS_DIR so a normal host test run
+// never creates, replaces, or removes anything inside repo/artifacts.
+function runPrepare({ variant, tag, buildDir, artifactsDir }) {
   const scriptPath = new URL("../../scripts/prepare_release.sh", import.meta.url).pathname;
+  if (!artifactsDir) throw new Error("artifactsDir is required (must be a tmp path)");
+  const repoRoot = new URL("../../", import.meta.url).pathname;
+  if (artifactsDir === path.join(repoRoot, "artifacts")
+      || artifactsDir.startsWith(path.join(repoRoot, "artifacts") + "/")) {
+    throw new Error("artifactsDir must not point at the repository artifacts tree");
+  }
   try {
     const stdout = execFileSync("bash", [
       scriptPath,
@@ -2262,6 +2271,7 @@ function runPrepare({ variant, tag, buildDir }) {
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
       timeout: 15000,
+      env: { ...process.env, ALIRO_ARTIFACTS_DIR: artifactsDir },
     });
     return { status: 0, stdout, stderr: "" };
   } catch (error) {
@@ -2273,77 +2283,88 @@ function runPrepare({ variant, tag, buildDir }) {
   }
 }
 
-test("prepare_release.sh rejects a wrong project_name", () => {
-  const { root, build } = makeFixtureBuild({ projectName: "door_lock" });
+function withFixture(setup, callback) {
+  const { root, build } = makeFixtureBuild(setup);
+  const artifactsDir = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
   try {
+    return callback({ root, build, artifactsDir });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifactsDir, { recursive: true, force: true });
+  }
+}
+
+test("prepare_release.sh rejects a wrong project_name", () => {
+  withFixture({ projectName: "door_lock" }, ({ build, artifactsDir }) => {
     const result = runPrepare({
       variant: "nanoc6-thread",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /project_name is 'door_lock'.*aliro-nanoc6-thread/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 test("prepare_release.sh rejects a wrong project_version", () => {
-  const { root, build } = makeFixtureBuild({ projectVersion: "0.0.5-devkit" });
-  try {
+  withFixture({ projectVersion: "0.0.5-devkit" }, ({ build, artifactsDir }) => {
     const result = runPrepare({
       variant: "nanoc6-thread",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /project_version is '0\.0\.5-devkit'.*0\.0\.6-devkit/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 test("prepare_release.sh rejects a wrong chip", () => {
-  const { root, build } = makeFixtureBuild({ chip: "esp32s3" });
-  try {
+  withFixture({ chip: "esp32s3" }, ({ build, artifactsDir }) => {
     const result = runPrepare({
       variant: "nanoc6-thread",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /build chip is 'esp32s3'.*esp32c6/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 test("prepare_release.sh fails closed when the approved partition hash is null", () => {
   // atoms3-lite-wifi variants.json has partition_table_sha256=null.
-  const { root, build } = makeFixtureBuild({
+  withFixture({
     projectName: "aliro-atoms3-lite-wifi",
     projectVersion: "0.0.6-devkit",
     chip: "esp32s3",
     appBin: "aliro-atoms3-lite-wifi.bin",
-  });
-  try {
+  }, ({ build, artifactsDir }) => {
     const result = runPrepare({
       variant: "atoms3-lite-wifi",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /no approved partition_table_sha256/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 test("prepare_release.sh rejects a partition-table SHA-256 mismatch", () => {
-  const { root, build } = makeFixtureBuild({
+  withFixture({
     partitionBytes: Buffer.alloc(0xC00, 0x00), // hashes to a known non-approved value
-  });
-  try {
+  }, ({ build, artifactsDir }) => {
     const result = runPrepare({
       variant: "nanoc6-thread",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /not the approved layout for nanoc6-thread/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
 
 test("prepare_release.sh valid path passes every fail-closed check before esptool", () => {
@@ -2354,32 +2375,120 @@ test("prepare_release.sh valid path passes every fail-closed check before esptoo
   // check is exercised, not that the placeholder is a real ESP32-C6 layout.
   const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
   const originalVariants = readFileSync(variantsPath, "utf8");
-  const { root, build } = makeFixtureBuild();
-  const partitionBytes = Buffer.alloc(0xC00, 0x00);
-  writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
-  const forgedHash = createHash("sha256").update(partitionBytes).digest("hex");
-  const patched = JSON.parse(originalVariants);
-  patched.variants["nanoc6-thread"].partition_table_sha256 = forgedHash;
-  writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
-  try {
-    const result = runPrepare({
+  withFixture({}, ({ build, artifactsDir }) => {
+    const partitionBytes = Buffer.alloc(0xC00, 0x00);
+    writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+    const forgedHash = createHash("sha256").update(partitionBytes).digest("hex");
+    const patched = JSON.parse(originalVariants);
+    patched.variants["nanoc6-thread"].partition_table_sha256 = forgedHash;
+    writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+    try {
+      const result = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+      });
+      // The script gets past every fail-closed check and only fails when it
+      // tries to invoke esptool.py (which is not on this test host). That is
+      // proof the valid path reached asset assembly.
+      if (result.status === 0) {
+        // If esptool is present, packaging succeeds.
+        assert.match(result.stdout, /Release artifacts for variant nanoc6-thread/);
+      } else {
+        assert.match(result.stderr, /esptool\.py not on PATH|merge_bin|IDF_PATH/);
+      }
+    } finally {
+      writeFileSync(variantsPath, originalVariants);
+    }
+  });
+});
+
+test("prepare_release.sh rejects a project_description app_bin that is not <project_name>.bin", () => {
+  // Patch variants.json to accept the fixture's forged partition hash so
+  // the earlier fail-closed checks pass; then declare a bad app_bin and
+  // confirm the packager refuses before staging.
+  const variantsPath = new URL("../../firmware/variants.json", import.meta.url);
+  const originalVariants = readFileSync(variantsPath, "utf8");
+  withFixture({}, ({ build, artifactsDir }) => {
+    const partitionBytes = Buffer.alloc(0xC00, 0x00);
+    writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+    const forgedHash = createHash("sha256").update(partitionBytes).digest("hex");
+    const patched = JSON.parse(originalVariants);
+    patched.variants["nanoc6-thread"].partition_table_sha256 = forgedHash;
+    writeFileSync(variantsPath, JSON.stringify(patched, null, 2));
+    try {
+      const descPath = path.join(build, "project_description.json");
+      const desc = JSON.parse(readFileSync(descPath, "utf8"));
+      desc.app_bin = "surprise.bin";
+      writeFileSync(descPath, JSON.stringify(desc));
+      const result = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /app_bin is 'surprise\.bin'.*aliro-nanoc6-thread\.bin/);
+      // Nothing must be written under the artifacts tmp root when the
+      // check fires before staging.
+      assert.deepEqual(readdirSync(artifactsDir), [],
+        "no staging directory should exist under artifactsDir when app_bin is rejected");
+    } finally {
+      writeFileSync(variantsPath, originalVariants);
+    }
+  });
+});
+
+test("prepare_release.sh fixture tests never touch the repository artifacts tree", () => {
+  const repoArtifactsPath = new URL("../../artifacts/", import.meta.url).pathname;
+  const snapshot = () => {
+    try {
+      return readdirSync(repoArtifactsPath).sort();
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }
+  };
+  const before = snapshot();
+  // Run every fixture path once with a tmp artifacts root and confirm
+  // repo/artifacts is unchanged. This test both proves the sandboxing
+  // works and guards against a future regression that hardcodes the
+  // repo path back in.
+  withFixture({ projectName: "door_lock" }, ({ build, artifactsDir }) => {
+    runPrepare({
       variant: "nanoc6-thread",
       tag: "aliro-v0.0.6-devkit",
       buildDir: build,
+      artifactsDir,
     });
-    // The script gets past every fail-closed check and only fails when it
-    // tries to invoke esptool.py (which is not on this test host). That is
-    // proof the valid path reached asset assembly.
-    if (result.status === 0) {
-      // If esptool is present, packaging succeeds.
-      assert.match(result.stdout, /Release artifacts for variant nanoc6-thread/);
-    } else {
-      assert.match(result.stderr, /esptool\.py not on PATH|merge_bin|IDF_PATH/);
-    }
-  } finally {
-    writeFileSync(variantsPath, originalVariants);
-    rmSync(root, { recursive: true, force: true });
-  }
+  });
+  withFixture({}, ({ build, artifactsDir }) => {
+    runPrepare({
+      variant: "nanoc6-thread",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: build,
+      artifactsDir,
+    });
+  });
+  const after = snapshot();
+  assert.deepEqual(after, before,
+    "prepare_release.sh must not create, replace, or remove anything under repo/artifacts when ALIRO_ARTIFACTS_DIR points elsewhere");
+});
+
+test("runPrepare refuses to point at the repository artifacts tree", () => {
+  const repoArtifactsPath = new URL("../../artifacts/", import.meta.url).pathname;
+  withFixture({}, ({ build }) => {
+    assert.throws(
+      () => runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir: repoArtifactsPath.replace(/\/$/, ""),
+      }),
+      /must not point at the repository artifacts tree/,
+    );
+  });
 });
 
 test("README and installer link to each other", () => {
