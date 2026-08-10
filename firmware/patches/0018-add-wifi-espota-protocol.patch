@@ -1,0 +1,509 @@
+Add the Arduino-espota protocol parser + challenge / response
+authentication module. This is a pure library that later Wi-Fi
+patches will wire into a UDP invitation listener + TCP receiver
+task. Applied only to nanoc6-wifi and atoms3-lite-wifi via
+variants.json; nanoc6-thread never applies, compiles, links, or
+exposes any of the code here.
+
+Scope, kept minimal (no callers, no sockets, no tasks, no OTA
+core calls, no service start, no runtime behaviour, no HTTP
+route, no page UI, no auth policy change, no settings or log
+changes, no new runtime dependency, no partition change, no
+build-file change):
+
+  * NEW main/aliro_espota_protocol.h: declares the four pure
+    entry points ParseInvitation / FormatChallenge / ParseAuth
+    / VerifyAuth, the two parsed-message struct types, and the
+    stored password hash constant kAliroEspotaStoredHashHex.
+
+  * NEW main/aliro_espota_protocol.cpp: implements the parsers
+    and the auth verifier:
+      - Invitation "<cmd> <port> <size> <32-hex md5>\n":
+          command byte compared as a strict byte-string "0 " so
+          "100" (filesystem), leading-zero variants and any
+          nonzero command are refused;
+          port decimal in [1, 65535];
+          size decimal > 0 with an overflow-safe uint64
+          multiply-add, then narrowed to uint32_t;
+          md5 exactly 32 hex characters, decoded to 16 bytes
+          via a case-insensitive hex path (A-F and a-f both
+          accepted, then normalised by decoding to bytes) —
+          per reviewer, downstream comparisons happen on raw
+          bytes so client letter case cannot bypass;
+          trailing '\n' required; a NUL inside the payload
+          is rejected.
+      - Challenge "AUTH <64 lower-hex nonce>" written to a
+          caller-provided buffer of at least 69 bytes; NOT
+          NUL-terminated.
+      - Auth "200 <64 lower-hex cnonce> <64 lower-hex
+          response>\n": exact length; strict prefix; both hex
+          fields are strict lower-hex (per assignment),
+          decoded to 32 raw bytes each.
+      - Verify:
+          salt = nonce_hex + ':' + cnonce_hex (129 bytes);
+          derived = PBKDF2-HMAC-SHA256(kAliroEspotaStoredHashHex,
+                    salt, 10000 iters, 32 bytes);
+          expected = SHA-256(derived_hex + ':' + nonce_hex + ':'
+                    + cnonce_hex);
+          constant-time compare via mbedtls_ct_memcmp;
+          every intermediate buffer zeroised via
+          mbedtls_platform_zeroize on every return path.
+      - No malloc anywhere; only fixed stack buffers.
+      - Uses IDF-supplied mbedtls_pkcs5_pbkdf2_hmac_ext,
+        mbedtls_sha256, mbedtls_ct_memcmp, and
+        mbedtls_platform_zeroize.
+      - Default password "aliro-ota" is NEVER stored. Only
+        kAliroEspotaStoredHashHex =
+        016d7675c49c4b9c22719f36ce56bfb0b526ff984ad02852369f9c6f697c835b
+        is in the image.
+
+  * WIRE the new patch into nanoc6-wifi and atoms3-lite-wifi
+    source_patches in firmware/variants.json.
+    nanoc6-thread source_patches is unchanged.
+
+Explicit non-goals for this patch: no callers, no sockets, no
+tasks, no OTA core calls, no service start, no runtime
+behaviour, no HTTP route, no page UI, no authentication policy
+change, no settings or log changes, no new runtime dependency,
+no partition change, no CMakeLists.txt change (SRC_DIRS "."
+already picks up main/ .cpp files on Wi-Fi variants).
+
+diff --git a/examples/door_lock/main/aliro_espota_protocol.h b/examples/door_lock/main/aliro_espota_protocol.h
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_protocol.h
+@@ -0,0 +1,119 @@
++/*
++   Arduino-espota protocol parser + challenge / response
++   authentication for the Aliro door-lock reader firmware. Compiled
++   and linked only on the Wi-Fi variants (nanoc6-wifi and
++   atoms3-lite-wifi); the Thread variant never applies, compiles,
++   or links this module.
++
++   Scope, and only this scope: a pure library that parses the two
++   text messages exchanged with the Arduino espota client
++   (invitation, auth), formats the server challenge, and verifies
++   the client response against the stored password hash. This
++   module opens no sockets, spawns no tasks, calls no OTA core
++   entry points, and starts no service.
++
++   The default password is "aliro-ota". Only its SHA-256 hex is
++   stored (kAliroEspotaStoredHashHex).
++*/
++
++#pragma once
++
++#include <esp_err.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Sizes.
++enum {
++    kAliroEspotaNonceBytes      = 32,               // raw random bytes
++    kAliroEspotaHexLen          = 64,               // = kAliroEspotaNonceBytes * 2
++    kAliroEspotaMd5HexLen       = 32,
++    kAliroEspotaMd5Bytes        = 16,
++    kAliroEspotaChallengeLen    = 5 + 64,           // "AUTH " + 64 lower hex
++    kAliroEspotaResponseBytes   = 32,               // SHA-256 output
++    kAliroEspotaDerivedBytes    = 32,
++    kAliroEspotaDerivedHexLen   = 64,
++    kAliroEspotaPbkdf2Iters     = 10000,
++};
++
++/*
++   Parsed invitation. The Arduino espota client sends
++   "<cmd> <client_port> <size> <md5-hex>\n" where cmd == 0 is a
++   flash-app upload. This module rejects the filesystem command
++   100 and every other nonzero command.
++*/
++typedef struct {
++    uint16_t client_port;
++    uint32_t size;
++    uint8_t  md5[kAliroEspotaMd5Bytes];             // decoded from hex
++} aliro_espota_invitation_t;
++
++/*
++   Parse "0 <port> <size> <32 hex-md5>\n".
++
++   Rejects: cmd != 0 (including 100), port outside 1..65535,
++   size == 0, size that would overflow uint32_t, wrong md5
++   length, non-hex md5, extra fields, missing trailing '\n', a
++   NUL byte inside the payload, and leading '+'/'-' signs.
++   Returns ESP_OK on success, else ESP_ERR_INVALID_ARG.
++*/
++esp_err_t AliroEspotaParseInvitation(const char *line, size_t len,
++                                     aliro_espota_invitation_t *out);
++
++/*
++   Format the server challenge "AUTH <64 lower-hex nonce>" from
++   the caller-provided 32 random bytes. Writes exactly
++   kAliroEspotaChallengeLen bytes into `out`; does NOT NUL-
++   terminate. Returns ESP_ERR_INVALID_ARG if `cap` is smaller
++   than kAliroEspotaChallengeLen.
++*/
++esp_err_t AliroEspotaFormatChallenge(const uint8_t nonce[kAliroEspotaNonceBytes],
++                                     char *out, size_t cap);
++
++/*
++   Parsed auth response. cnonce and response are the raw 32-byte
++   decodings of the client's two hex tokens.
++*/
++typedef struct {
++    uint8_t cnonce[kAliroEspotaNonceBytes];
++    uint8_t response[kAliroEspotaResponseBytes];
++} aliro_espota_auth_t;
++
++/*
++   Parse "200 <64 lower-hex cnonce> <64 lower-hex response>\n".
++
++   Rejects: prefix != "200 ", either hex field of wrong length or
++   non-hex, extra fields, missing trailing '\n', a NUL byte inside
++   the payload. Returns ESP_OK on success, else
++   ESP_ERR_INVALID_ARG.
++*/
++esp_err_t AliroEspotaParseAuth(const char *line, size_t len,
++                               aliro_espota_auth_t *out);
++
++/*
++   Verify the client response against the default stored password
++   hash. The salt is ASCII nonce (64 hex) + ":" + cnonce (64 hex).
++   The key is derived with PBKDF2-HMAC-SHA256, 10 000 iterations,
++   using the stored hash's ASCII hex as the password. The expected
++   response is SHA-256 of ASCII derived_hex + ":" + nonce + ":" +
++   cnonce, compared to auth->response in constant time.
++
++   Returns ESP_OK on match, ESP_ERR_INVALID_STATE on mismatch,
++   ESP_FAIL on internal error. Sensitive intermediate buffers are
++   zeroised before return on all paths.
++*/
++esp_err_t AliroEspotaVerifyAuth(const uint8_t nonce[kAliroEspotaNonceBytes],
++                                const aliro_espota_auth_t *auth);
++
++/*
++   ASCII lower-hex SHA-256 of the default password "aliro-ota".
++   Length 64 + trailing NUL.
++*/
++extern const char kAliroEspotaStoredHashHex[65];
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/examples/door_lock/main/aliro_espota_protocol.cpp b/examples/door_lock/main/aliro_espota_protocol.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_protocol.cpp
+@@ -0,0 +1,310 @@
++/*
++   Arduino-espota protocol parser + challenge / response
++   authentication for the Aliro door-lock reader firmware.
++   Wi-Fi variants only (nanoc6-wifi, atoms3-lite-wifi); the
++   Thread variant never applies, compiles, or links this file.
++
++   This is a pure library module. It opens no sockets, spawns no
++   tasks, calls no OTA core entry points, and starts no service.
++   The espota server is a later patch and will wire this module.
++
++   The default password is "aliro-ota". Only its SHA-256 hex is
++   stored in flash (kAliroEspotaStoredHashHex); the plaintext
++   never appears in the image.
++*/
++
++#include "aliro_espota_protocol.h"
++
++#include <string.h>
++
++#include <mbedtls/constant_time.h>
++#include <mbedtls/md.h>
++#include <mbedtls/pkcs5.h>
++#include <mbedtls/platform_util.h>
++#include <mbedtls/sha256.h>
++
++/*
++   ASCII lower-hex SHA-256 of the default password "aliro-ota".
++   Length 64 hex chars + terminating NUL. The plaintext password
++   is NOT stored anywhere in this file or the image.
++*/
++extern "C" const char kAliroEspotaStoredHashHex[65] =
++    "016d7675c49c4b9c22719f36ce56bfb0b526ff984ad02852369f9c6f697c835b";
++
++namespace {
++
++/*
++   Decode a single strict lower-hex character into 0..15. Returns
++   -1 if the character is not [0-9a-f]. Used for the cnonce and
++   response tokens where the assignment requires strict lower-hex.
++*/
++int hex_nibble(char c) {
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
++    return -1;
++}
++
++/*
++   Decode a single case-insensitive hex character into 0..15.
++   Accepts [0-9a-fA-F]. Used only for the invitation MD5, per the
++   reviewer clarification: MD5 must be normalised by decoding
++   regardless of the client's letter case, then compared to the
++   uploaded image's MD5 downstream on raw bytes.
++*/
++int hex_nibble_ci(char c) {
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
++    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
++    return -1;
++}
++
++/*
++   Decode `hex_len` strict lower-hex characters into `out`.
++   Returns true on success, false on any non-hex byte. hex_len
++   must be even.
++*/
++bool hex_decode(const char *hex, size_t hex_len, uint8_t *out) {
++    if ((hex_len & 1u) != 0) return false;
++    for (size_t i = 0; i < hex_len; i += 2) {
++        int hi = hex_nibble(hex[i]);
++        int lo = hex_nibble(hex[i + 1]);
++        if (hi < 0 || lo < 0) return false;
++        out[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
++    }
++    return true;
++}
++
++/*
++   Decode `hex_len` case-insensitive hex characters into `out`.
++   Used only by the invitation MD5 path.
++*/
++bool hex_decode_ci(const char *hex, size_t hex_len, uint8_t *out) {
++    if ((hex_len & 1u) != 0) return false;
++    for (size_t i = 0; i < hex_len; i += 2) {
++        int hi = hex_nibble_ci(hex[i]);
++        int lo = hex_nibble_ci(hex[i + 1]);
++        if (hi < 0 || lo < 0) return false;
++        out[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
++    }
++    return true;
++}
++
++/*
++   Encode `in_len` bytes as `2 * in_len` lower-hex characters.
++   Never writes a trailing NUL; the caller sizes the output.
++*/
++void hex_encode(const uint8_t *in, size_t in_len, char *out) {
++    static const char kDigits[] = "0123456789abcdef";
++    for (size_t i = 0; i < in_len; ++i) {
++        out[2 * i]     = kDigits[(in[i] >> 4) & 0x0F];
++        out[2 * i + 1] = kDigits[in[i] & 0x0F];
++    }
++}
++
++/*
++   Parse a decimal token that starts at *p, must contain only
++   ASCII digits '0'..'9' (no sign, no leading whitespace, no
++   trailing digits beyond the token), and must be terminated by
++   the byte `terminator`. On success returns true, advances *p
++   past the terminator, and writes the parsed value into *out.
++   Rejects overflow of uint64_t; the caller narrows.
++*/
++bool parse_decimal_u64(const char **p, const char *end,
++                       char terminator, uint64_t *out) {
++    const char *cur = *p;
++    if (cur >= end) return false;
++    if (*cur < '0' || *cur > '9') return false;
++    uint64_t v = 0;
++    while (cur < end && *cur >= '0' && *cur <= '9') {
++        uint64_t digit = static_cast<uint64_t>(*cur - '0');
++        // Overflow-safe multiply-add: check v > (max - digit) / 10.
++        if (v > (UINT64_MAX - digit) / 10ULL) return false;
++        v = v * 10ULL + digit;
++        ++cur;
++    }
++    if (cur >= end || *cur != terminator) return false;
++    ++cur;  // consume terminator
++    *p = cur;
++    *out = v;
++    return true;
++}
++
++}  // namespace
++
++esp_err_t AliroEspotaParseInvitation(const char *line, size_t len,
++                                     aliro_espota_invitation_t *out) {
++    if (line == nullptr || out == nullptr) return ESP_ERR_INVALID_ARG;
++    // Trailing '\n' is required.
++    if (len == 0 || line[len - 1] != '\n') return ESP_ERR_INVALID_ARG;
++    // A NUL byte anywhere in the payload is a rejection.
++    for (size_t i = 0; i + 1 < len; ++i) {
++        if (line[i] == '\0') return ESP_ERR_INVALID_ARG;
++    }
++
++    const char *p   = line;
++    const char *end = line + len;
++
++    // Command must be exactly "0" followed by a space. This
++    // refuses filesystem command "100" and every other nonzero
++    // command; strict-byte compare is safer than parsing a
++    // decimal and rejecting !=0 because it also refuses
++    // "00", "0 " variants and leading-zero shenanigans.
++    if ((end - p) < 2) return ESP_ERR_INVALID_ARG;
++    if (p[0] != '0' || p[1] != ' ') return ESP_ERR_INVALID_ARG;
++    p += 2;
++
++    // Port: decimal 1..65535, terminated by a single space.
++    uint64_t port_u = 0;
++    if (!parse_decimal_u64(&p, end, ' ', &port_u)) return ESP_ERR_INVALID_ARG;
++    if (port_u == 0 || port_u > 65535) return ESP_ERR_INVALID_ARG;
++
++    // Size: decimal > 0, must fit in uint32_t, terminated by a
++    // single space. parse_decimal_u64 already caught wraparound
++    // inside u64; here we narrow to u32.
++    uint64_t size_u = 0;
++    if (!parse_decimal_u64(&p, end, ' ', &size_u)) return ESP_ERR_INVALID_ARG;
++    if (size_u == 0 || size_u > UINT32_MAX) return ESP_ERR_INVALID_ARG;
++
++    // MD5: exactly 32 lower-hex characters, then the trailing '\n'
++    // which is (end - 1).
++    if ((end - p) != static_cast<ptrdiff_t>(kAliroEspotaMd5HexLen + 1)) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    uint8_t md5_bin[kAliroEspotaMd5Bytes];
++    // MD5 accepts case-insensitive hex per assignment; the parser
++    // normalises by decoding to raw bytes, so downstream byte
++    // comparisons behave the same for upper and lower case client
++    // input.
++    if (!hex_decode_ci(p, kAliroEspotaMd5HexLen, md5_bin)) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    if (p[kAliroEspotaMd5HexLen] != '\n') return ESP_ERR_INVALID_ARG;
++
++    out->client_port = static_cast<uint16_t>(port_u);
++    out->size        = static_cast<uint32_t>(size_u);
++    memcpy(out->md5, md5_bin, kAliroEspotaMd5Bytes);
++    return ESP_OK;
++}
++
++esp_err_t AliroEspotaFormatChallenge(const uint8_t nonce[kAliroEspotaNonceBytes],
++                                     char *out, size_t cap) {
++    if (nonce == nullptr || out == nullptr) return ESP_ERR_INVALID_ARG;
++    if (cap < static_cast<size_t>(kAliroEspotaChallengeLen)) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    static const char kAuth[] = "AUTH ";
++    memcpy(out, kAuth, 5);
++    hex_encode(nonce, kAliroEspotaNonceBytes, out + 5);
++    return ESP_OK;
++}
++
++esp_err_t AliroEspotaParseAuth(const char *line, size_t len,
++                               aliro_espota_auth_t *out) {
++    if (line == nullptr || out == nullptr) return ESP_ERR_INVALID_ARG;
++    if (len == 0 || line[len - 1] != '\n') return ESP_ERR_INVALID_ARG;
++    for (size_t i = 0; i + 1 < len; ++i) {
++        if (line[i] == '\0') return ESP_ERR_INVALID_ARG;
++    }
++    // Exact expected length: "200 " + 64 hex + " " + 64 hex + "\n"
++    constexpr size_t kExpectedLen = 4 + 64 + 1 + 64 + 1;
++    if (len != kExpectedLen) return ESP_ERR_INVALID_ARG;
++
++    if (line[0] != '2' || line[1] != '0' || line[2] != '0' || line[3] != ' ') {
++        return ESP_ERR_INVALID_ARG;
++    }
++    if (line[4 + 64] != ' ')     return ESP_ERR_INVALID_ARG;
++    if (line[len - 1] != '\n')   return ESP_ERR_INVALID_ARG;
++
++    uint8_t cnonce_bin[kAliroEspotaNonceBytes];
++    uint8_t resp_bin[kAliroEspotaResponseBytes];
++    if (!hex_decode(line + 4, 64, cnonce_bin))                return ESP_ERR_INVALID_ARG;
++    if (!hex_decode(line + 4 + 64 + 1, 64, resp_bin))         return ESP_ERR_INVALID_ARG;
++
++    memcpy(out->cnonce, cnonce_bin, kAliroEspotaNonceBytes);
++    memcpy(out->response, resp_bin, kAliroEspotaResponseBytes);
++    return ESP_OK;
++}
++
++esp_err_t AliroEspotaVerifyAuth(const uint8_t nonce[kAliroEspotaNonceBytes],
++                                const aliro_espota_auth_t *auth) {
++    if (nonce == nullptr || auth == nullptr) return ESP_ERR_INVALID_ARG;
++
++    /*
++       Fixed intermediate buffers on the stack. No heap. Every
++       sensitive buffer is zeroised before return on every path
++       via mbedtls_platform_zeroize.
++
++       Layout:
++         nonce_hex   : 64 ASCII lower hex
++         cnonce_hex  : 64 ASCII lower hex
++         salt        : nonce_hex + ':' + cnonce_hex  = 129 bytes
++         derived     : 32 raw bytes
++         derived_hex : 64 ASCII lower hex
++         msg         : derived_hex + ':' + nonce_hex + ':'
++                       + cnonce_hex                   = 194 bytes
++         expected    : 32 raw bytes (SHA-256 of msg)
++    */
++    char    nonce_hex[kAliroEspotaHexLen];
++    char    cnonce_hex[kAliroEspotaHexLen];
++    char    salt[kAliroEspotaHexLen + 1 + kAliroEspotaHexLen];
++    uint8_t derived[kAliroEspotaDerivedBytes];
++    char    derived_hex[kAliroEspotaDerivedHexLen];
++    char    msg[kAliroEspotaDerivedHexLen + 1
++                + kAliroEspotaHexLen + 1
++                + kAliroEspotaHexLen];
++    uint8_t expected[kAliroEspotaResponseBytes];
++
++    esp_err_t result = ESP_FAIL;
++
++    hex_encode(nonce, kAliroEspotaNonceBytes, nonce_hex);
++    hex_encode(auth->cnonce, kAliroEspotaNonceBytes, cnonce_hex);
++
++    memcpy(salt, nonce_hex, kAliroEspotaHexLen);
++    salt[kAliroEspotaHexLen] = ':';
++    memcpy(salt + kAliroEspotaHexLen + 1, cnonce_hex, kAliroEspotaHexLen);
++
++    int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(
++        MBEDTLS_MD_SHA256,
++        reinterpret_cast<const unsigned char *>(kAliroEspotaStoredHashHex),
++        static_cast<size_t>(kAliroEspotaHexLen),
++        reinterpret_cast<const unsigned char *>(salt),
++        sizeof(salt),
++        static_cast<unsigned int>(kAliroEspotaPbkdf2Iters),
++        static_cast<uint32_t>(kAliroEspotaDerivedBytes),
++        derived);
++    if (rc != 0) { result = ESP_FAIL; goto out; }
++
++    hex_encode(derived, kAliroEspotaDerivedBytes, derived_hex);
++
++    memcpy(msg, derived_hex, kAliroEspotaDerivedHexLen);
++    msg[kAliroEspotaDerivedHexLen] = ':';
++    memcpy(msg + kAliroEspotaDerivedHexLen + 1, nonce_hex, kAliroEspotaHexLen);
++    msg[kAliroEspotaDerivedHexLen + 1 + kAliroEspotaHexLen] = ':';
++    memcpy(msg + kAliroEspotaDerivedHexLen + 1 + kAliroEspotaHexLen + 1,
++           cnonce_hex, kAliroEspotaHexLen);
++
++    rc = mbedtls_sha256(
++        reinterpret_cast<const unsigned char *>(msg),
++        sizeof(msg),
++        expected,
++        0 /* is224 == 0 => SHA-256 */);
++    if (rc != 0) { result = ESP_FAIL; goto out; }
++
++    // Constant-time compare so a partial-match attacker cannot
++    // learn the response byte by byte.
++    if (mbedtls_ct_memcmp(expected, auth->response, kAliroEspotaResponseBytes) == 0) {
++        result = ESP_OK;
++    } else {
++        result = ESP_ERR_INVALID_STATE;
++    }
++
++out:
++    mbedtls_platform_zeroize(nonce_hex,   sizeof(nonce_hex));
++    mbedtls_platform_zeroize(cnonce_hex,  sizeof(cnonce_hex));
++    mbedtls_platform_zeroize(salt,        sizeof(salt));
++    mbedtls_platform_zeroize(derived,     sizeof(derived));
++    mbedtls_platform_zeroize(derived_hex, sizeof(derived_hex));
++    mbedtls_platform_zeroize(msg,         sizeof(msg));
++    mbedtls_platform_zeroize(expected,    sizeof(expected));
++    return result;
++}

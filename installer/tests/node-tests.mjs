@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync, existsSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, pbkdf2Sync } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8323,3 +8323,344 @@ function runPhase3Task3UploadScript({ fetchImpl }) {
   }
   return { formEl, fileEl, submitEl, statusEl, calls, settle };
 }
+
+// -----------------------------------------------------------------------
+// Phase 3 task 4: espota protocol + auth module
+// -----------------------------------------------------------------------
+
+const PHASE3_TASK4_PATCH = "firmware/patches/0018-add-wifi-espota-protocol.patch";
+
+function phase3Task4PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE3_TASK4_PATCH}`, import.meta.url), "utf8");
+}
+
+function extractPhase3Task4NewFile(basename) {
+  const patch = phase3Task4PatchText();
+  const lines = patch.split("\n");
+  const header = `+++ b/examples/door_lock/main/${basename}`;
+  let i = lines.findIndex((line) => line === header);
+  assert.ok(i > 0,
+    `patch 0018 must add examples/door_lock/main/${basename}`);
+  const body = [];
+  for (i++; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("diff --git ") || line.startsWith("+++ b/")) break;
+    if (line.startsWith("@@")) continue;
+    if (line.startsWith("+")) body.push(line.slice(1));
+  }
+  return body.join("\n");
+}
+
+test("phase 3 task 4: patch 0018 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE3_TASK4_PATCH),
+      `${id}.source_patches must include ${PHASE3_TASK4_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE3_TASK4_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only espota-protocol patch");
+});
+
+test("phase 3 task 4: patch 0018 creates exactly two files, both under examples/door_lock/main/", () => {
+  const patch = phase3Task4PatchText();
+  const paths = patch.match(/^diff --git a\/([^\s]+) /gm) || [];
+  for (const line of paths) {
+    const m = line.match(/^diff --git a\/([^\s]+) /);
+    assert.match(m[1], /^examples\/door_lock\/main\/aliro_espota_protocol\.(h|cpp)$/,
+      `patch 0018 must only touch aliro_espota_protocol.h and .cpp; saw ${m[1]}`);
+  }
+  assert.equal((patch.match(/^new file mode 100644$/gm) || []).length, 2,
+    "patch 0018 must add exactly two new files");
+});
+
+test("phase 3 task 4: header declares the required entry points and constants", () => {
+  const header = extractPhase3Task4NewFile("aliro_espota_protocol.h");
+  assert.match(header, /esp_err_t\s+AliroEspotaParseInvitation\s*\(/,
+    "header must declare AliroEspotaParseInvitation");
+  assert.match(header, /esp_err_t\s+AliroEspotaFormatChallenge\s*\(/,
+    "header must declare AliroEspotaFormatChallenge");
+  assert.match(header, /esp_err_t\s+AliroEspotaParseAuth\s*\(/,
+    "header must declare AliroEspotaParseAuth");
+  assert.match(header, /esp_err_t\s+AliroEspotaVerifyAuth\s*\(/,
+    "header must declare AliroEspotaVerifyAuth");
+  assert.match(header, /extern\s+const\s+char\s+kAliroEspotaStoredHashHex\s*\[\s*65\s*\]/,
+    "header must extern-declare kAliroEspotaStoredHashHex[65]");
+  assert.match(header, /extern\s+"C"\s*\{/,
+    "header must expose C linkage");
+});
+
+test("phase 3 task 4: stored hash constant is exactly SHA-256('aliro-ota') as ASCII lower hex", () => {
+  const cpp = extractPhase3Task4NewFile("aliro_espota_protocol.cpp");
+  const expected = "016d7675c49c4b9c22719f36ce56bfb0b526ff984ad02852369f9c6f697c835b";
+  const literal = new RegExp(
+    `const\\s+char\\s+kAliroEspotaStoredHashHex\\s*\\[\\s*65\\s*\\]\\s*=\\s*"${expected}"\\s*;`);
+  assert.match(cpp, literal,
+    "cpp must define kAliroEspotaStoredHashHex = SHA-256('aliro-ota') lower-hex");
+  // Cross-check with node crypto so a typo in the constant fails here
+  const computed = createHash("sha256").update("aliro-ota").digest("hex");
+  assert.equal(computed, expected,
+    "node-side sanity: sha256('aliro-ota') must equal the stored hash");
+  // Plaintext password MUST NOT appear as a compiled string
+  // literal anywhere in the .cpp. Strip comments before the
+  // check — the header comment legitimately names the default
+  // password in prose without embedding it in a runtime literal.
+  const codeOnly = cpp
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.equal(codeOnly.includes('"aliro-ota"'), false,
+    "the plaintext default password must NEVER appear as a runtime string literal in the cpp");
+});
+
+test("phase 3 task 4: verifier uses PBKDF2-HMAC-SHA256 with 10000 iterations, constant-time compare, and zeroises intermediates", () => {
+  const cpp = extractPhase3Task4NewFile("aliro_espota_protocol.cpp");
+  const header = extractPhase3Task4NewFile("aliro_espota_protocol.h");
+  assert.match(cpp, /mbedtls_pkcs5_pbkdf2_hmac_ext\s*\(/,
+    "verifier must call mbedtls_pkcs5_pbkdf2_hmac_ext");
+  assert.match(header, /kAliroEspotaPbkdf2Iters\s*=\s*10000/,
+    "kAliroEspotaPbkdf2Iters constant must be 10000 in the header");
+  assert.match(cpp, /kAliroEspotaPbkdf2Iters\b/,
+    "verifier must reference kAliroEspotaPbkdf2Iters (never a raw literal)");
+  assert.match(cpp, /MBEDTLS_MD_SHA256/,
+    "PBKDF2 must be requested with MBEDTLS_MD_SHA256");
+  assert.match(cpp, /mbedtls_ct_memcmp\s*\(\s*expected\s*,\s*auth->response\s*,\s*kAliroEspotaResponseBytes\s*\)/,
+    "constant-time compare must be mbedtls_ct_memcmp(expected, auth->response, kAliroEspotaResponseBytes)");
+  for (const buf of ["nonce_hex", "cnonce_hex", "salt", "derived", "derived_hex", "msg", "expected"]) {
+    const rx = new RegExp(`mbedtls_platform_zeroize\\s*\\(\\s*${buf}\\s*,`);
+    assert.match(cpp, rx,
+      `every sensitive buffer must be zeroised: ${buf}`);
+  }
+});
+
+test("phase 3 task 4: no malloc / calloc / new / heap anywhere in the espota module (fixed buffers only)", () => {
+  const cpp = extractPhase3Task4NewFile("aliro_espota_protocol.cpp");
+  const header = extractPhase3Task4NewFile("aliro_espota_protocol.h");
+  for (const token of ["malloc(", "calloc(", "realloc(", "operator new", " new ", "heap_caps_"]) {
+    assert.equal(cpp.includes(token), false, `cpp must not use ${token}`);
+    assert.equal(header.includes(token), false, `header must not use ${token}`);
+  }
+});
+
+test("phase 3 task 4: patch introduces NO callers, sockets, tasks, OTA core calls, service start, or runtime behaviour", () => {
+  const cpp = extractPhase3Task4NewFile("aliro_espota_protocol.cpp");
+  const header = extractPhase3Task4NewFile("aliro_espota_protocol.h");
+  const both = cpp + "\n" + header;
+  for (const token of [
+    "socket(", "AF_INET", "SOCK_STREAM", "SOCK_DGRAM", "bind(", "listen(", "accept(",
+    "recv(", "recvfrom(", "send(", "sendto(",
+    "xTaskCreate", "vTaskDelay",
+    "AliroLocalOta", "esp_ota_",
+    "httpd_", "esp_http_server",
+    "esp_restart(", "esp_wifi_", "esp_netif_",
+    "app_main", "start_server", "stop_server",
+  ]) {
+    assert.equal(both.includes(token), false,
+      `patch 0018 must NOT introduce ${token} — this module is a pure library`);
+  }
+});
+
+test("phase 3 task 4: invitation parser accepts CASE-INSENSITIVE MD5 (A-F and a-f), strict lower-hex for cnonce/response", () => {
+  const cpp = extractPhase3Task4NewFile("aliro_espota_protocol.cpp");
+  // MD5 must use hex_decode_ci; auth fields must use strict hex_decode.
+  assert.match(cpp, /hex_decode_ci\s*\(\s*p\s*,\s*kAliroEspotaMd5HexLen\s*,\s*md5_bin\s*\)/,
+    "invitation MD5 must be decoded via hex_decode_ci (case-insensitive)");
+  assert.match(cpp,
+    /hex_decode\s*\(\s*line\s*\+\s*4\s*,\s*64\s*,\s*cnonce_bin\s*\)/,
+    "auth cnonce must be decoded via strict lower-hex hex_decode");
+  assert.match(cpp,
+    /hex_decode\s*\(\s*line\s*\+\s*4\s*\+\s*64\s*\+\s*1\s*,\s*64\s*,\s*resp_bin\s*\)/,
+    "auth response must be decoded via strict lower-hex hex_decode");
+  // hex_nibble_ci must accept A-F but hex_nibble must not
+  assert.match(cpp,
+    /int\s+hex_nibble_ci\s*\(\s*char\s+c\s*\)[\s\S]*?c\s*>=\s*'A'\s*&&\s*c\s*<=\s*'F'/,
+    "hex_nibble_ci must accept upper-case A-F");
+  const strictBody = cpp.match(
+    /int\s+hex_nibble\s*\(\s*char\s+c\s*\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(strictBody, "must find strict hex_nibble definition");
+  assert.equal(/'A'\s*&&\s*c\s*<=\s*'F'/.test(strictBody[1]), false,
+    "strict hex_nibble must NOT accept upper-case A-F");
+});
+
+/*
+   Reference re-implementation of the C parser + verifier in JS,
+   so tests can exercise the same edge cases the C code should
+   reject and the same happy path the C code should accept.
+*/
+function jsParseInvitation(line) {
+  if (typeof line !== "string" || !line.endsWith("\n")) return null;
+  if (line.slice(0, -1).includes("\0")) return null;
+  const s = line.slice(0, -1);
+  // "0 <port> <size> <md5>"
+  if (!s.startsWith("0 ")) return null;
+  const rest = s.slice(2);
+  const parts = rest.split(" ");
+  if (parts.length !== 3) return null;
+  const [portStr, sizeStr, md5Str] = parts;
+  if (!/^\d+$/.test(portStr)) return null;
+  const port = Number(portStr);
+  if (port < 1 || port > 65535) return null;
+  if (!/^\d+$/.test(sizeStr)) return null;
+  // Overflow-safe: reject anything > 2**32-1
+  if (sizeStr.length > 10 || BigInt(sizeStr) > 0xFFFFFFFFn) return null;
+  const size = Number(sizeStr);
+  if (size === 0) return null;
+  if (md5Str.length !== 32 || !/^[0-9a-fA-F]{32}$/.test(md5Str)) return null;
+  const md5 = Buffer.from(md5Str, "hex");
+  return { client_port: port, size, md5 };
+}
+
+function jsFormatChallenge(nonce32) {
+  if (!(nonce32 instanceof Uint8Array) || nonce32.length !== 32) return null;
+  return "AUTH " + Buffer.from(nonce32).toString("hex");
+}
+
+function jsParseAuth(line) {
+  if (typeof line !== "string" || !line.endsWith("\n")) return null;
+  if (line.slice(0, -1).includes("\0")) return null;
+  if (line.length !== 4 + 64 + 1 + 64 + 1) return null;
+  if (!line.startsWith("200 ")) return null;
+  if (line[4 + 64] !== " ") return null;
+  const cnonceHex = line.slice(4, 4 + 64);
+  const respHex = line.slice(4 + 64 + 1, 4 + 64 + 1 + 64);
+  if (!/^[0-9a-f]{64}$/.test(cnonceHex)) return null;   // strict lower-hex
+  if (!/^[0-9a-f]{64}$/.test(respHex)) return null;
+  return { cnonce: Buffer.from(cnonceHex, "hex"), response: Buffer.from(respHex, "hex") };
+}
+
+function jsVerifyAuth(nonce32, auth) {
+  const storedHashHex = "016d7675c49c4b9c22719f36ce56bfb0b526ff984ad02852369f9c6f697c835b";
+  const nonceHex = Buffer.from(nonce32).toString("hex");
+  const cnonceHex = Buffer.from(auth.cnonce).toString("hex");
+  const salt = nonceHex + ":" + cnonceHex;
+  const derived = pbkdf2Sync(storedHashHex, salt, 10000, 32, "sha256");
+  const derivedHex = derived.toString("hex");
+  const expected = createHash("sha256")
+    .update(derivedHex + ":" + nonceHex + ":" + cnonceHex).digest();
+  return Buffer.compare(expected, auth.response) === 0;
+}
+
+test("phase 3 task 4 vector: PBKDF2 + SHA-256 chain matches the assigned fixed test vector", () => {
+  const nonce = Buffer.from("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex");
+  const cnonce = Buffer.from("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "hex");
+  const stored = "016d7675c49c4b9c22719f36ce56bfb0b526ff984ad02852369f9c6f697c835b";
+  const salt = nonce.toString("hex") + ":" + cnonce.toString("hex");
+  const derived = pbkdf2Sync(stored, salt, 10000, 32, "sha256").toString("hex");
+  assert.equal(derived,
+    "c67189ff2fab52e64778b99e8f4b44621b2c21a982098d600ea66d318b2a96f0",
+    "derived key must match the assigned fixed vector");
+  const response = createHash("sha256")
+    .update(derived + ":" + nonce.toString("hex") + ":" + cnonce.toString("hex"))
+    .digest("hex");
+  assert.equal(response,
+    "793f6487b47035e4abba5ced9535cb0b01310159e17d244e181669e5b0119350",
+    "response must match the assigned fixed vector");
+});
+
+test("phase 3 task 4 vector: JS reference verify accepts the correct response and rejects flipped bits", () => {
+  const nonce = Buffer.from("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex");
+  const cnonce = Buffer.from("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f", "hex");
+  const good = Buffer.from("793f6487b47035e4abba5ced9535cb0b01310159e17d244e181669e5b0119350", "hex");
+  const auth = { cnonce, response: good };
+  assert.equal(jsVerifyAuth(nonce, auth), true,
+    "correct response must verify");
+  // Flip one bit
+  const bad = Buffer.from(good);
+  bad[0] ^= 0x01;
+  assert.equal(jsVerifyAuth(nonce, { cnonce, response: bad }), false,
+    "single-bit-flipped response must NOT verify");
+});
+
+test("phase 3 task 4 parser edges: valid invitation with lower-hex md5", () => {
+  const md5Hex = "0123456789abcdef0123456789abcdef";
+  const line = `0 8266 12345 ${md5Hex}\n`;
+  const inv = jsParseInvitation(line);
+  assert.ok(inv, "well-formed invitation must parse");
+  assert.equal(inv.client_port, 8266);
+  assert.equal(inv.size, 12345);
+  assert.equal(inv.md5.toString("hex"), md5Hex);
+});
+
+test("phase 3 task 4 parser edges: invitation with UPPER-CASE md5 hex must be accepted (normalised)", () => {
+  const md5Hex = "0123456789ABCDEF0123456789ABCDEF";
+  const line = `0 8266 12345 ${md5Hex}\n`;
+  const inv = jsParseInvitation(line);
+  assert.ok(inv, "upper-case md5 must be accepted");
+  assert.equal(inv.md5.toString("hex"), md5Hex.toLowerCase(),
+    "md5 must be normalised by decoding to raw bytes");
+});
+
+test("phase 3 task 4 parser edges: invitation rejects command 100 (filesystem) and every nonzero command", () => {
+  for (const bad of [
+    `100 8266 12345 0123456789abcdef0123456789abcdef\n`,     // filesystem
+    `1 8266 12345 0123456789abcdef0123456789abcdef\n`,       // nonzero
+    `01 8266 12345 0123456789abcdef0123456789abcdef\n`,      // leading-zero variant
+    `00 8266 12345 0123456789abcdef0123456789abcdef\n`,      // "00 " variant
+  ]) {
+    assert.equal(jsParseInvitation(bad), null,
+      `must reject: ${bad.trimEnd()}`);
+  }
+});
+
+test("phase 3 task 4 parser edges: invitation rejects port outside 1..65535, including 0 and 65536", () => {
+  const md5 = "0123456789abcdef0123456789abcdef";
+  assert.equal(jsParseInvitation(`0 0 100 ${md5}\n`), null, "port 0 must reject");
+  assert.equal(jsParseInvitation(`0 65536 100 ${md5}\n`), null, "port 65536 must reject");
+  assert.equal(jsParseInvitation(`0 4294967296 100 ${md5}\n`), null, "port > u32 must reject");
+});
+
+test("phase 3 task 4 parser edges: invitation rejects size 0 and any size that would overflow uint32_t", () => {
+  const md5 = "0123456789abcdef0123456789abcdef";
+  assert.equal(jsParseInvitation(`0 8266 0 ${md5}\n`), null, "size 0 must reject");
+  // 2^32 = 4294967296 -> exactly one past u32 max
+  assert.equal(jsParseInvitation(`0 8266 4294967296 ${md5}\n`), null, "size 2^32 must reject");
+  // Extreme overflow attempt
+  const huge = "9".repeat(30);
+  assert.equal(jsParseInvitation(`0 8266 ${huge} ${md5}\n`), null,
+    "very long decimal that would overflow u64 must reject");
+});
+
+test("phase 3 task 4 parser edges: invitation rejects wrong md5 length and non-hex md5", () => {
+  assert.equal(jsParseInvitation("0 8266 100 short\n"), null, "short md5 must reject");
+  assert.equal(jsParseInvitation("0 8266 100 " + "z".repeat(32) + "\n"), null, "non-hex md5 must reject");
+  assert.equal(jsParseInvitation("0 8266 100 " + "a".repeat(31) + "\n"), null, "31-char md5 must reject");
+  assert.equal(jsParseInvitation("0 8266 100 " + "a".repeat(33) + "\n"), null, "33-char md5 must reject");
+});
+
+test("phase 3 task 4 parser edges: invitation rejects missing trailing newline and NUL bytes inside payload", () => {
+  const md5 = "0123456789abcdef0123456789abcdef";
+  assert.equal(jsParseInvitation(`0 8266 100 ${md5}`), null, "missing \\n must reject");
+  assert.equal(jsParseInvitation(`0 8266 100 ${md5}\r\n`), null, "trailing CRLF must reject (only \\n)");
+  assert.equal(jsParseInvitation(`0\x008266 100 ${md5}\n`), null, "NUL inside payload must reject");
+});
+
+test("phase 3 task 4 parser edges: auth accepts the canonical shape and rejects the common misforms", () => {
+  const cnHex = "20".repeat(1) + "21".repeat(1) + "a".repeat(60); // 64 lower-hex
+  const cn = Array.from({length: 32}, (_, i) => (0x20 + i).toString(16).padStart(2, "0")).join("");
+  const rh = Array.from({length: 32}, (_, i) => (0x40 + i).toString(16).padStart(2, "0")).join("");
+  const line = `200 ${cn} ${rh}\n`;
+  const a = jsParseAuth(line);
+  assert.ok(a, "canonical auth line must parse");
+  assert.equal(a.cnonce.toString("hex"), cn);
+  assert.equal(a.response.toString("hex"), rh);
+  // Reject upper-case in strict fields
+  assert.equal(jsParseAuth(`200 ${cn.toUpperCase()} ${rh}\n`), null,
+    "upper-case cnonce must reject (strict lower-hex)");
+  assert.equal(jsParseAuth(`200 ${cn} ${rh.toUpperCase()}\n`), null,
+    "upper-case response must reject (strict lower-hex)");
+  // Wrong prefix
+  assert.equal(jsParseAuth(`201 ${cn} ${rh}\n`), null, "wrong prefix must reject");
+  // Missing newline
+  assert.equal(jsParseAuth(`200 ${cn} ${rh}`), null, "missing \\n must reject");
+  // Wrong separator
+  assert.equal(jsParseAuth(`200  ${cn} ${rh}\n`), null, "double space after 200 must reject");
+  // Extra trailing bytes
+  assert.equal(jsParseAuth(`200 ${cn} ${rh}\nx`), null, "trailing bytes past \\n must reject");
+});
+
+test("phase 3 task 4 challenge format: produces exactly 'AUTH <64 lower-hex>'", () => {
+  const nonce = Buffer.alloc(32);
+  for (let i = 0; i < 32; i++) nonce[i] = i;
+  const s = jsFormatChallenge(nonce);
+  assert.equal(s, "AUTH 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  assert.equal(s.length, 69, "challenge must be exactly 5 + 64 = 69 bytes");
+});
