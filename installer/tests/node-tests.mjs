@@ -5942,6 +5942,339 @@ test("phase 2 task 6 correction 2: embedded save classifies AbortError as networ
     "AbortError on save must NOT be reclassified as invalid response");
 });
 
+// Phase 2 task 8: recent-log ring + GET /api/logs on Wi-Fi variants.
+// Patch 0013 hooks esp_log via esp_log_set_vprintf, preserves the
+// prior serial sink, keeps every formatted line in a bounded 16 KiB
+// ring, and serves a chronological snapshot at /api/logs.
+
+const PHASE2_TASK8_PATCH = "firmware/patches/0013-add-wifi-log-capture.patch";
+
+function phase2Task8PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE2_TASK8_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 8: patch 0013 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_TASK8_PATCH),
+      `${id}.source_patches must include ${PHASE2_TASK8_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_TASK8_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only log-capture patch");
+  const patch = phase2Task8PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 8: patch 0013 keeps scope inside examples/door_lock/main/ only", () => {
+  const patch = phase2Task8PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  for (const p of modifiedPaths) {
+    assert.match(p, /^examples\/door_lock\/main\//,
+      `patch must only touch examples/door_lock/main/; got ${p}`);
+  }
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_local_web.h",
+    "examples/door_lock/main/aliro_local_web.cpp",
+    "examples/door_lock/main/app_main.cpp",
+  ]));
+});
+
+test("phase 2 task 8: log sink installs early in app_main via AliroLocalWebLogInit", () => {
+  const patch = phase2Task8PatchText();
+  // The header exports AliroLocalWebLogInit.
+  assert.match(patch,
+    /esp_err_t\s+AliroLocalWebLogInit\s*\(\s*void\s*\)\s*;/,
+    "aliro_local_web.h must declare AliroLocalWebLogInit(void)");
+  // The app_main hunk calls it as the FIRST statement inside app_main.
+  const appMainMatch = patch.match(
+    /diff --git a\/examples\/door_lock\/main\/app_main\.cpp[\s\S]*/,
+  );
+  assert.ok(appMainMatch, "must find the app_main.cpp diff");
+  const appMainSection = appMainMatch[0];
+  assert.match(appMainSection,
+    /\+\s*\(void\)\s*AliroLocalWebLogInit\s*\(\s*\)\s*;/,
+    "app_main.cpp diff must add a AliroLocalWebLogInit() call");
+  // The add must appear BEFORE the existing nvs_flash_init() call.
+  const initIdx = appMainSection.indexOf("(void) AliroLocalWebLogInit();");
+  const nvsIdx = appMainSection.indexOf("nvs_flash_init()");
+  assert.ok(initIdx > 0 && nvsIdx > initIdx,
+    "AliroLocalWebLogInit must appear BEFORE nvs_flash_init in the app_main diff");
+});
+
+test("phase 2 task 8: log sink preserves the prior serial vprintf and its return value", () => {
+  const patch = phase2Task8PatchText();
+  // s_prev_vprintf is captured from esp_log_set_vprintf.
+  assert.match(patch,
+    /s_prev_vprintf\s*=\s*esp_log_set_vprintf\s*\(\s*&log_sink_vprintf\s*\)/,
+    "AliroLocalWebLogInit must install the sink via esp_log_set_vprintf and keep the previous callback");
+  // The sink invokes the previous vprintf on the serial path and
+  // returns ITS byte count.
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(sinkMatch, "must find the log_sink_vprintf body");
+  const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(sink, /int\s+written\s*=\s*0/,
+    "sink must track the previous-vprintf return value in 'written'");
+  assert.match(sink, /written\s*=\s*s_prev_vprintf\s*\(\s*fmt\s*,\s*to_serial\s*\)/,
+    "sink must invoke s_prev_vprintf and store its return value in 'written'");
+  assert.match(sink, /return\s+written\s*;/,
+    "sink must return the previous vprintf's byte count");
+});
+
+test("phase 2 task 8: log sink uses independent va_copy values for serial and ring", () => {
+  const patch = phase2Task8PatchText();
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // Two va_copy calls, two matching va_end calls, and distinct
+  // va_list names for the serial sink and the ring format.
+  const copyCount = (sink.match(/va_copy\s*\(/g) || []).length;
+  const endCount = (sink.match(/va_end\s*\(/g) || []).length;
+  assert.equal(copyCount, 2, "sink must call va_copy exactly twice (serial + ring)");
+  assert.equal(endCount, 2, "sink must call va_end exactly twice for the two copies");
+  assert.match(sink, /va_copy\s*\(\s*to_serial\s*,\s*args\s*\)/,
+    "sink must va_copy into a to_serial va_list");
+  assert.match(sink, /va_copy\s*\(\s*to_ring\s*,\s*args\s*\)/,
+    "sink must va_copy into a to_ring va_list");
+});
+
+test("phase 2 task 8: log sink formats OUTSIDE the ring lock and does not call ESP_LOG or malloc", () => {
+  const patch = phase2Task8PatchText();
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // vsnprintf runs BEFORE the critical section is entered.
+  const vsnprintfIdx = sink.indexOf("vsnprintf");
+  const enterCritIdx = sink.indexOf("portENTER_CRITICAL_SAFE");
+  assert.ok(vsnprintfIdx > 0, "sink must call vsnprintf to format the message");
+  assert.ok(enterCritIdx > vsnprintfIdx,
+    "vsnprintf must run BEFORE portENTER_CRITICAL_SAFE");
+  // Never calls ESP_LOG* or allocates.
+  assert.doesNotMatch(sink, /\bESP_LOG[A-Z]\s*\(/,
+    "sink must NOT call any ESP_LOG* macro");
+  assert.doesNotMatch(sink, /\bmalloc\s*\(|\bcalloc\s*\(|\brealloc\s*\(|\bnew\b/,
+    "sink must NOT allocate memory");
+});
+
+test("phase 2 task 8: log sink uses a critical-section lock (no silent drops on contention)", () => {
+  const patch = phase2Task8PatchText();
+  // The ring lock is a portMUX declared with portMUX_INITIALIZER_UNLOCKED.
+  assert.match(patch,
+    /portMUX_TYPE\s+s_log_lock\s*=\s*portMUX_INITIALIZER_UNLOCKED/,
+    "ring lock must be a statically-initialised portMUX spinlock");
+  // The sink enters and exits the critical section with the *_SAFE
+  // variants so it is callable from any task context.
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(sink, /portENTER_CRITICAL_SAFE\s*\(\s*&s_log_lock\s*\)/,
+    "sink must enter the critical section around the ring copy");
+  assert.match(sink, /portEXIT_CRITICAL_SAFE\s*\(\s*&s_log_lock\s*\)/,
+    "sink must exit the critical section after the ring copy");
+  // NO no-wait mutex take (the pre-review sketch used
+  // xSemaphoreTake(..., 0) which silently dropped diagnostic data).
+  assert.doesNotMatch(sink, /xSemaphoreTake\s*\([^)]*,\s*0\s*\)/,
+    "sink must NOT use a no-wait xSemaphoreTake — no silent drops on contention");
+});
+
+test("phase 2 task 8: log sink appends a clear truncation marker instead of silently cropping", () => {
+  const patch = phase2Task8PatchText();
+  // The marker is defined.
+  assert.match(patch, /kLogTruncMarker\[\]\s*=\s*"\.\.\.\[log truncated\]\\n"/,
+    "patch must define kLogTruncMarker as '...[log truncated]\\n'");
+  // The sink rewrites the tail on truncation.
+  const sinkMatch = patch.match(
+    /\+int log_sink_vprintf\(const char \* fmt, va_list args\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  const sink = sinkMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(sink,
+    /if\s*\(\s*static_cast<size_t>\(n\)\s*>=\s*sizeof\(line\)\s*\)/,
+    "sink must detect truncation via vsnprintf's return >= buffer size");
+  assert.match(sink,
+    /memcpy\s*\(\s*line\s*\+\s*head_len\s*,\s*kLogTruncMarker\s*,\s*kLogTruncMarkerLen\s*\)/,
+    "sink must copy the truncation marker into the tail of the stack buffer");
+});
+
+test("phase 2 task 8: ring is 16 KiB and snapshot is chronological under the critical section", () => {
+  const patch = phase2Task8PatchText();
+  // Ring size constant.
+  assert.match(patch, /kLogRingSize\s*=\s*16\s*\*\s*1024/,
+    "kLogRingSize must be exactly 16 KiB");
+  // Snapshot function contract.
+  const snapMatch = patch.match(
+    /\+esp_err_t log_ring_snapshot\(char \*\* out, size_t \* out_len\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(snapMatch, "must find log_ring_snapshot body");
+  const snap = snapMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // Ordering: malloc BEFORE portENTER, memcpy INSIDE critical section, portEXIT BEFORE return.
+  const mallocIdx = snap.indexOf("malloc(kLogRingSize)");
+  const enterIdx  = snap.indexOf("portENTER_CRITICAL_SAFE");
+  const memcpyIdx = snap.indexOf("memcpy(buf");
+  const exitIdx   = snap.indexOf("portEXIT_CRITICAL_SAFE");
+  assert.ok(mallocIdx > 0 && enterIdx > mallocIdx,
+    "malloc must happen BEFORE entering the critical section");
+  assert.ok(memcpyIdx > enterIdx,
+    "memcpy must happen INSIDE the critical section");
+  assert.ok(exitIdx > memcpyIdx,
+    "portEXIT must happen after the memcpy and BEFORE the return");
+  // Chronological order: when wrapped, copy head..end first, then 0..head.
+  assert.match(snap, /memcpy\(buf,\s*s_log_ring\s*\+\s*s_log_head,\s*tail_len\)/,
+    "wrapped snapshot must copy the tail (head..end) first");
+  assert.match(snap, /memcpy\(buf\s*\+\s*tail_len,\s*s_log_ring,\s*s_log_head\)/,
+    "wrapped snapshot must copy the head (0..head) second, appended to the tail");
+  // Allocation failure is handled — return ESP_ERR_NO_MEM.
+  assert.match(snap, /return\s+ESP_ERR_NO_MEM\s*;/,
+    "snapshot must return ESP_ERR_NO_MEM on malloc failure");
+});
+
+test("phase 2 task 8: /api/logs sets text/plain + Cache-Control no-store, releases lock before send, and frees the buffer", () => {
+  const patch = phase2Task8PatchText();
+  const handlerMatch = patch.match(
+    /\+esp_err_t logs_get_handler\(httpd_req_t \* req\)\n\+\{[\s\S]*?^[+ ]\}$/m,
+  );
+  assert.ok(handlerMatch, "must find logs_get_handler body");
+  const h = handlerMatch[0].split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // The handler calls log_ring_snapshot BEFORE it sets any header.
+  const snapIdx = h.indexOf("log_ring_snapshot");
+  const typeIdx = h.indexOf("httpd_resp_set_type");
+  const hdrIdx  = h.indexOf("httpd_resp_set_hdr");
+  const sendIdx = h.indexOf("httpd_resp_send(req, buf, len)");
+  const freeIdx = h.indexOf("free(buf)");
+  assert.ok(snapIdx > 0 && typeIdx > snapIdx && hdrIdx > snapIdx && sendIdx > hdrIdx && freeIdx > sendIdx,
+    "handler must snapshot → set headers → send → free (in that order)");
+  // Correct headers.
+  assert.match(h,
+    /httpd_resp_set_type\s*\(\s*req\s*,\s*"text\/plain; charset=utf-8"\s*\)/,
+    "handler must set Content-Type: text/plain; charset=utf-8");
+  assert.match(h,
+    /httpd_resp_set_hdr\s*\(\s*req\s*,\s*"Cache-Control"\s*,\s*"no-store"\s*\)/,
+    "handler must set Cache-Control: no-store");
+  // Alloc failure is surfaced as 503.
+  assert.match(h,
+    /ESP_ERR_NO_MEM[\s\S]*?"503 Service Unavailable"[\s\S]*?"out_of_memory"/,
+    "handler must surface log_ring_snapshot ESP_ERR_NO_MEM as 503 out_of_memory");
+});
+
+test("phase 2 task 8: /api/logs is registered as the 7th URI handler; max_uri_handlers is 7", () => {
+  const patch = phase2Task8PatchText();
+  assert.match(patch, /max_uri_handlers\s*=\s*7/,
+    "max_uri_handlers must be bumped to 7");
+  assert.match(patch, /"\/api\/logs",\s+HTTP_GET/,
+    "GET /api/logs must be declared");
+  assert.match(patch, /httpd_register_uri_handler\s*\(\s*s_server\s*,\s*&kLogs\s*\)/,
+    "start_server must register the /api/logs handler");
+});
+
+test("phase 2 task 8: patch 0013 stores log text without redaction and has no forbidden subsystem", () => {
+  const patch = phase2Task8PatchText();
+  const addedLines = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  // No transformations of the formatted line before copy — the sink
+  // copies `line` byte-for-byte and never calls tolower/toupper,
+  // strncasecmp, or similar redaction primitives.
+  const forbiddenTransforms = [
+    { name: "tolower/toupper transform", pattern: /\btolower\s*\(|\btoupper\s*\(/ },
+    { name: "case-insensitive compare", pattern: /\bstr[nc]?casecmp\s*\(/ },
+    { name: "sensitive-word filter",    pattern: /\b(secret|password|redact|scrub)\b/i },
+  ];
+  for (const { name, pattern } of forbiddenTransforms) {
+    assert.doesNotMatch(addedLines, pattern,
+      `sink must not perform ${name} on log text`);
+  }
+  const forbidden = [
+    { name: "log viewer UI (HTML/JS)", pattern: /<script>|<form>/ },
+    { name: "WebSocket route",         pattern: /HTTPD_WS_|Sec-WebSocket|httpd_ws_/ },
+    { name: "OTA route",               pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "auth middleware",         pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate|httpd_basic_auth/ },
+    { name: "reset route",             pattern: /"\/(api\/)?factory(reset|-reset)?"|"\/api\/reset"/ },
+    { name: "reboot route",            pattern: /"\/(api\/)?reboot"|esp_restart\s*\(/ },
+    { name: "settings backend change", pattern: /nvs_open\s*\(|AliroSettingsSerializedSetApply/ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0013 must not introduce ${name}`);
+  }
+});
+
+// Runtime tests: exercise the sink logic (formatted-line → ring
+// bytes, truncation marker, chronological wrap) by mirroring the
+// C algorithm in JS with the same 16 KiB ring size and marker.
+
+function makeMirrorRing(sizeBytes) {
+  const ring = new Array(sizeBytes).fill(0);
+  let head = 0;
+  let wrapped = false;
+  const marker = "...[log truncated]\n";
+  const lineMax = 256;
+  function writeLine(text) {
+    // Emulate vsnprintf into a 256-byte stack buffer: if source is
+    // >= 256, the tail is replaced with the marker.
+    let out;
+    if (text.length >= lineMax) {
+      const headLen = lineMax - 1 - marker.length;
+      out = text.slice(0, headLen) + marker;
+    } else {
+      out = text;
+    }
+    for (const ch of out) {
+      ring[head] = ch;
+      head = (head + 1) % sizeBytes;
+      if (head === 0) wrapped = true;
+    }
+  }
+  function snapshot() {
+    if (!wrapped) return ring.slice(0, head).join("");
+    return ring.slice(head).join("") + ring.slice(0, head).join("");
+  }
+  return { writeLine, snapshot };
+}
+
+test("phase 2 task 8 runtime: bounded 16 KiB ring wraps and snapshot is chronological", () => {
+  const ring = makeMirrorRing(16 * 1024);
+  // Fill just under one full ring with a handful of short lines.
+  ring.writeLine("A".repeat(10));
+  const s1 = ring.snapshot();
+  assert.equal(s1, "A".repeat(10), "unwrapped snapshot returns bytes so far");
+  // Wrap the ring by pushing enough sub-256-byte lines to exceed
+  // the ring size (each sink call is bounded to ~256 bytes; the
+  // reviewer requires the ring itself to be 16 KiB).
+  // 100 * 200 = 20,000 bytes > 16 KiB.
+  for (let i = 0; i < 100; i++) {
+    ring.writeLine("B".repeat(200));
+  }
+  const s2 = ring.snapshot();
+  assert.equal(s2.length, 16 * 1024, "wrapped snapshot returns exactly kLogRingSize bytes");
+  // After that flood the surviving oldest byte cannot be an 'A'.
+  assert.doesNotMatch(s2.slice(0, 50), /A/,
+    "after full wrap the surviving prefix should not contain the pre-wrap 'A' bytes");
+  // A third write — a small tail after wrap — must appear at the
+  // end of the chronological snapshot.
+  ring.writeLine("Z".repeat(5));
+  const s3 = ring.snapshot();
+  assert.equal(s3.slice(-5), "ZZZZZ",
+    "third write appears at the tail of the chronological snapshot");
+});
+
+test("phase 2 task 8 runtime: over-length messages get the '...[log truncated]\\n' marker", () => {
+  const ring = makeMirrorRing(16 * 1024);
+  ring.writeLine("X".repeat(500));
+  const s = ring.snapshot();
+  assert.ok(s.endsWith("...[log truncated]\n"),
+    "an over-length line must end with the truncation marker in the ring");
+  // The stored line is exactly 255 bytes (256-byte buffer minus '\0').
+  assert.equal(s.length, 255,
+    `truncated line length should be lineMax-1 (255), got ${s.length}`);
+});
+
 test("phase 2 task 6 correction 1: patch 0012 removes populate's leading-# strip and outer catch classifies SyntaxError", () => {
   const patch = phase2Task6PatchText();
   // populate no longer strips a leading '#' from the response.

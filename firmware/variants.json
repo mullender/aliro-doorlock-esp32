@@ -80,7 +80,8 @@
         "firmware/patches/0009-add-wifi-local-web.patch",
         "firmware/patches/0010-add-wifi-local-pairing-qr.patch",
         "firmware/patches/0011-add-wifi-settings-api.patch",
-        "firmware/patches/0012-add-wifi-settings-page.patch"
+        "firmware/patches/0012-add-wifi-settings-page.patch",
+        "firmware/patches/0013-add-wifi-log-capture.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
@@ -133,7 +134,8 @@
         "firmware/patches/0009-add-wifi-local-web.patch",
         "firmware/patches/0010-add-wifi-local-pairing-qr.patch",
         "firmware/patches/0011-add-wifi-settings-api.patch",
-        "firmware/patches/0012-add-wifi-settings-page.patch"
+        "firmware/patches/0012-add-wifi-settings-page.patch",
+        "firmware/patches/0013-add-wifi-log-capture.patch"
       ],
       "dependency_patches": [
         "firmware/patches/0005-add-m5nfc-aliro-ecp.patch"
