@@ -67,11 +67,16 @@ function validateStatus(fields) {
     throw new Error("The firmware version is not a semantic devkit version.");
   }
   // Variant and transport are additive fields. Pre-Phase-1 firmware
-  // does not print them; treat that as the legacy nanoc6-thread build.
-  const variant = Object.hasOwn(fields, "variant")
+  // does not print them; treat that as the legacy nanoc6-thread build
+  // for legacy display, but record whether each field was explicitly
+  // reported so callers that need proof-of-matrix-support (such as
+  // the preserving-update guard) can refuse a legacy-defaulted value.
+  const variantExplicit = Object.hasOwn(fields, "variant");
+  const transportExplicit = Object.hasOwn(fields, "transport");
+  const variant = variantExplicit
     ? parseIdentifier(fields.variant, "variant", VARIANT_ID_PATTERN)
     : LEGACY_VARIANT_ID;
-  const transport = Object.hasOwn(fields, "transport")
+  const transport = transportExplicit
     ? parseIdentifier(fields.transport, "transport", TRANSPORT_ID_PATTERN)
     : LEGACY_TRANSPORT_ID;
   return {
@@ -79,6 +84,8 @@ function validateStatus(fields) {
     protocol: 1,
     variant,
     transport,
+    variantExplicit,
+    transportExplicit,
     auto_relock_seconds: parseInteger(
       fields.auto_relock_seconds,
       "auto_relock_seconds",
@@ -145,7 +152,11 @@ export function buildSetRequest(values) {
 
 export function parseDevkitVersion(value) {
   if (typeof value !== "string") return null;
-  const match = /^(?:aliro-c6-)?v?(\d+)\.(\d+)\.(\d+)-devkit$/.exec(value.trim());
+  // Accept the legacy `aliro-c6-vX.Y.Z-devkit`, the Phase 1B matrix
+  // `aliro-vX.Y.Z-devkit`, and the bare `vX.Y.Z-devkit` / `X.Y.Z-devkit`
+  // that the firmware app descriptor emits. Any other shape is malformed.
+  const match =
+    /^(?:aliro-(?:c6-)?)?v?(\d+)\.(\d+)\.(\d+)-devkit$/.exec(value.trim());
   if (!match) return null;
   const parts = match.slice(1).map(Number);
   if (parts.some((part) => !Number.isSafeInteger(part))) return null;

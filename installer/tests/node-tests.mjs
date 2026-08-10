@@ -33,7 +33,15 @@ import {
   buildSetRequest,
   compareDevkitVersions,
   parseAliroProtocolLine,
+  parseDevkitVersion,
 } from "../js/device-protocol.js";
+import {
+  checkPreservingUpdate,
+  getSupportedVariantIds,
+  getVariant,
+  selectFactoryVariant,
+  __internals as matrixInternals,
+} from "../js/firmware-matrix.js";
 import { LOG_FIXTURES } from "./boot-log-fixtures.js";
 import {
   BASE38_VECTORS,
@@ -311,6 +319,11 @@ const VALID_STATUS = {
   // and older). Newer firmware announces the actual variant/transport.
   variant: "nanoc6-thread",
   transport: "thread",
+  // Phase 1B safety-model additions. False when the STATUS line omitted
+  // the field (legacy firmware); true when the device explicitly reported
+  // the identifier over the wire.
+  variantExplicit: false,
+  transportExplicit: false,
   auto_relock_seconds: 10,
   success_rgb: "#00ff00",
   success_ms: 750,
@@ -3468,6 +3481,162 @@ test("deploy-installer.yml does not write releases.json until code consumes it",
   );
   assert.doesNotMatch(workflow, /releases\.json/,
     "workflow must not create releases.json unless current code consumes it");
+});
+
+// --- firmware-matrix.js safety model tests ---
+// The module holds the exact shipped-variant set and two helpers that
+// gate what the installer UI is allowed to write. These tests are
+// table-driven and cover every documented allow / deny path.
+
+test("firmware-matrix exposes exactly the three shipped variants with the right transports and manifests", () => {
+  assert.deepEqual(getSupportedVariantIds().sort(),
+    ["atoms3-lite-wifi", "nanoc6-thread", "nanoc6-wifi"]);
+  const rows = [
+    ["nanoc6-thread",    "thread", "M5Stack NanoC6",
+     "manifest-nanoc6-thread.json", "manifest-update-nanoc6-thread.json"],
+    ["nanoc6-wifi",      "wifi",   "M5Stack NanoC6",
+     "manifest-nanoc6-wifi.json",   "manifest-update-nanoc6-wifi.json"],
+    ["atoms3-lite-wifi", "wifi",   "M5Stack AtomS3 Lite",
+     "manifest-atoms3-lite-wifi.json", "manifest-update-atoms3-lite-wifi.json"],
+  ];
+  for (const [id, transport, boardLabel, mfFactory, mfUpdate] of rows) {
+    const entry = getVariant(id);
+    assert.ok(entry, `variant ${id} must be present`);
+    assert.equal(entry.transport, transport);
+    assert.equal(entry.boardLabel, boardLabel);
+    assert.equal(entry.manifestFactory, mfFactory);
+    assert.equal(entry.manifestUpdate, mfUpdate);
+  }
+  assert.equal(getVariant("does-not-exist"), null);
+});
+
+test("firmware-matrix selectFactoryVariant always resolves and exposes the erase-and-recommission requirement", () => {
+  for (const id of ["nanoc6-thread", "nanoc6-wifi", "atoms3-lite-wifi"]) {
+    const pick = selectFactoryVariant(id);
+    assert.equal(pick.variant.id, id);
+    assert.equal(pick.manifest, `manifest-${id}.json`);
+    assert.equal(pick.mustEraseAndRecommission, true,
+      `${id}: factory selection must mark erase-and-recommission as required`);
+    assert.match(pick.note, /erases/i);
+    assert.match(pick.note, /add the device to your smart home again/i);
+  }
+  assert.throws(() => selectFactoryVariant("mystery-board"), /unknown variant/);
+});
+
+test("firmware-matrix checkPreservingUpdate handles every allow and deny path", () => {
+  const goodStatus = (over = {}) => Object.assign({
+    variant: "nanoc6-thread",
+    transport: "thread",
+    variantExplicit: true,
+    transportExplicit: true,
+  }, over);
+
+  const cases = [
+    // Three valid statuses — one per shipped variant.
+    {
+      name: "nanoc6-thread reports its variant and transport",
+      status: goodStatus({ variant: "nanoc6-thread", transport: "thread" }),
+      expect: { allowed: true, targetVariant: "nanoc6-thread",
+                manifest: "manifest-update-nanoc6-thread.json" },
+    },
+    {
+      name: "nanoc6-wifi reports its variant and transport",
+      status: goodStatus({ variant: "nanoc6-wifi", transport: "wifi" }),
+      expect: { allowed: true, targetVariant: "nanoc6-wifi",
+                manifest: "manifest-update-nanoc6-wifi.json" },
+    },
+    {
+      name: "atoms3-lite-wifi reports its variant and transport",
+      status: goodStatus({ variant: "atoms3-lite-wifi", transport: "wifi" }),
+      expect: { allowed: true, targetVariant: "atoms3-lite-wifi",
+                manifest: "manifest-update-atoms3-lite-wifi.json" },
+    },
+    // Deny paths.
+    {
+      name: "null status is malformed",
+      status: null,
+      expect: { allowed: false, reason: matrixInternals.REASON.MALFORMED_STATUS },
+    },
+    {
+      name: "non-object status is malformed",
+      status: "not-a-status",
+      expect: { allowed: false, reason: matrixInternals.REASON.MALFORMED_STATUS },
+    },
+    {
+      name: "legacy default (variantExplicit=false) is refused",
+      status: goodStatus({ variantExplicit: false }),
+      expect: { allowed: false, reason: matrixInternals.REASON.NO_VARIANT_REPORTED },
+    },
+    {
+      name: "legacy default (transportExplicit=false) is refused",
+      status: goodStatus({ transportExplicit: false }),
+      expect: { allowed: false, reason: matrixInternals.REASON.NO_TRANSPORT_REPORTED },
+    },
+    {
+      name: "unknown variant is refused",
+      status: goodStatus({ variant: "mystery-board", transport: "thread" }),
+      expect: { allowed: false, reason: matrixInternals.REASON.UNKNOWN_VARIANT },
+    },
+    {
+      name: "transport mismatch: nanoc6-wifi shipping thread",
+      status: goodStatus({ variant: "nanoc6-wifi", transport: "thread" }),
+      expect: { allowed: false, reason: matrixInternals.REASON.TRANSPORT_MISMATCH },
+    },
+    {
+      name: "transport mismatch: nanoc6-thread shipping wifi",
+      status: goodStatus({ variant: "nanoc6-thread", transport: "wifi" }),
+      expect: { allowed: false, reason: matrixInternals.REASON.TRANSPORT_MISMATCH },
+    },
+    {
+      name: "transport mismatch: atoms3-lite-wifi shipping thread",
+      status: goodStatus({ variant: "atoms3-lite-wifi", transport: "thread" }),
+      expect: { allowed: false, reason: matrixInternals.REASON.TRANSPORT_MISMATCH },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const result = checkPreservingUpdate(testCase.status);
+    for (const [key, value] of Object.entries(testCase.expect)) {
+      assert.equal(result[key], value,
+        `${testCase.name}: expected ${key}=${value}, got ${result[key]}`);
+    }
+    if (result.allowed === false) {
+      assert.ok(typeof result.note === "string" && result.note.length > 0,
+        `${testCase.name}: deny cases must carry a human note`);
+    }
+  }
+});
+
+test("parseDevkitVersion accepts every documented shape and rejects malformed input", () => {
+  const good = [
+    ["aliro-c6-v0.0.5-devkit", [0, 0, 5]],
+    ["aliro-v0.0.6-devkit",    [0, 0, 6]],
+    ["v0.0.6-devkit",          [0, 0, 6]],
+    ["0.0.6-devkit",           [0, 0, 6]],
+    ["aliro-v1.2.3-devkit",    [1, 2, 3]],
+  ];
+  for (const [text, parts] of good) {
+    const parsed = parseDevkitVersion(text);
+    assert.ok(parsed, `expected ${JSON.stringify(text)} to parse`);
+    assert.deepEqual(parsed.parts, parts, `parts of ${text}`);
+    assert.equal(parsed.normalized, `${parts.join(".")}-devkit`,
+      `normalized form of ${text}`);
+  }
+  const bad = [
+    null, undefined, 0, {}, "",
+    "aliro-c7-v0.0.5-devkit",   // unknown chip prefix
+    "aliro-v0.0.6",              // missing -devkit
+    "aliro-v0.0.6-release",      // wrong suffix
+    "aliro-v0.0-devkit",         // only two version parts
+    "aliro-v0.0.6.7-devkit",     // four version parts
+    "aliro-v-devkit",            // no version
+    "aliro-vabc.def.ghi-devkit", // non-numeric
+    "aliro-v0.0.06-devkit-extra",// trailing junk
+  ];
+  for (const value of bad) {
+    assert.equal(parseDevkitVersion(value), null,
+      `expected ${JSON.stringify(value)} to be rejected`);
+  }
 });
 
 test("README and installer link to each other", () => {
