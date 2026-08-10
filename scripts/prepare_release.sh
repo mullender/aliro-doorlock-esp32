@@ -64,7 +64,15 @@ while [[ "$#" -gt 0 ]]; do
     --build-dir) BUILD_DIR="${2:?--build-dir requires a value}"; shift 2 ;;
     --build-dir=*) BUILD_DIR="${1#--build-dir=}"; shift ;;
     -h|--help) sed -n '1,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    --) shift; break ;;
+    --)
+      # `--` is a common "end of options" marker, but every input here
+      # must be an explicit --flag=value so that a trailing "/path"
+      # cannot be smuggled in past the safe identity checks. Reject
+      # `--` outright, before any build directory is opened.
+      echo "error: -- is not accepted; pass every input as an explicit --variant/--tag/--build-dir flag" >&2
+      usage
+      exit 2
+      ;;
     -*)
       echo "error: unknown option $1" >&2
       usage
@@ -239,16 +247,21 @@ ARTIFACTS_DIR="${ALIRO_ARTIFACTS_DIR:-$REPO_ROOT/artifacts}"
 TAG_DIR="$ARTIFACTS_DIR/$TAG"
 OUT_DIR="$TAG_DIR/$VARIANT_ID"
 
-# Refuse to overwrite an existing final variant directory. Callers that
-# want to republish must delete the existing directory first — an
-# explicit action, not a silent replacement.
-if [[ -e "$OUT_DIR" ]]; then
-  echo "error: $OUT_DIR already exists; refusing to overwrite an existing package" >&2
-  echo "       Delete the directory explicitly to republish." >&2
+mkdir -p "$ARTIFACTS_DIR" "$TAG_DIR"
+
+# Publication lock. mkdir is atomic on POSIX: exactly one caller wins.
+# The lock lives on the same filesystem as OUT_DIR (inside
+# ARTIFACTS_DIR) so a concurrent publisher across the same
+# tag+variant target cannot race with us between the final existence
+# check and the directory rename. The lock is always released on exit,
+# even if a check-only pre-flight later exits non-zero.
+LOCK_DIR="$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.publish.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "error: another publisher holds the lock at $LOCK_DIR" >&2
+  echo "       If no publisher is running, remove the stale lock directory explicitly." >&2
   exit 3
 fi
 
-mkdir -p "$ARTIFACTS_DIR" "$TAG_DIR"
 STAGE_DIR="$(mktemp -d "$ARTIFACTS_DIR/.${TAG}-${VARIANT_ID}.stage.XXXXXX")"
 
 cleanup() {
@@ -256,8 +269,22 @@ cleanup() {
         "$(dirname "$STAGE_DIR")" == "$ARTIFACTS_DIR" ]]; then
     rm -R -- "$STAGE_DIR"
   fi
+  if [[ -n "${LOCK_DIR:-}" && -d "$LOCK_DIR" &&
+        "$(dirname "$LOCK_DIR")" == "$ARTIFACTS_DIR" ]]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
+
+# Refuse to overwrite an existing final variant directory. Because we
+# hold the publication lock, no other publisher can insert a directory
+# between this check and the rename; the pre-flight remains here to
+# fail fast when a completed package is already on disk.
+if [[ -e "$OUT_DIR" ]]; then
+  echo "error: $OUT_DIR already exists; refusing to overwrite an existing package" >&2
+  echo "       Delete the directory explicitly to republish." >&2
+  exit 3
+fi
 
 ASSET_STEM="${TAG}-${VARIANT_ID}"
 OUT_BIN="$STAGE_DIR/${ASSET_STEM}-factory.bin"
@@ -398,14 +425,46 @@ for required in "$OUT_BIN" "$OUT_SHA" "$OUT_APP" "$OUT_APP_SHA" "$OUT_MANIFEST";
   fi
 done
 
-# Publish the complete package as one atomic directory rename. Guard
-# against a racing writer that created the final directory between the
-# earlier pre-flight check and now.
-if [[ -e "$OUT_DIR" ]]; then
-  echo "error: $OUT_DIR appeared during staging; refusing to overwrite" >&2
+# Publish the complete package as one atomic directory rename. Because
+# the publication lock is held, no other publisher can create OUT_DIR
+# between now and the rename. Use Python's os.rename so the syscall
+# fails cleanly if a destination directory somehow already exists — no
+# nesting of the stage directory inside OUT_DIR is possible.
+RENAME_STATUS=0
+python3 - "$STAGE_DIR" "$OUT_DIR" <<'PY' || RENAME_STATUS=$?
+import errno, os, sys
+stage, dest = sys.argv[1], sys.argv[2]
+if os.path.exists(dest):
+    print(f"error: {dest} appeared during staging; refusing to overwrite", file=sys.stderr)
+    sys.exit(3)
+try:
+    os.rename(stage, dest)
+except OSError as exc:
+    if exc.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.EISDIR):
+        print(f"error: refusing to nest stage into existing {dest} (errno={exc.errno})", file=sys.stderr)
+        sys.exit(3)
+    print(f"error: rename {stage!r} -> {dest!r} failed: {exc}", file=sys.stderr)
+    sys.exit(3)
+PY
+if [[ "$RENAME_STATUS" -ne 0 ]]; then
+  exit "$RENAME_STATUS"
+fi
+
+# Verify the stage directory moved to the exact final path and that
+# nothing was nested. If OUT_DIR/<basename STAGE> exists, some caller
+# (or a stale filesystem semantic) nested the stage; abort.
+if [[ -e "$OUT_DIR/$(basename "$STAGE_DIR")" ]]; then
+  echo "error: stage directory was nested inside $OUT_DIR; expected a flat directory rename" >&2
   exit 3
 fi
-mv "$STAGE_DIR" "$OUT_DIR"
+if [[ -d "$STAGE_DIR" ]]; then
+  echo "error: rename did not remove the source stage directory $STAGE_DIR" >&2
+  exit 3
+fi
+if [[ ! -d "$OUT_DIR" ]]; then
+  echo "error: rename claimed success but $OUT_DIR is missing" >&2
+  exit 3
+fi
 STAGE_DIR=""
 
 echo

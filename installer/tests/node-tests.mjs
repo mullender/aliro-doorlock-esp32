@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -2712,6 +2712,132 @@ test("prepare_release.sh rejects positional arguments", () => {
   } finally {
     rmSync(tmpArtifacts, { recursive: true, force: true });
   }
+});
+
+test("prepare_release.sh rejects a bare -- with no other args", () => {
+  const tmpArtifacts = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
+  try {
+    const result = runPrepare({
+      variant: "unused",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: "/tmp/does-not-matter",
+      artifactsDir: tmpArtifacts,
+      extraArgs: ["--"],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /-- is not accepted/);
+  } finally {
+    rmSync(tmpArtifacts, { recursive: true, force: true });
+  }
+});
+
+test("prepare_release.sh rejects a trailing '-- /path' after the flags", () => {
+  const tmpArtifacts = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
+  try {
+    // Even with all required flags supplied, appending `-- /path` must
+    // be rejected outright. The build-dir must never be opened.
+    const result = runPrepare({
+      variant: "unused",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: "/tmp/does-not-matter",
+      artifactsDir: tmpArtifacts,
+      extraArgs: [
+        "--variant", "nanoc6-thread",
+        "--tag", "aliro-v0.0.6-devkit",
+        "--build-dir", "/nonexistent/build",
+        "--", "/tmp/build",
+      ],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /-- is not accepted/);
+    // Must fail before touching the (nonexistent) build directory.
+    assert.doesNotMatch(result.stderr, /flasher_args\.json not found/);
+  } finally {
+    rmSync(tmpArtifacts, { recursive: true, force: true });
+  }
+});
+
+test("prepare_release.sh rejects -- inserted between flags and positional smuggling", () => {
+  const tmpArtifacts = mkdtempSync(path.join(tmpdir(), "prep-artifacts-"));
+  try {
+    // --variant X --tag Y -- extra should reject at -- before extra
+    // is ever interpreted as a build-dir.
+    const result = runPrepare({
+      variant: "unused",
+      tag: "aliro-v0.0.6-devkit",
+      buildDir: "/tmp/does-not-matter",
+      artifactsDir: tmpArtifacts,
+      extraArgs: [
+        "--variant", "nanoc6-thread",
+        "--tag", "aliro-v0.0.6-devkit",
+        "--", "extra-positional",
+      ],
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /-- is not accepted/);
+  } finally {
+    rmSync(tmpArtifacts, { recursive: true, force: true });
+  }
+});
+
+test("prepare_release.sh publication lock blocks a concurrent publisher without touching the winner", () => {
+  const partitionBytes = Buffer.alloc(0xC00, 0x00);
+  withForgedPartition(partitionBytes, () => {
+    withFixture({}, ({ build, artifactsDir }) => {
+      writeFileSync(path.join(build, "partition_table/partition-table.bin"), partitionBytes);
+      const first = runPrepare({
+        variant: "nanoc6-thread",
+        tag: "aliro-v0.0.6-devkit",
+        buildDir: build,
+        artifactsDir,
+        useMockEsptool: true,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      const outDir = path.join(artifactsDir, "aliro-v0.0.6-devkit", "nanoc6-thread");
+      // Snapshot the winner's published files.
+      const winnerFiles = readdirSync(outDir).sort();
+      const winnerDigests = {};
+      for (const f of winnerFiles) {
+        winnerDigests[f] = createHash("sha256").update(readFileSync(path.join(outDir, f))).digest("hex");
+      }
+
+      // Simulate a concurrent publisher by pre-creating the lock
+      // directory. mkdir is atomic, so this is exactly what a live
+      // second publisher would look like from the newcomer's point of
+      // view. The lock name uses the same tag+variant pattern the
+      // script derives.
+      const lockName = `.aliro-v0.0.6-devkit-nanoc6-thread.publish.lock`;
+      const lockPath = path.join(artifactsDir, lockName);
+      // Remove the winner's package so the lock's presence alone is
+      // what blocks the second run (otherwise the existing-package
+      // refusal would fire first). Then re-hold the lock.
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(lockPath);
+      try {
+        const second = runPrepare({
+          variant: "nanoc6-thread",
+          tag: "aliro-v0.0.6-devkit",
+          buildDir: build,
+          artifactsDir,
+          useMockEsptool: true,
+        });
+        assert.notEqual(second.status, 0);
+        assert.match(second.stderr, /another publisher holds the lock/);
+        // The blocked run must not create any nested stage or final
+        // directory, and must not touch the lock (release stays with
+        // whoever created it).
+        assert.equal(existsSync(outDir), false,
+          "blocked publisher must not create a final directory");
+        for (const entry of readdirSync(artifactsDir)) {
+          if (entry === lockName) continue;
+          assert.doesNotMatch(entry, /\.stage\./,
+            `blocked publisher must not leave stage residue: found ${entry}`);
+        }
+      } finally {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 test("runPrepare refuses to point at the repository artifacts tree", () => {
