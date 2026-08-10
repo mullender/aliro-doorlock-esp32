@@ -4780,6 +4780,143 @@ test("phase 2 task 1 correction 1: bind rolls back the first handler if the seco
     "unregister must be in the failure branch, before reconciliation");
 });
 
+// Correction 2 findings — serialization and partial-start cleanup.
+
+test("phase 2 task 1 correction 2: s_server access is serialized by a mutex created before handler registration", () => {
+  const patch = phase2PatchText();
+  // The mutex must be declared alongside s_server, created via a
+  // FreeRTOS static-allocation primitive, and initialized inside
+  // bind BEFORE the first esp_event_handler_instance_register.
+  assert.match(patch, /StaticSemaphore_t\s+s_server_mutex_storage/,
+    "patch must declare static storage for the server mutex");
+  assert.match(patch, /SemaphoreHandle_t\s+s_server_mutex\s*=\s*nullptr/,
+    "patch must declare the server mutex handle");
+  assert.match(patch, /#include\s+<freertos\/FreeRTOS\.h>/,
+    "patch must include FreeRTOS.h");
+  assert.match(patch, /#include\s+<freertos\/semphr\.h>/,
+    "patch must include semphr.h");
+
+  // In bind: the mutex must be created before any handler register.
+  const bindMatch = patch.match(
+    /extern "C" esp_err_t aliro_local_web_bind_wifi_lifecycle\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(bindMatch, "must find the bind function body");
+  const bindCode = bindMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  const mutexCreateIdx = bindCode.indexOf("xSemaphoreCreateMutexStatic");
+  const firstRegisterIdx = bindCode.indexOf("esp_event_handler_instance_register");
+  assert.ok(mutexCreateIdx > 0, "bind must call xSemaphoreCreateMutexStatic");
+  assert.ok(firstRegisterIdx > mutexCreateIdx,
+    "the mutex must be created BEFORE the first event handler register");
+
+  // start_server and stop_server must take + give the mutex around
+  // every s_server access.
+  const startMatch = patch.match(
+    /\+esp_err_t start_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(startMatch, "must find start_server body");
+  const startCode = startMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(startCode, /xSemaphoreTake\s*\(\s*s_server_mutex\s*,\s*portMAX_DELAY\s*\)/,
+    "start_server must take the mutex");
+  assert.match(startCode, /xSemaphoreGive\s*\(\s*s_server_mutex\s*\)/,
+    "start_server must give the mutex on every return path");
+
+  const stopMatch = patch.match(
+    /\+void stop_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(stopMatch, "must find stop_server body");
+  const stopCode = stopMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(stopCode, /xSemaphoreTake\s*\(\s*s_server_mutex\s*,\s*portMAX_DELAY\s*\)/,
+    "stop_server must take the mutex");
+  assert.match(stopCode, /xSemaphoreGive\s*\(\s*s_server_mutex\s*\)/,
+    "stop_server must give the mutex on every return path");
+
+  // Route handlers must NOT take the mutex (they run on the httpd
+  // task and only touch the request; taking the mutex would
+  // serialize HTTP responses against lifecycle transitions).
+  for (const name of ["root_get_handler", "status_get_handler", "pairing_get_handler"]) {
+    const routeMatch = patch.match(
+      new RegExp(`\\+esp_err_t ${name}\\(httpd_req_t \\* req\\)[\\s\\S]*?^\\+\\}`, "m"),
+    );
+    assert.ok(routeMatch, `must find ${name} body`);
+    const routeCode = routeMatch[0]
+      .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+    assert.doesNotMatch(routeCode, /xSemaphoreTake\s*\(\s*s_server_mutex/,
+      `${name} must not hold s_server_mutex during HTTP handling`);
+  }
+});
+
+test("phase 2 task 1 correction 2: URI-registration failure calls httpd_stop and retains handle on stop failure", () => {
+  const patch = phase2PatchText();
+  const startMatch = patch.match(
+    /\+esp_err_t start_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(startMatch, "must find start_server body");
+  const startCode = startMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  // Locate the URI-registration failure block.
+  const uriFailIdx = startCode.indexOf("URI handler register failed");
+  assert.ok(uriFailIdx > 0, "start_server must log a URI-register failure");
+  // Everything after the failure log must include an httpd_stop and
+  // a stop-error branch that keeps the handle.
+  const failTail = startCode.slice(uriFailIdx);
+  assert.match(failTail, /esp_err_t\s+stop_err\s*=\s*httpd_stop\s*\(\s*s_server\s*\)/,
+    "URI-failure branch must capture httpd_stop's return");
+  assert.match(failTail, /if\s*\(\s*stop_err\s*!=\s*ESP_OK\s*\)/,
+    "URI-failure branch must check the stop error");
+  // In the stop-error branch, s_server is NOT cleared before return.
+  const stopErrBranch = failTail.match(
+    /if\s*\(\s*stop_err\s*!=\s*ESP_OK\s*\)\s*\{([\s\S]*?)\}/,
+  );
+  assert.ok(stopErrBranch, "must find the stop-error branch");
+  const stopErrBody = stopErrBranch[1];
+  assert.doesNotMatch(stopErrBody, /s_server\s*=\s*nullptr/,
+    "stop-error branch must NOT clear s_server (retain for later retry)");
+  assert.doesNotMatch(stopErrBody, /s_server_ready\s*=\s*true/,
+    "stop-error branch must never set s_server_ready = true");
+});
+
+test("phase 2 task 1 correction 2: s_server_ready separates complete from partial server state", () => {
+  const patch = phase2PatchText();
+  // The ready flag exists and is only set true after all URI
+  // registrations succeed, and is cleared on stop-failure.
+  assert.match(patch, /bool\s+s_server_ready\s*=\s*false/,
+    "patch must declare s_server_ready as a distinct completeness flag");
+
+  const startMatch = patch.match(
+    /\+esp_err_t start_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  const startCode = startMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  const readyTrueIdx = startCode.indexOf("s_server_ready = true");
+  const uriFailIdx   = startCode.indexOf("URI handler register failed");
+  const httpdStartIdx = startCode.indexOf("httpd_start(&s_server");
+  assert.ok(readyTrueIdx > 0, "start_server must set s_server_ready = true");
+  assert.ok(readyTrueIdx > uriFailIdx,
+    "s_server_ready = true must appear AFTER the URI-failure branch");
+  assert.ok(readyTrueIdx > httpdStartIdx,
+    "s_server_ready = true must appear AFTER httpd_start");
+
+  // start_server's early-return-on-ready branch keeps things idempotent.
+  const readyIfIdx = startCode.indexOf("if (s_server_ready)");
+  assert.ok(readyIfIdx > 0 && readyIfIdx < httpdStartIdx,
+    "start_server must early-return when s_server_ready is already true");
+
+  // stop_server must clear s_server_ready on both the stop-fail and
+  // stop-ok paths so a false 'complete server' report never survives.
+  const stopMatch = patch.match(
+    /\+void stop_server\(void\)[\s\S]*?^\+\}/m,
+  );
+  const stopCode = stopMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  const stopFailIdx = stopCode.indexOf("httpd_stop failed");
+  const stopFailTail = stopCode.slice(stopFailIdx);
+  assert.match(stopFailTail, /s_server_ready\s*=\s*false/,
+    "stop-failure branch must clear s_server_ready");
+});
+
 test("phase 2 task 1 correction 1: stop_server keeps the live handle when httpd_stop fails", () => {
   const patch = phase2PatchText();
   const stopMatch = patch.match(

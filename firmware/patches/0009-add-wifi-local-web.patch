@@ -63,7 +63,7 @@ diff --git a/examples/door_lock/main/aliro_local_web.cpp b/examples/door_lock/ma
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_local_web.cpp
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,427 @@
 +/*
 +   Trusted-LAN HTTP foundation for the Wi-Fi variants of the Aliro
 +   door-lock reader firmware.
@@ -101,6 +101,9 @@ new file mode 100644
 +#include <esp_netif.h>
 +#include <esp_wifi.h>
 +
++#include <freertos/FreeRTOS.h>
++#include <freertos/semphr.h>
++
 +#include <lib/support/Span.h>
 +#include <setup_payload/OnboardingCodesUtil.h>
 +#include <setup_payload/SetupPayload.h>
@@ -116,7 +119,20 @@ new file mode 100644
 +
 +const char * const TAG = "aliro_web";
 +
++// Serializes every read and every write of s_server / s_server_ready
++// across the app-task reconciliation and default event-loop callbacks.
++// The mutex is created in aliro_local_web_bind_wifi_lifecycle BEFORE
++// any esp_event handler is registered, so no callback can race the
++// mutex creation.
++StaticSemaphore_t s_server_mutex_storage;
++SemaphoreHandle_t s_server_mutex = nullptr;
++
++// s_server is the raw httpd handle. s_server_ready is true only when
++// the server is fully brought up (started AND all URIs registered).
++// A stop failure keeps the handle for a later retry but clears the
++// ready flag so callers never see a false "complete server" report.
 +httpd_handle_t s_server = nullptr;
++bool           s_server_ready = false;
 +
 +// Small text page. Deliberately no visual QR rendering — that lands
 +// in a later task. Everything is a literal so nothing dynamic is
@@ -319,7 +335,26 @@ new file mode 100644
 +
 +esp_err_t start_server(void)
 +{
-+    if (s_server != nullptr) return ESP_OK;
++    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
++
++    if (s_server_ready)
++    {
++        xSemaphoreGive(s_server_mutex);
++        return ESP_OK;
++    }
++    // A previous start left a stale partial handle (URI reg failed,
++    // then httpd_stop also failed). Retry cleanup before starting.
++    if (s_server != nullptr)
++    {
++        esp_err_t cleanup_err = httpd_stop(s_server);
++        if (cleanup_err != ESP_OK)
++        {
++            ESP_LOGW(TAG, "cleanup httpd_stop failed: %s", esp_err_to_name(cleanup_err));
++            xSemaphoreGive(s_server_mutex);
++            return cleanup_err;
++        }
++        s_server = nullptr;
++    }
 +
 +    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
 +    cfg.max_uri_handlers = 3;
@@ -332,6 +367,7 @@ new file mode 100644
 +    {
 +        ESP_LOGW(TAG, "httpd_start failed: %s", esp_err_to_name(err));
 +        s_server = nullptr;
++        xSemaphoreGive(s_server_mutex);
 +        return err;
 +    }
 +
@@ -343,27 +379,53 @@ new file mode 100644
 +        httpd_register_uri_handler(s_server, &kPairing) != ESP_OK)
 +    {
 +        ESP_LOGW(TAG, "URI handler register failed");
-+        httpd_stop(s_server);
++        esp_err_t stop_err = httpd_stop(s_server);
++        if (stop_err != ESP_OK)
++        {
++            // Retain the handle so a later lifecycle call can retry
++            // cleanup. Leave s_server_ready false so callers never
++            // see a false "complete server" report.
++            ESP_LOGW(TAG, "httpd_stop after URI register failure: %s",
++                     esp_err_to_name(stop_err));
++            xSemaphoreGive(s_server_mutex);
++            return ESP_FAIL;
++        }
 +        s_server = nullptr;
++        xSemaphoreGive(s_server_mutex);
 +        return ESP_FAIL;
 +    }
 +
++    s_server_ready = true;
++    xSemaphoreGive(s_server_mutex);
 +    ESP_LOGI(TAG, "aliro-web listening on port 80");
 +    return ESP_OK;
 +}
 +
 +void stop_server(void)
 +{
-+    if (s_server == nullptr) return;
++    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
++
++    if (s_server == nullptr)
++    {
++        s_server_ready = false;
++        xSemaphoreGive(s_server_mutex);
++        return;
++    }
 +    esp_err_t err = httpd_stop(s_server);
 +    if (err != ESP_OK)
 +    {
 +        // Retain the live handle so a later stop attempt can retry;
-+        // clearing s_server here would leak the server task.
++        // clearing s_server here would leak the server task. Drop
++        // the ready flag so callers do not see a stale complete
++        // server report between a failed stop and the retry.
 +        ESP_LOGW(TAG, "httpd_stop failed: %s", esp_err_to_name(err));
++        s_server_ready = false;
++        xSemaphoreGive(s_server_mutex);
 +        return;
 +    }
 +    s_server = nullptr;
++    s_server_ready = false;
++    xSemaphoreGive(s_server_mutex);
 +    ESP_LOGI(TAG, "aliro-web stopped");
 +}
 +
@@ -384,6 +446,19 @@ new file mode 100644
 +
 +extern "C" esp_err_t aliro_local_web_bind_wifi_lifecycle(void)
 +{
++    // Create the serialization mutex BEFORE any event handler is
++    // registered, so no callback can ever run while the mutex is
++    // still null. Idempotent on repeat calls.
++    if (s_server_mutex == nullptr)
++    {
++        s_server_mutex = xSemaphoreCreateMutexStatic(&s_server_mutex_storage);
++        if (s_server_mutex == nullptr)
++        {
++            ESP_LOGW(TAG, "s_server_mutex create failed");
++            return ESP_ERR_NO_MEM;
++        }
++    }
++
 +    esp_err_t err = esp_event_handler_instance_register(
 +        IP_EVENT, ESP_EVENT_ANY_ID, &wifi_lifecycle_handler, nullptr, nullptr);
 +    if (err != ESP_OK)
