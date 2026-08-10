@@ -3524,11 +3524,23 @@ test("firmware-matrix selectFactoryVariant always resolves and exposes the erase
 });
 
 test("firmware-matrix checkPreservingUpdate handles every allow and deny path", () => {
+  // A fully-validated status object matches every field
+  // parseAliroProtocolLine produces (types and ranges included). The
+  // guard must reject anything less.
   const goodStatus = (over = {}) => Object.assign({
+    firmware: "0.0.6-devkit",
+    protocol: 1,
     variant: "nanoc6-thread",
     transport: "thread",
     variantExplicit: true,
     transportExplicit: true,
+    auto_relock_seconds: 5,
+    success_rgb: "#00ff00",
+    success_ms: 1000,
+    failure_rgb: "#ff0000",
+    failure_ms: 1000,
+    other_rgb: "#0000ff",
+    other_ms: 1000,
   }, over);
 
   const cases = [
@@ -3632,10 +3644,71 @@ test("parseDevkitVersion accepts every documented shape and rejects malformed in
     "aliro-v-devkit",            // no version
     "aliro-vabc.def.ghi-devkit", // non-numeric
     "aliro-v0.0.06-devkit-extra",// trailing junk
+    // Every aliro- prefix MUST carry `v` before the version.
+    "aliro-0.0.6-devkit",        // aliro- prefix without v
+    "aliro-c6-0.0.5-devkit",     // legacy aliro-c6- without v
   ];
   for (const value of bad) {
     assert.equal(parseDevkitVersion(value), null,
       `expected ${JSON.stringify(value)} to be rejected`);
+  }
+});
+
+test("firmware-matrix checkPreservingUpdate refuses the four-field partial status as malformed", () => {
+  // Correction 1 regression: the previous guard only checked the four
+  // matrix fields (variant, transport, variantExplicit,
+  // transportExplicit). A caller could smuggle in a hand-built
+  // object with just those fields and the guard would allow the
+  // update. The new guard requires the complete validated STATUS
+  // shape that parseAliroProtocolLine produces.
+  const fourFieldPartial = {
+    variant: "nanoc6-thread",
+    transport: "thread",
+    variantExplicit: true,
+    transportExplicit: true,
+  };
+  const result = checkPreservingUpdate(fourFieldPartial);
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, matrixInternals.REASON.MALFORMED_STATUS);
+});
+
+test("firmware-matrix rejects every inherited object key on the VARIANTS lookup", () => {
+  // Correction 1 regression: without own-property-only lookup, a
+  // key like 'constructor', 'toString', or '__proto__' would resolve
+  // to an inherited Object.prototype value and slip past every
+  // guard. Every inherited key must therefore behave like an unknown
+  // variant.
+  for (const key of [
+    "constructor", "toString", "valueOf", "hasOwnProperty",
+    "isPrototypeOf", "propertyIsEnumerable", "__proto__",
+  ]) {
+    assert.equal(getVariant(key), null,
+      `getVariant(${JSON.stringify(key)}) must be null`);
+    assert.throws(() => selectFactoryVariant(key), /unknown variant/,
+      `selectFactoryVariant(${JSON.stringify(key)}) must throw`);
+    const denied = checkPreservingUpdate({
+      firmware: "0.0.6-devkit",
+      protocol: 1,
+      variant: key,
+      transport: "thread",
+      variantExplicit: true,
+      transportExplicit: true,
+      auto_relock_seconds: 5,
+      success_rgb: "#00ff00", success_ms: 1000,
+      failure_rgb: "#ff0000", failure_ms: 1000,
+      other_rgb: "#0000ff",  other_ms: 1000,
+    });
+    // Prototype keys are lowercase kebab-invalid; some fail
+    // IDENTIFIER_PATTERN and return MALFORMED_STATUS. `constructor`,
+    // `tostring`, `valueof`, `hasownproperty`, `isprototypeof`,
+    // `propertyisenumerable`, `__proto__` — the identifier pattern
+    // rejects `_` and requires kebab. Both refusal paths are safe
+    // and never produce a manifest.
+    assert.equal(denied.allowed, false,
+      `checkPreservingUpdate variant=${key} must be refused`);
+    assert.ok(denied.reason === matrixInternals.REASON.UNKNOWN_VARIANT
+      || denied.reason === matrixInternals.REASON.MALFORMED_STATUS,
+      `unexpected refusal reason for ${key}: ${denied.reason}`);
   }
 });
 

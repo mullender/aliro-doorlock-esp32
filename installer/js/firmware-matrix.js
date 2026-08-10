@@ -6,7 +6,13 @@
 // button on its own. The install-controller pulls the helpers to
 // gate its factory buttons and the update button.
 
-const VARIANTS = Object.freeze({
+import { parseDevkitVersion } from "./device-protocol.js";
+
+// The variant map is a null-prototype object so lookups only see keys
+// that were explicitly added. Inherited object properties such as
+// `constructor`, `toString`, and `__proto__` therefore appear as
+// undefined and never leak into a factory selection or update guard.
+const VARIANTS = Object.freeze(Object.assign(Object.create(null), {
   "nanoc6-thread": Object.freeze({
     id: "nanoc6-thread",
     transport: "thread",
@@ -28,7 +34,7 @@ const VARIANTS = Object.freeze({
     manifestFactory: "manifest-atoms3-lite-wifi.json",
     manifestUpdate: "manifest-update-atoms3-lite-wifi.json",
   }),
-});
+}));
 
 const SUPPORTED_VARIANT_IDS = Object.freeze(Object.keys(VARIANTS));
 
@@ -43,19 +49,67 @@ const REASON = Object.freeze({
   TRANSPORT_MISMATCH: "transport-mismatch",
 });
 
+// Match parseAliroProtocolLine's identifier rule. Duplicated (not
+// imported) so a caller cannot supply a status object that satisfies
+// the guard through a different pattern than the parser used.
+const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const RGB_PATTERN = /^#[0-9a-f]{6}$/;
+const SETTING_INT_LIMITS = Object.freeze(Object.assign(Object.create(null), {
+  auto_relock_seconds: [0, 3600],
+  success_ms: [0, 10000],
+  failure_ms: [0, 10000],
+  other_ms: [0, 10000],
+}));
+const SETTING_RGB_KEYS = Object.freeze(["success_rgb", "failure_rgb", "other_rgb"]);
+
+// Own-property-only lookup. Guards against inherited keys like
+// constructor / toString / __proto__ leaking a VARIANTS value.
+function lookupVariant(variantId) {
+  if (typeof variantId !== "string") return undefined;
+  return Object.hasOwn(VARIANTS, variantId) ? VARIANTS[variantId] : undefined;
+}
+
+// Complete validated-STATUS shape check. Rejects any object that
+// parseAliroProtocolLine would not have produced, so the preserving-
+// update guard never sees a partially-formed status.
+function isValidatedStatus(status) {
+  if (!status || typeof status !== "object") return false;
+  if (typeof status.firmware !== "string") return false;
+  if (!parseDevkitVersion(status.firmware)) return false;
+  if (status.protocol !== 1) return false;
+  if (typeof status.variant !== "string" || !IDENTIFIER_PATTERN.test(status.variant)) {
+    return false;
+  }
+  if (typeof status.transport !== "string" || !IDENTIFIER_PATTERN.test(status.transport)) {
+    return false;
+  }
+  if (typeof status.variantExplicit !== "boolean") return false;
+  if (typeof status.transportExplicit !== "boolean") return false;
+  for (const key of Object.keys(SETTING_INT_LIMITS)) {
+    const value = status[key];
+    const [min, max] = SETTING_INT_LIMITS[key];
+    if (!Number.isInteger(value) || value < min || value > max) return false;
+  }
+  for (const key of SETTING_RGB_KEYS) {
+    const value = status[key];
+    if (typeof value !== "string" || !RGB_PATTERN.test(value)) return false;
+  }
+  return true;
+}
+
 export function getSupportedVariantIds() {
   return SUPPORTED_VARIANT_IDS.slice();
 }
 
 export function getVariant(variantId) {
-  return VARIANTS[variantId] || null;
+  return lookupVariant(variantId) || null;
 }
 
 // Factory selection always resolves. The caller must show the note
 // about erase and recommission before it enables the button so the
 // user sees that a board or transport change is destructive.
 export function selectFactoryVariant(variantId) {
-  const variant = VARIANTS[variantId];
+  const variant = lookupVariant(variantId);
   if (!variant) {
     throw new Error(`unknown variant '${variantId}'`);
   }
@@ -71,15 +125,18 @@ export function selectFactoryVariant(variantId) {
 
 // A preserving update is only safe when the connected device has
 // explicitly reported both a supported variant and its matching
-// transport. Legacy defaults, unknown variants, and any mismatch
-// return `{ allowed: false }` with a machine-checkable reason and a
-// short human-readable note.
+// transport, AND the status object is the complete validated shape
+// that parseAliroProtocolLine produces. Anything less returns
+// { allowed: false } with a machine-checkable reason and a short
+// human-readable note.
 export function checkPreservingUpdate(status) {
-  if (!status || typeof status !== "object") {
+  if (!isValidatedStatus(status)) {
     return Object.freeze({
       allowed: false,
       reason: REASON.MALFORMED_STATUS,
-      note: "The device did not return a valid status line.",
+      note:
+        "The device did not return a valid status line, or the status is missing required fields. " +
+        "A preserving update needs the complete validated STATUS shape.",
     });
   }
   if (status.variantExplicit !== true) {
@@ -100,7 +157,7 @@ export function checkPreservingUpdate(status) {
         "transport matches this release; use Factory install instead.",
     });
   }
-  const variant = VARIANTS[status.variant];
+  const variant = lookupVariant(status.variant);
   if (!variant) {
     return Object.freeze({
       allowed: false,

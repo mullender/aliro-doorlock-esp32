@@ -152,11 +152,13 @@ export function buildSetRequest(values) {
 
 export function parseDevkitVersion(value) {
   if (typeof value !== "string") return null;
-  // Accept the legacy `aliro-c6-vX.Y.Z-devkit`, the Phase 1B matrix
-  // `aliro-vX.Y.Z-devkit`, and the bare `vX.Y.Z-devkit` / `X.Y.Z-devkit`
-  // that the firmware app descriptor emits. Any other shape is malformed.
+  // Accept the Phase 1B matrix `aliro-vX.Y.Z-devkit`, the legacy
+  // `aliro-c6-vX.Y.Z-devkit`, the bare `vX.Y.Z-devkit`, and the
+  // `X.Y.Z-devkit` form the firmware app descriptor emits. Any
+  // `aliro-` prefix REQUIRES the `v` before the version to avoid an
+  // accidental match on a truncated tag like `aliro-0.0.6-devkit`.
   const match =
-    /^(?:aliro-(?:c6-)?)?v?(\d+)\.(\d+)\.(\d+)-devkit$/.exec(value.trim());
+    /^(?:aliro-(?:c6-)?v|v?)(\d+)\.(\d+)\.(\d+)-devkit$/.exec(value.trim());
   if (!match) return null;
   const parts = match.slice(1).map(Number);
   if (parts.some((part) => !Number.isSafeInteger(part))) return null;
