@@ -1,0 +1,467 @@
+Add a shared Wi-Fi OTA transaction core to the Aliro door-lock
+reader firmware. Applied only to nanoc6-wifi and atoms3-lite-wifi
+via variants.json; nanoc6-thread never applies, compiles, links,
+or exposes any of the code introduced here.
+
+Scope, kept minimal (no HTTP route, no page UI, no UDP or TCP
+server, no authentication, no restart, no settings changes, no
+log-capture changes):
+
+  * NEW main/aliro_local_ota.h: declares the four-entry-point
+    transaction core (Begin / Write / Finish / Abort) that later
+    Wi-Fi entry points (an HTTP handler in a later patch, and an
+    espota server in a later patch) share. The header is present
+    only on Wi-Fi variants.
+
+  * NEW main/aliro_local_ota.cpp: implements the state machine:
+      - A short portMUX critical section guards a single busy
+        flag s_busy. Only one transaction may be active at a
+        time; a concurrent second Begin returns
+        ESP_ERR_INVALID_STATE and does NOT take the guard.
+      - Begin selects the next OTA partition with
+        esp_ota_get_next_update_partition, refuses a declared
+        size that is 0 or greater than that partition, and
+        calls esp_ota_begin. On any failure the busy guard is
+        released before returning.
+      - Write buffers the first 288 bytes (image header +
+        first segment header + full app descriptor) into a
+        fixed static prefix; no per-write allocation. Once the
+        prefix is full it verifies the ESP image magic byte
+        0xE9, the incoming chip id against the running chip
+        (ESP32-C6 or ESP32-S3, gated by CONFIG_IDF_TARGET_*),
+        the app descriptor magic word 0xABCD5432, and the
+        incoming project_name against esp_app_get_description
+        of the running app. On mismatch the transaction is
+        aborted (esp_ota_abort + busy release) and the failure
+        is returned. Only after successful validation is the
+        buffered prefix forwarded to esp_ota_write and only
+        then are subsequent bytes forwarded directly.
+      - Overflow-safe write-size guard. len is untrusted, so
+        s_received_size + len is NEVER evaluated. Every write
+        first proves s_received_size <= s_declared_size (the
+        invariant established at Begin and preserved by every
+        path that increments the counter — the runtime check
+        is at the top of Write), then rejects when
+        len > s_declared_size - s_received_size. A SIZE_MAX-
+        style len therefore aborts with ESP_ERR_INVALID_SIZE
+        instead of wrapping past the guard.
+      - Finish requires a validated prefix and an exact
+        received-size match against the declared size; else
+        the transaction is aborted. It calls esp_ota_end and
+        sets the boot partition with esp_ota_set_boot_partition
+        ONLY on esp_ota_end success (complete image
+        validation). The busy guard is released before Finish
+        returns in either the success or the failure path.
+      - Abort is idempotent, safe from any partial-write or
+        error path and from a state where no transaction is
+        open, and never blocks on Wi-Fi or Matter.
+
+  * WIRE the new patch into nanoc6-wifi and atoms3-lite-wifi
+    source_patches in firmware/variants.json.
+    nanoc6-thread source_patches is unchanged.
+
+Explicit non-goals for this patch: no HTTP route, no page UI, no
+UDP or TCP server, no authentication, no compiled-in Wi-Fi
+credentials, no cJSON or new runtime dependency, no external
+asset, no partition change, no restart, no settings or log
+changes, no build-system changes (the main/ SRC_DIRS glob picks
+up the new .cpp automatically on Wi-Fi variants).
+
+diff --git a/examples/door_lock/main/aliro_local_ota.h b/examples/door_lock/main/aliro_local_ota.h
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_local_ota.h
+@@ -0,0 +1,89 @@
++/*
++   Shared Wi-Fi OTA transaction core for the Aliro door-lock reader
++   firmware. Compiled and linked only on the Wi-Fi variants
++   (nanoc6-wifi and atoms3-lite-wifi). The Thread variant never
++   applies, compiles, or links this module.
++
++   The module is a single-transfer OTA state machine that later
++   Wi-Fi entry points (an HTTP handler in a later patch, and an
++   espota server in a later patch) share. It does not open any
++   HTTP route, page, UDP or TCP socket by itself, and it does not
++   restart the device. On complete success it sets the boot
++   partition and returns; the caller decides when to reboot.
++
++   Concurrency: only one transaction may be active at a time. A
++   short portMUX critical section guards a single busy flag. The
++   caller must serialise writes on a single transaction.
++*/
++
++#pragma once
++
++#include <esp_err.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++   Open a single-transfer OTA transaction with the declared
++   image size in bytes.
++
++   On success takes the shared busy guard, selects the next OTA
++   partition with esp_ota_get_next_update_partition, refuses the
++   declared size if it is 0 or greater than the selected
++   partition, and calls esp_ota_begin.
++
++   On any failure this function releases the busy guard before
++   returning. A concurrent second call while a transaction is
++   already open returns ESP_ERR_INVALID_STATE and does NOT take
++   the busy guard.
++*/
++esp_err_t AliroLocalOtaBegin(size_t declared_size);
++
++/*
++   Append at most len bytes to the active transaction.
++
++   Requires an open transaction; else ESP_ERR_INVALID_STATE and
++   NO state change. If the running total plus len would exceed
++   the declared size, the transaction is aborted and
++   ESP_ERR_INVALID_SIZE is returned.
++
++   The first bytes are buffered into a small fixed prefix. Once
++   the prefix is full, the early ESP image header chip id and
++   the app descriptor magic word and project name are compared
++   against the running app. On mismatch the transaction is
++   aborted (esp_ota_abort + release of the busy guard) and the
++   failure is returned. Only after successful validation is the
++   buffered prefix forwarded to esp_ota_write, and only then
++   are the subsequent bytes forwarded directly.
++
++   No per-write allocation. The prefix buffer is a fixed static.
++*/
++esp_err_t AliroLocalOtaWrite(const void *data, size_t len);
++
++/*
++   Complete the transaction.
++
++   Requires an open transaction with a validated prefix and an
++   exact received-size match against the declared size; else the
++   transaction is aborted and ESP_ERR_INVALID_STATE or
++   ESP_ERR_INVALID_SIZE is returned.
++
++   On success calls esp_ota_end and, ONLY on esp_ota_end success
++   (complete image validation), calls esp_ota_set_boot_partition.
++   In either the success or failure path the busy guard is
++   released before this function returns.
++*/
++esp_err_t AliroLocalOtaFinish(void);
++
++/*
++   Abort the active transaction and release the busy guard.
++   Idempotent; safe to call from any partial-write or error
++   path, and from a state where no transaction is open.
++*/
++void AliroLocalOtaAbort(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/examples/door_lock/main/aliro_local_ota.cpp b/examples/door_lock/main/aliro_local_ota.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_local_ota.cpp
+@@ -0,0 +1,299 @@
++/*
++   Shared Wi-Fi OTA transaction core for the Aliro door-lock reader
++   firmware. Wi-Fi variants only (nanoc6-wifi, atoms3-lite-wifi);
++   the Thread variant never applies, compiles, or links this file.
++
++   Non-goals in this module: no HTTP route, no page UI, no UDP or TCP
++   server, no authentication, no restart, no settings or log
++   changes. This is a bare state machine that later Wi-Fi entry
++   points share.
++
++   State ownership:
++
++     * A short portMUX critical section guards a single busy flag
++       s_busy.
++     * All other state (s_handle, s_partition, s_declared_size,
++       s_received_size, s_prefix, s_prefix_len, s_prefix_validated)
++       is single-writer while s_busy is true and the caller has the
++       transaction open. The caller must serialise writes on a
++       single transaction.
++*/
++
++#include "aliro_local_ota.h"
++
++#include <string.h>
++
++#include <esp_app_desc.h>
++#include <esp_app_format.h>
++#include <esp_log.h>
++#include <esp_ota_ops.h>
++#include <esp_partition.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/portmacro.h>
++
++namespace {
++
++const char *TAG = "aliro_ota";
++
++/*
++   The prefix buffer must hold at least the ESP image header
++   (24 bytes), the first segment header (8 bytes), and the app
++   descriptor (256 bytes). That is 288 bytes total. The buffer
++   is a fixed static; nothing here calls malloc.
++*/
++constexpr size_t kAliroOtaPrefixBytes =
++    sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) +
++    sizeof(esp_app_desc_t);
++static_assert(kAliroOtaPrefixBytes == 288,
++              "prefix buffer must be exactly image header + segment "
++              "header + app descriptor");
++
++portMUX_TYPE s_ota_lock = portMUX_INITIALIZER_UNLOCKED;
++bool s_busy = false;
++
++esp_ota_handle_t s_handle = 0;
++const esp_partition_t *s_partition = nullptr;
++size_t s_declared_size = 0;
++size_t s_received_size = 0;
++uint8_t s_prefix[kAliroOtaPrefixBytes] = {0};
++size_t s_prefix_len = 0;
++bool s_prefix_validated = false;
++
++/*
++   Try to take the shared busy guard. Returns true if this call
++   observed s_busy == false and set it to true; false if a
++   transaction was already open.
++*/
++bool try_take_busy() {
++    portENTER_CRITICAL(&s_ota_lock);
++    bool was_busy = s_busy;
++    if (!was_busy) {
++        s_busy = true;
++    }
++    portEXIT_CRITICAL(&s_ota_lock);
++    return !was_busy;
++}
++
++/*
++   Release the shared busy guard. The caller must have taken it
++   via try_take_busy earlier. Idempotent from the outside because
++   the abort path checks s_busy before doing anything.
++*/
++void release_busy() {
++    portENTER_CRITICAL(&s_ota_lock);
++    s_busy = false;
++    portEXIT_CRITICAL(&s_ota_lock);
++}
++
++/*
++   Reset all per-transaction state. Only call this while s_busy
++   is true and the caller owns the transaction.
++*/
++void reset_state() {
++    s_handle = 0;
++    s_partition = nullptr;
++    s_declared_size = 0;
++    s_received_size = 0;
++    s_prefix_len = 0;
++    s_prefix_validated = false;
++    memset(s_prefix, 0, sizeof(s_prefix));
++}
++
++/*
++   Compare the buffered prefix against the running app. Returns
++   ESP_OK if the incoming image is compatible; ESP_ERR_INVALID_ARG
++   on any mismatch. Does NOT modify state and does NOT touch the
++   OTA handle.
++*/
++esp_err_t validate_prefix() {
++    if (s_prefix_len < kAliroOtaPrefixBytes) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    const esp_image_header_t *hdr =
++        reinterpret_cast<const esp_image_header_t *>(s_prefix);
++    if (hdr->magic != ESP_IMAGE_HEADER_MAGIC) {
++        ESP_LOGE(TAG, "image magic 0x%02x != 0xE9",
++                 static_cast<unsigned>(hdr->magic));
++        return ESP_ERR_INVALID_ARG;
++    }
++    const esp_app_desc_t *incoming =
++        reinterpret_cast<const esp_app_desc_t *>(
++            s_prefix + sizeof(esp_image_header_t) +
++            sizeof(esp_image_segment_header_t));
++    if (incoming->magic_word != ESP_APP_DESC_MAGIC_WORD) {
++        ESP_LOGE(TAG, "app desc magic 0x%08x != 0xABCD5432",
++                 static_cast<unsigned>(incoming->magic_word));
++        return ESP_ERR_INVALID_ARG;
++    }
++#if defined(CONFIG_IDF_TARGET_ESP32C6)
++    if (hdr->chip_id != ESP_CHIP_ID_ESP32C6) {
++        ESP_LOGE(TAG, "image chip id 0x%04x != running ESP32-C6",
++                 static_cast<unsigned>(hdr->chip_id));
++        return ESP_ERR_INVALID_ARG;
++    }
++#elif defined(CONFIG_IDF_TARGET_ESP32S3)
++    if (hdr->chip_id != ESP_CHIP_ID_ESP32S3) {
++        ESP_LOGE(TAG, "image chip id 0x%04x != running ESP32-S3",
++                 static_cast<unsigned>(hdr->chip_id));
++        return ESP_ERR_INVALID_ARG;
++    }
++#else
++#error "aliro_local_ota: unsupported target chip"
++#endif
++    const esp_app_desc_t *running = esp_app_get_description();
++    if (running == nullptr) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (strncmp(incoming->project_name, running->project_name,
++                sizeof(incoming->project_name)) != 0) {
++        ESP_LOGE(TAG, "project name mismatch");
++        return ESP_ERR_INVALID_ARG;
++    }
++    return ESP_OK;
++}
++
++}  // namespace
++
++esp_err_t AliroLocalOtaBegin(size_t declared_size) {
++    if (declared_size == 0) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    if (!try_take_busy()) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    reset_state();
++    s_partition = esp_ota_get_next_update_partition(nullptr);
++    if (s_partition == nullptr) {
++        release_busy();
++        return ESP_ERR_NOT_FOUND;
++    }
++    if (declared_size > s_partition->size) {
++        release_busy();
++        return ESP_ERR_INVALID_SIZE;
++    }
++    esp_err_t err = esp_ota_begin(s_partition, declared_size, &s_handle);
++    if (err != ESP_OK) {
++        s_partition = nullptr;
++        release_busy();
++        return err;
++    }
++    s_declared_size = declared_size;
++    return ESP_OK;
++}
++
++esp_err_t AliroLocalOtaWrite(const void *data, size_t len) {
++    if (data == nullptr && len > 0) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    portENTER_CRITICAL(&s_ota_lock);
++    bool active = s_busy && s_handle != 0;
++    portEXIT_CRITICAL(&s_ota_lock);
++    if (!active) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (len == 0) {
++        return ESP_OK;
++    }
++    /*
++       Overflow-safe write-size guard. len is untrusted (it comes
++       from a caller that ultimately reads it off the network) and
++       may be as large as SIZE_MAX, so s_received_size + len must
++       never be evaluated. The invariant s_received_size <=
++       s_declared_size is checked below and preserved by every
++       path that increments s_received_size, so
++       s_declared_size - s_received_size is always a valid
++       subtraction; comparing len against it detects overflow
++       without wrap.
++    */
++    if (s_received_size > s_declared_size) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (len > s_declared_size - s_received_size) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_SIZE;
++    }
++    const uint8_t *p = static_cast<const uint8_t *>(data);
++    if (!s_prefix_validated) {
++        size_t want = kAliroOtaPrefixBytes - s_prefix_len;
++        size_t take = (len < want) ? len : want;
++        memcpy(s_prefix + s_prefix_len, p, take);
++        s_prefix_len += take;
++        if (s_prefix_len < kAliroOtaPrefixBytes) {
++            s_received_size += take;
++            return ESP_OK;
++        }
++        esp_err_t v = validate_prefix();
++        if (v != ESP_OK) {
++            AliroLocalOtaAbort();
++            return v;
++        }
++        s_prefix_validated = true;
++        esp_err_t w = esp_ota_write(s_handle, s_prefix,
++                                    kAliroOtaPrefixBytes);
++        if (w != ESP_OK) {
++            AliroLocalOtaAbort();
++            return w;
++        }
++        s_received_size += take;
++        p += take;
++        len -= take;
++        if (len == 0) {
++            return ESP_OK;
++        }
++    }
++    esp_err_t w = esp_ota_write(s_handle, p, len);
++    if (w != ESP_OK) {
++        AliroLocalOtaAbort();
++        return w;
++    }
++    s_received_size += len;
++    return ESP_OK;
++}
++
++esp_err_t AliroLocalOtaFinish(void) {
++    portENTER_CRITICAL(&s_ota_lock);
++    bool active = s_busy && s_handle != 0;
++    portEXIT_CRITICAL(&s_ota_lock);
++    if (!active) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (!s_prefix_validated) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (s_received_size != s_declared_size) {
++        AliroLocalOtaAbort();
++        return ESP_ERR_INVALID_SIZE;
++    }
++    esp_ota_handle_t handle = s_handle;
++    const esp_partition_t *partition = s_partition;
++    esp_err_t end_err = esp_ota_end(handle);
++    if (end_err != ESP_OK) {
++        s_handle = 0;
++        s_partition = nullptr;
++        release_busy();
++        return end_err;
++    }
++    esp_err_t boot_err = esp_ota_set_boot_partition(partition);
++    s_handle = 0;
++    s_partition = nullptr;
++    release_busy();
++    return boot_err;
++}
++
++void AliroLocalOtaAbort(void) {
++    portENTER_CRITICAL(&s_ota_lock);
++    if (!s_busy) {
++        portEXIT_CRITICAL(&s_ota_lock);
++        return;
++    }
++    esp_ota_handle_t handle = s_handle;
++    s_handle = 0;
++    s_partition = nullptr;
++    portEXIT_CRITICAL(&s_ota_lock);
++    if (handle != 0) {
++        esp_ota_abort(handle);
++    }
++    release_busy();
++}
