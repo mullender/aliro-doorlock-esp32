@@ -357,37 +357,55 @@ def _assemble(tag: str, variants_json: dict, assets_root: Path, out_dir: Path) -
     if not tag_root.is_dir():
         _die(f"assets directory {assets_root} does not contain a {tag}/ subdirectory")
 
-    # Refuse to overwrite an existing output directory. A caller that
-    # wants to reassemble must delete the directory explicitly.
-    if out_dir.exists():
-        _die(f"output directory {out_dir} already exists; refusing to overwrite")
-
-    # Verify every variant BEFORE any output is written.
-    verified_by_variant = {}
-    for variant_id in REQUIRED_VARIANT_IDS:
-        spec = _load_variant_spec(variants_json, variant_id)
-        variant_dir = tag_root / variant_id
-        verified_by_variant[variant_id] = _verify_variant(tag, spec, variant_dir, firmware_version)
-
-    # Confirm the three variants are the exact set. An asset directory
-    # with a fourth per-variant subdirectory could hide a smuggled
-    # release and is treated as inconsistent input.
-    extras = sorted(entry.name for entry in tag_root.iterdir()
-                    if entry.is_dir() and entry.name not in REQUIRED_VARIANT_IDS)
-    if extras:
-        _die(f"assets tree contains unexpected variant directories: {extras}")
-
-    # Stage the whole output in a private tmpdir on the same filesystem
-    # as OUT_DIR, then rename to the final path in one atomic move.
+    # Publication lock. Acquire the sibling lock BEFORE the destination
+    # existence check so a racing assembler cannot slip an empty
+    # destination directory in between the check and the final rename.
+    # POSIX os.rename can silently replace an empty destination
+    # directory; the lock serializes every assembler publisher for this
+    # output. The lock is released on all failure and success paths.
     out_parent = out_dir.parent
     out_parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.stage.", dir=out_parent))
+    lock_dir = out_parent / f".{out_dir.name}.publish.lock"
     try:
+        lock_dir.mkdir()
+    except FileExistsError:
+        _die(f"another assembler holds the publication lock at {lock_dir}; "
+             f"if no publisher is running, remove the stale lock directory explicitly")
+
+    stage: object = None
+    try:
+        # Refuse to overwrite an existing output directory. A caller that
+        # wants to reassemble must delete the directory explicitly.
+        if out_dir.exists():
+            _die(f"output directory {out_dir} already exists; refusing to overwrite")
+
+        # Verify every variant BEFORE any output is written.
+        verified_by_variant = {}
+        for variant_id in REQUIRED_VARIANT_IDS:
+            spec = _load_variant_spec(variants_json, variant_id)
+            variant_dir = tag_root / variant_id
+            verified_by_variant[variant_id] = _verify_variant(tag, spec, variant_dir, firmware_version)
+
+        # Confirm the three variants are the exact set. An asset
+        # directory with a fourth per-variant subdirectory could hide
+        # a smuggled release and is treated as inconsistent input.
+        extras = sorted(entry.name for entry in tag_root.iterdir()
+                        if entry.is_dir() and entry.name not in REQUIRED_VARIANT_IDS)
+        if extras:
+            _die(f"assets tree contains unexpected variant directories: {extras}")
+
+        # Stage the whole output in a private tmpdir on the same
+        # filesystem as OUT_DIR, then rename to the final path in one
+        # atomic move.
+        stage = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.stage.", dir=out_parent))
         _current_tag[0] = tag
         for variant_id in REQUIRED_VARIANT_IDS:
             _stage_variant(stage, verified_by_variant[variant_id])
-        # Rename must not overwrite. os.rename fails with EEXIST /
-        # ENOTEMPTY on POSIX if the destination exists.
+        # Recheck the destination immediately before rename. The lock
+        # protects against a racing assembler; this guard also covers a
+        # non-assembler writer that made the directory outside the lock.
+        if out_dir.exists():
+            _die(f"output directory {out_dir} appeared during staging; refusing to overwrite")
         try:
             os.rename(stage, out_dir)
         except OSError as exc:
@@ -396,8 +414,13 @@ def _assemble(tag: str, variants_json: dict, assets_root: Path, out_dir: Path) -
             raise
         stage = None  # mark consumed so cleanup skips it
     finally:
-        if stage is not None and stage.exists():
+        if isinstance(stage, Path) and stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
+        # Release the lock on every exit path.
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
 
 
 def main(argv: List[str]) -> int:

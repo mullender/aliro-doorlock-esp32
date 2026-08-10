@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, readdirSync, existsSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -3306,6 +3306,58 @@ test("assemble_release.py fails closed on a bad embedded app slice", () => {
     } finally {
       rmSync(assetsRoot, { recursive: true, force: true });
       rmSync(path.dirname(outDir), { recursive: true, force: true });
+    }
+  });
+});
+
+test("assemble_release.py publication lock keeps an existing racing destination byte-for-byte after failed publication", () => {
+  // Inject the P1 race: a rival assembler creates an empty destination
+  // during the winner's staging window. On POSIX (macOS, Linux)
+  // os.rename could silently replace an EMPTY destination directory,
+  // which would erase the rival's package. This test pre-creates the
+  // destination with a marker file inside, runs the assembler, and
+  // asserts that the assembler fails, the marker file remains
+  // byte-for-byte identical, and the destination inode is stable.
+  const partitionBytes = forgePartitionBytes();
+  withForgedPartitionForAllVariants(partitionBytes, (variantsPath) => {
+    const assetsRoot = mkdtempSync(path.join(tmpdir(), "assemble-assets-"));
+    const outParent = mkdtempSync(path.join(tmpdir(), "assemble-out-"));
+    const outDir = path.join(outParent, "site");
+    try {
+      buildMatrixTree("aliro-v0.0.6-devkit", assetsRoot, partitionBytes);
+      // Pre-existing rival package: destination directory with a
+      // marker file whose contents must survive.
+      mkdirSync(outDir, { recursive: true });
+      const marker = path.join(outDir, "rival-marker.txt");
+      const markerBody = "rival publisher was here\n";
+      writeFileSync(marker, markerBody);
+      const beforeInode = statSync(outDir).ino;
+      const beforeMarkerBytes = readFileSync(marker);
+
+      const result = runAssemble({
+        tag: "aliro-v0.0.6-devkit",
+        variantsPath,
+        assetsRoot,
+        outDir,
+      });
+      assert.notEqual(result.status, 0, "assembler must fail when destination already exists");
+      assert.match(result.stderr, /output directory .* already exists; refusing to overwrite/);
+
+      // The rival's marker and inode must be unchanged.
+      const afterInode = statSync(outDir).ino;
+      const afterMarkerBytes = readFileSync(marker);
+      assert.equal(afterInode, beforeInode,
+        "destination directory inode must remain stable after a refused publication");
+      assert.deepEqual(afterMarkerBytes, beforeMarkerBytes,
+        "rival's marker file must remain byte-for-byte identical");
+      // No stage residue in the parent either.
+      for (const entry of readdirSync(outParent)) {
+        assert.doesNotMatch(entry, /\.stage\./,
+          `no stage residue allowed under ${outParent}: found ${entry}`);
+      }
+    } finally {
+      rmSync(assetsRoot, { recursive: true, force: true });
+      rmSync(outParent, { recursive: true, force: true });
     }
   });
 });
