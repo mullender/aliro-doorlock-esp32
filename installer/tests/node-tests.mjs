@@ -4977,6 +4977,203 @@ test("phase 2 task 1 correction 3: start_server revalidates the station IP insid
     "locked recheck's early return must NOT touch httpd_*");
 });
 
+// Phase 2 task 3: local pairing QR page.
+// Patch 0010 extends patch 0009 with a scannable Matter QR served
+// from a locally-embedded MIT-licensed QR-generator asset. Thread
+// stays completely excluded.
+
+const PHASE2_TASK3_PATCH = "firmware/patches/0010-add-wifi-local-pairing-qr.patch";
+const PHASE2_TASK3_QRCODE_SHA256 =
+  "dc04ef86fde7887e95d5c22aa468c1e01e0d9ac0101e87f902ee3c93aed0d21a";
+
+function phase2Task3PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE2_TASK3_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 2 task 3: patch 0010 is wired to exactly the two Wi-Fi variants; Thread stays excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE2_TASK3_PATCH),
+      `${id}.source_patches must include ${PHASE2_TASK3_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE2_TASK3_PATCH), false,
+    "nanoc6-thread.source_patches must NOT include the Wi-Fi-only pairing QR patch");
+  const patch = phase2Task3PatchText();
+  assert.ok(patch.length > 0, "patch file must exist and be non-empty");
+});
+
+test("phase 2 task 3: patch 0010 introduces no external URL and no CDN", () => {
+  const addedLines = phase2Task3PatchText().split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    // Drop code and single-line comments so the source-URL / license
+    // annotation lines in the asset header do not false-positive.
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  // No fetch of remote QR services, no CDN, no external URL loads.
+  const forbidden = [
+    { name: "remote fetch of an http(s):// URL",
+      pattern: /(?<!\/\/[^"]*)(?:fetch|XMLHttpRequest|import\(|new Image)\s*\([^)]*['"]https?:\/\// },
+    { name: "script src to an external host",
+      pattern: /<script[^>]*src\s*=\s*['"]https?:\/\// },
+    { name: "link href to an external host",
+      pattern: /<link[^>]*href\s*=\s*['"]https?:\/\// },
+    { name: "unpkg / jsdelivr / cdnjs / googleapis / cloudflare",
+      pattern: /(unpkg|jsdelivr|cdnjs|googleapis|cloudflare)\.com/ },
+    { name: "chart.apis.google.com QR",
+      pattern: /chart\.(googleapis|apis\.google)\.com/ },
+    { name: "qrserver.com / goqr.me / api.qrserver",
+      pattern: /(qrserver|goqr|api\.qrserver)\./ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0010 must not introduce ${name}`);
+  }
+});
+
+test("phase 2 task 3: patch 0010 preserves the MIT notice and identifies the QR-generator source", () => {
+  const patch = phase2Task3PatchText();
+  assert.match(patch, /SPDX-License-Identifier:\s*MIT/,
+    "asset file must carry an SPDX MIT license identifier");
+  assert.match(patch, /Kazuhiko Arase/,
+    "asset file must credit the upstream QR-generator author");
+  assert.match(patch, /kazuhikoarase\/qrcode-generator|d-project\.com/,
+    "asset file must link to the upstream source");
+  assert.match(patch, /installer\/vendor\/qrcode\.js/,
+    "asset file must identify the repository source it was gzipped from");
+});
+
+test("phase 2 task 3: patch 0010 pins the gzip SHA-256 of the embedded QR asset", () => {
+  const patch = phase2Task3PatchText();
+  assert.ok(patch.includes(PHASE2_TASK3_QRCODE_SHA256),
+    `asset header must document the pinned SHA-256 ${PHASE2_TASK3_QRCODE_SHA256}`);
+  // Reconstruct the byte array from the patch's added lines and
+  // recompute the SHA-256 to prove the pinned hash matches the served
+  // bytes. Only lines added by the patch inside the asset section are
+  // considered; skip the leading comment and non-hex lines.
+  const assetMatch = patch.match(
+    /\+extern "C" const unsigned char kAliroQrcodeJsGz\[\][^]+?\};/,
+  );
+  assert.ok(assetMatch, "must find the kAliroQrcodeJsGz array in the patch");
+  const bytes = [...assetMatch[0].matchAll(/0x([0-9a-fA-F]{2})/g)]
+    .map((m) => parseInt(m[1], 16));
+  assert.ok(bytes.length > 0, "must recover at least one byte from the array");
+  // First two bytes are the gzip magic 0x1f 0x8b.
+  assert.equal(bytes[0], 0x1f, "gzip byte 0 must be 0x1f");
+  assert.equal(bytes[1], 0x8b, "gzip byte 1 must be 0x8b");
+  const hash = createHash("sha256").update(Uint8Array.from(bytes)).digest("hex");
+  assert.equal(hash, PHASE2_TASK3_QRCODE_SHA256,
+    `SHA-256 of embedded bytes must match pinned value; got ${hash}`);
+  // Length declaration matches the byte count.
+  const lenMatch = patch.match(/kAliroQrcodeJsGzLen\s*=\s*(\d+)/);
+  assert.ok(lenMatch, "must find the kAliroQrcodeJsGzLen declaration");
+  assert.equal(parseInt(lenMatch[1], 10), bytes.length,
+    "kAliroQrcodeJsGzLen must equal the array byte count");
+});
+
+test("phase 2 task 3: /qrcode.js route serves gzip with correct headers and is registered", () => {
+  const patch = phase2Task3PatchText();
+  // Route path is exactly /qrcode.js.
+  assert.ok(patch.includes('"/qrcode.js"'),
+    "patch must declare an httpd_uri_t for /qrcode.js");
+  // qrcode_get_handler exists and sets the right headers.
+  const handlerMatch = patch.match(
+    /\+esp_err_t qrcode_get_handler\(httpd_req_t \* req\)[\s\S]*?^\+\}/m,
+  );
+  assert.ok(handlerMatch, "must find qrcode_get_handler body");
+  const handlerCode = handlerMatch[0]
+    .split("\n").map((l) => l.replace(/^\+/, "")).join("\n");
+  assert.match(handlerCode, /httpd_resp_set_type\s*\(\s*req\s*,\s*"application\/javascript;\s*charset=utf-8"\s*\)/,
+    "handler must set Content-Type: application/javascript; charset=utf-8");
+  assert.match(handlerCode, /httpd_resp_set_hdr\s*\(\s*req\s*,\s*"Content-Encoding"\s*,\s*"gzip"\s*\)/,
+    "handler must set Content-Encoding: gzip");
+  assert.match(handlerCode, /kAliroQrcodeJsGz\b/,
+    "handler must serve the embedded gzipped asset");
+  assert.match(handlerCode, /kAliroQrcodeJsGzLen\b/,
+    "handler must send exactly kAliroQrcodeJsGzLen bytes");
+  // The route is registered as the fourth handler; max_uri_handlers
+  // bumped from 3 to 4.
+  assert.match(patch, /max_uri_handlers\s*=\s*4/,
+    "max_uri_handlers must be bumped to 4 for the fourth route");
+  assert.match(patch, /httpd_register_uri_handler\s*\(\s*s_server\s*,\s*&kQrcode\s*\)/,
+    "start_server must register the /qrcode.js handler");
+});
+
+test("phase 2 task 3: pairing page uses the real /api/pairing and never inserts JSON into HTML", () => {
+  const patch = phase2Task3PatchText();
+  // The embedded HTML must reference /api/pairing (the actual JSON
+  // route), NOT hard-code MT/manual values.
+  assert.ok(patch.includes("fetch('/api/pairing')"),
+    "the pairing page must fetch /api/pairing at runtime");
+  // JSON values MUST be set via textContent, never innerHTML.
+  assert.match(patch,
+    /getElementById\('mt'\)\.textContent\s*=\s*mt/,
+    "MT payload must be assigned via textContent");
+  assert.match(patch,
+    /getElementById\('manual'\)\.textContent\s*=\s*manual/,
+    "manual pairing code must be assigned via textContent");
+  // Any innerHTML use must be gated to strings the client BUILT itself
+  // (SVG from qr module bitmap, or textContent-empty prior to it).
+  // The only innerHTML assignment we allow is `el.innerHTML=parts.join('')`
+  // where `parts` is the local SVG array. Search for other innerHTML uses.
+  const badInnerHtml = /innerHTML\s*=\s*(?!parts\.join)[^;]*(?:data\.|json\.|response|manual|mt(?!\s*=\s*data)|body)/;
+  assert.doesNotMatch(patch, badInnerHtml,
+    "no innerHTML assignment may include untrusted JSON values");
+});
+
+test("phase 2 task 3: pairing page shows a clear error when fetch or QR rendering fails", () => {
+  const patch = phase2Task3PatchText();
+  assert.match(patch, /id=\\"error\\"/,
+    "the pairing page must contain a visible #error element");
+  assert.match(patch, /showError\s*\(\s*'Pairing fetch failed:/,
+    "the fetch-failure catch must call showError with a clear message");
+  assert.match(patch, /showError\s*\(\s*'QR rendering failed:/,
+    "the QR-render try/catch must call showError with a clear message");
+  assert.match(patch, /showError\s*\(\s*'Pairing values missing\./,
+    "missing MT or manual code must call showError");
+  assert.match(patch, /showError\s*\(\s*'QR library did not load\./,
+    "an absent qrcode global must call showError");
+});
+
+test("phase 2 task 3: patch 0010 keeps scope inside examples/door_lock/main/ only and no forbidden subsystems", () => {
+  const patch = phase2Task3PatchText();
+  const modifiedPaths = [...patch.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+  assert.ok(modifiedPaths.length > 0, "patch must modify at least one file");
+  for (const p of modifiedPaths) {
+    assert.match(p, /^examples\/door_lock\/main\//,
+      `patch must only touch examples/door_lock/main/; got ${p}`);
+  }
+  assert.deepEqual(new Set(modifiedPaths), new Set([
+    "examples/door_lock/main/aliro_local_web_qrcode_asset.cpp",
+    "examples/door_lock/main/aliro_local_web.cpp",
+  ]));
+
+  // The same forbidden-subsystems screen applied to patch 0009,
+  // this time restricted to added lines outside comments.
+  const addedLines = patch.split("\n")
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join("\n");
+  const forbidden = [
+    { name: "LittleFS",                pattern: /<LittleFS\.h>|<esp_littlefs\.h>|LittleFS::/ },
+    { name: "captive-portal AP",       pattern: /esp_wifi_set_mode\s*\(\s*WIFI_MODE_AP|WIFI_IF_AP|softAP|dns_server_start/ },
+    { name: "TLS/SSL server",          pattern: /esp_https_server|httpd_ssl_start|mbedtls_ssl_/ },
+    { name: "HTTP Basic/Bearer auth",  pattern: /Authorization:\s*(Basic|Bearer)|WWW-Authenticate/ },
+    { name: "WebSocket",               pattern: /HTTPD_WS_|is_websocket|Sec-WebSocket|handle_ws_req|httpd_ws_/ },
+    { name: "OTA route",               pattern: /"\/(api\/)?ota"|esp_ota_begin|esp_https_ota/ },
+    { name: "factory-reset route",     pattern: /"\/(api\/)?factory(reset|-reset)?"|esp_matter::factory_reset/ },
+    { name: "reboot route",            pattern: /"\/(api\/)?reboot"|esp_restart\s*\(/ },
+    { name: "settings mutation route", pattern: /"\/(api\/)?settings"/ },
+    { name: "logs endpoint",           pattern: /"\/(api\/)?logs"|esp_log_set_vprintf/ },
+  ];
+  for (const { name, pattern } of forbidden) {
+    assert.doesNotMatch(addedLines, pattern,
+      `patch 0010 must not introduce ${name}`);
+  }
+});
+
 test("phase 2 task 1 correction 1: stop_server keeps the live handle when httpd_stop fails", () => {
   const patch = phase2PatchText();
   const stopMatch = patch.match(
