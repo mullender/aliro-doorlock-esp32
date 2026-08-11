@@ -10,7 +10,17 @@ Scope:
     plus constants (UDP 3232, 8 KiB task stack, 3 s auth wait,
     5 s TCP connect, 500 ms restart delay, 256 B UDP buffer).
   * NEW main/aliro_espota_service.cpp:
-      - Idempotent start via a static-mutex-guarded s_started.
+      - Start-guard: statically-initialised portMUX +
+        Stopped/Starting/Started state (no lazy mutex, no
+        race). Under the critical section, the first caller
+        reserves Stopped -> Starting; a caller that sees
+        Started returns ESP_OK; a caller that sees Starting
+        returns ESP_ERR_INVALID_STATE without creating a
+        task. Only the Starting-reserver calls
+        xTaskCreateStatic, OUTSIDE the critical section. On
+        failure the critical section restores Starting ->
+        Stopped so a later call can retry; on success it
+        promotes Starting -> Started.
       - xTaskCreateStatic (no heap) with module-static
         s_listener_stack + s_listener_tcb.
       - UDP bind to :3232. Outer loop rebinds on a dead
@@ -134,7 +144,7 @@ diff --git a/examples/door_lock/main/aliro_espota_service.cpp b/examples/door_lo
 new file mode 100644
 --- /dev/null
 +++ b/examples/door_lock/main/aliro_espota_service.cpp
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,482 @@
 +/*
 +   Inactive Wi-Fi ESP-OTA service module. Wi-Fi variants only;
 +   Thread never applies, compiles, or links this file. Nothing
@@ -162,7 +172,7 @@ new file mode 100644
 +#include <esp_timer.h>
 +
 +#include <freertos/FreeRTOS.h>
-+#include <freertos/semphr.h>
++#include <freertos/portmacro.h>
 +#include <freertos/task.h>
 +
 +#include "aliro_espota_protocol.h"
@@ -174,13 +184,18 @@ new file mode 100644
 +const char *TAG = "aliro_espota_svc";
 +
 +/*
-+   Idempotent-start guard. A static bool + mutex; a second
-+   Start() call while the task is running returns ESP_OK and
-+   does nothing.
++   Start-state guard. A statically initialised portMUX (no
++   runtime create) plus a tri-state value guard the entire
++   xTaskCreateStatic call. See AliroEspotaServiceStart for the
++   Stopped -> Starting -> Started transition contract.
 +*/
-+StaticSemaphore_t s_start_mutex_buf;
-+SemaphoreHandle_t s_start_mutex = nullptr;
-+bool              s_started    = false;
++enum : uint8_t {
++    kStartStateStopped  = 0,
++    kStartStateStarting = 1,
++    kStartStateStarted  = 2,
++};
++portMUX_TYPE s_start_lock  = portMUX_INITIALIZER_UNLOCKED;
++uint8_t      s_start_state = kStartStateStopped;
 +
 +/*
 +   Static UDP receive buffer. Fixed-size; no heap; sized to hold
@@ -564,28 +579,51 @@ new file mode 100644
 +}  // namespace
 +
 +esp_err_t AliroEspotaServiceStart(void) {
-+    if (s_start_mutex == nullptr) {
-+        s_start_mutex = xSemaphoreCreateMutexStatic(&s_start_mutex_buf);
-+        if (s_start_mutex == nullptr) return ESP_FAIL;
++    /*
++       Start-guard contract (no lazy mutex, no race):
++         * Under a short portMUX critical section, read the
++           current state. If Stopped, reserve the Stopped ->
++           Starting transition atomically. Then exit the
++           critical section.
++         * A caller that observed Started returns ESP_OK; the
++           task is already running. Idempotent.
++         * A caller that observed Starting returns
++           ESP_ERR_INVALID_STATE without creating a task; a
++           concurrent first caller owns the create.
++         * Only the caller that reserved Starting calls
++           xTaskCreateStatic, and it does so OUTSIDE the
++           critical section so the create cannot block other
++           runtime code holding a related lock.
++         * Under a second critical section: on task-create
++           failure restore Starting -> Stopped so a later call
++           can retry; on success set Starting -> Started.
++    */
++    portENTER_CRITICAL(&s_start_lock);
++    uint8_t observed = s_start_state;
++    if (observed == kStartStateStopped) {
++        s_start_state = kStartStateStarting;
 +    }
-+    xSemaphoreTake(s_start_mutex, portMAX_DELAY);
-+    if (s_started) {
-+        // Idempotent: already running.
-+        xSemaphoreGive(s_start_mutex);
-+        return ESP_OK;
-+    }
-+    // Static task spawn — no heap. TCB + stack backing are the
-+    // module-static s_listener_tcb / s_listener_stack.
++    portEXIT_CRITICAL(&s_start_lock);
++
++    if (observed == kStartStateStarted)  return ESP_OK;
++    if (observed == kStartStateStarting) return ESP_ERR_INVALID_STATE;
++
++    // We hold the Starting reservation. Create the task OUTSIDE
++    // the critical section.
 +    TaskHandle_t task = xTaskCreateStatic(
 +        listener_task, "aliro_espota",
 +        sizeof(s_listener_stack) / sizeof(StackType_t),
 +        nullptr, tskIDLE_PRIORITY + 3,
 +        s_listener_stack, &s_listener_tcb);
++
++    portENTER_CRITICAL(&s_start_lock);
 +    if (task == nullptr) {
-+        xSemaphoreGive(s_start_mutex);
++        // Restore Stopped so a later Start() call can retry.
++        s_start_state = kStartStateStopped;
++        portEXIT_CRITICAL(&s_start_lock);
 +        return ESP_ERR_NO_MEM;
 +    }
-+    s_started = true;
-+    xSemaphoreGive(s_start_mutex);
++    s_start_state = kStartStateStarted;
++    portEXIT_CRITICAL(&s_start_lock);
 +    return ESP_OK;
 +}

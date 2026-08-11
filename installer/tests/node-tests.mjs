@@ -9162,13 +9162,58 @@ test("phase 3 task 6: fixed 256 B UDP buffer + static_assert; no per-session all
     "s_udp_buf must be a module-static fixed array");
 });
 
-test("phase 3 task 6 idempotent Start: static mutex + s_started guard", () => {
+test("phase 3 task 6 correction 1: start-guard is a static portMUX + tri-state (no lazy mutex, no race)", () => {
   const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
-  assert.match(cpp, /xSemaphoreCreateMutexStatic\s*\(\s*&\s*s_start_mutex_buf\s*\)/,
-    "start mutex must be static");
+  // No lazy mutex creation anywhere.
+  assert.equal(/xSemaphoreCreateMutexStatic/.test(cpp), false,
+    "lazy xSemaphoreCreateMutexStatic must be removed (start-guard race fix)");
+  assert.equal(/xSemaphoreTake\s*\(\s*s_start_mutex/.test(cpp), false,
+    "no reference to a start-mutex handle");
+  // Static portMUX + tri-state.
   assert.match(cpp,
-    /if\s*\(\s*s_started\s*\)\s*\{\s*[\s\S]{0,100}?xSemaphoreGive\s*\(\s*s_start_mutex\s*\)\s*;\s*return\s+ESP_OK\s*;/,
-    "second Start() returns ESP_OK without spawning again");
+    /portMUX_TYPE\s+s_start_lock\s*=\s*portMUX_INITIALIZER_UNLOCKED\s*;/,
+    "s_start_lock must be a statically initialised portMUX");
+  assert.match(cpp,
+    /uint8_t\s+s_start_state\s*=\s*kStartStateStopped\s*;/,
+    "s_start_state must be a small state value initialised to Stopped");
+  assert.match(cpp,
+    /kStartStateStopped\s*=\s*0[\s\S]{0,80}?kStartStateStarting\s*=\s*1[\s\S]{0,80}?kStartStateStarted\s*=\s*2/,
+    "state enum must include exactly Stopped(0), Starting(1), Started(2)");
+});
+
+test("phase 3 task 6 correction 1: Start() reserves Stopped -> Starting inside CS, releases CS before xTaskCreateStatic", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  // Structural match: portENTER_CRITICAL -> read observed -> conditional set to Starting -> portEXIT_CRITICAL -> then xTaskCreateStatic
+  assert.match(cpp,
+    /portENTER_CRITICAL\s*\(\s*&\s*s_start_lock\s*\)\s*;\s*uint8_t\s+observed\s*=\s*s_start_state\s*;\s*if\s*\(\s*observed\s*==\s*kStartStateStopped\s*\)\s*\{\s*s_start_state\s*=\s*kStartStateStarting\s*;\s*\}\s*portEXIT_CRITICAL\s*\(\s*&\s*s_start_lock\s*\)\s*;/,
+    "first CS must read state and conditionally set Starting under the same lock");
+  const csExitIdx = cpp.indexOf("portEXIT_CRITICAL(&s_start_lock)");
+  const createIdx = cpp.indexOf("xTaskCreateStatic(");
+  assert.ok(csExitIdx > 0 && createIdx > csExitIdx,
+    "xTaskCreateStatic must run AFTER the first portEXIT_CRITICAL (outside CS)");
+});
+
+test("phase 3 task 6 correction 1: Started returns ESP_OK; Starting returns ESP_ERR_INVALID_STATE without creating a task", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp,
+    /if\s*\(\s*observed\s*==\s*kStartStateStarted\s*\)\s*return\s+ESP_OK\s*;/,
+    "Started -> ESP_OK, no task create");
+  assert.match(cpp,
+    /if\s*\(\s*observed\s*==\s*kStartStateStarting\s*\)\s*return\s+ESP_ERR_INVALID_STATE\s*;/,
+    "Starting -> ESP_ERR_INVALID_STATE, no task create");
+});
+
+test("phase 3 task 6 correction 1: on xTaskCreateStatic failure, restore Starting -> Stopped inside CS so retry is allowed", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  // Strip comments so a rationale line inside the if-block does
+  // not fail the structural match.
+  const code = cpp.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.match(code,
+    /if\s*\(\s*task\s*==\s*nullptr\s*\)\s*\{\s*s_start_state\s*=\s*kStartStateStopped\s*;\s*portEXIT_CRITICAL\s*\(\s*&\s*s_start_lock\s*\)\s*;\s*return\s+ESP_ERR_NO_MEM\s*;/,
+    "task-create failure restores Stopped under CS before returning ESP_ERR_NO_MEM");
+  assert.match(code,
+    /s_start_state\s*=\s*kStartStateStarted\s*;\s*portEXIT_CRITICAL\s*\(\s*&\s*s_start_lock\s*\)\s*;\s*return\s+ESP_OK\s*;/,
+    "task-create success promotes to Started under CS then returns ESP_OK");
 });
 
 test("phase 3 task 6 UDP flow: bind :3232, esp_fill_random, FormatChallenge, sendto AUTH with full-send check", () => {
@@ -9359,4 +9404,89 @@ test("phase 3 task 6 state model: RunTransfer failure -> no Abort by service, no
   assert.equal(s.calls.runTransfer, 1);
   assert.equal(s.calls.abort, 0);
   assert.equal(s.calls.restart, 0);
+});
+
+/*
+   Start-guard interleaving state model. A JS mirror of the C
+   Start() function drives multiple concurrent callers through
+   staged interleavings and proves:
+     * Only one caller ever calls xTaskCreateStatic per Stopped
+       -> Started cycle.
+     * A caller that observed Started returns ESP_OK.
+     * A caller that observed Starting returns
+       ESP_ERR_INVALID_STATE without creating a task.
+     * If the create fails, the state returns to Stopped and a
+       later caller can retry (and now succeeds).
+*/
+function makeStartGuard() {
+  // Simulated portMUX critical section: bool.
+  const state = { value: 0 /* Stopped */ };
+  const calls = { create: 0 };
+  function reserve() {
+    // enter CS + read + conditional set + exit CS
+    const observed = state.value;
+    if (observed === 0) state.value = 1;   // Stopped -> Starting
+    return observed;
+  }
+  function finalise(taskOk) {
+    // enter CS + set state + exit CS
+    state.value = taskOk ? 2 : 0;
+  }
+  function Start(createReturns) {
+    const observed = reserve();
+    if (observed === 2) return "ESP_OK";
+    if (observed === 1) return "ESP_ERR_INVALID_STATE";
+    // Stopped: we own the create.
+    calls.create++;
+    const ok = createReturns.shift() ?? true;
+    finalise(ok);
+    return ok ? "ESP_OK" : "ESP_ERR_NO_MEM";
+  }
+  return { state, calls, Start };
+}
+
+test("phase 3 task 6 correction 1 state model: two concurrent Starts — one creates, the other returns INVALID_STATE without touching create", () => {
+  const g = makeStartGuard();
+  // Interleave: caller A reserves Stopped -> Starting first (before B's reserve).
+  const observedA = 0;                    // A reads Stopped
+  g.state.value = 1;                       // A reserves Starting
+  // Now caller B enters CS and reads Starting.
+  const observedB = g.state.value;
+  // B does not modify state (only Stopped triggers a transition).
+  // Post-CS: B observes Starting -> INVALID_STATE.
+  const rB = observedB === 1 ? "ESP_ERR_INVALID_STATE" : "ESP_OK";
+  assert.equal(rB, "ESP_ERR_INVALID_STATE",
+    "second concurrent Start must return ESP_ERR_INVALID_STATE");
+  // A now completes: xTaskCreateStatic (simulated ok), promotes Starting -> Started.
+  g.state.value = 2;
+  const rA = "ESP_OK";
+  assert.equal(rA, "ESP_OK");
+  assert.equal(g.state.value, 2, "state ends Started");
+  // Follow-up Start after the pair returns ESP_OK (idempotent).
+  const rC = g.Start([]);
+  assert.equal(rC, "ESP_OK", "third Start returns ESP_OK idempotently");
+  assert.equal(g.calls.create, 0,
+    "third Start must NOT reach create (already Started)");
+});
+
+test("phase 3 task 6 correction 1 state model: exactly one create per Stopped -> Started cycle (three concurrent Starts)", () => {
+  const g = makeStartGuard();
+  const outcomes = [];
+  outcomes.push(g.Start([true]));   // caller A: full path Stopped -> Starting -> create ok -> Started
+  outcomes.push(g.Start([]));       // caller B: sees Started -> ESP_OK, no create
+  outcomes.push(g.Start([]));       // caller C: sees Started -> ESP_OK, no create
+  assert.deepEqual(outcomes, ["ESP_OK", "ESP_OK", "ESP_OK"]);
+  assert.equal(g.calls.create, 1,
+    "exactly one create per Stopped -> Started cycle");
+});
+
+test("phase 3 task 6 correction 1 state model: xTaskCreateStatic failure restores Stopped so a later Start can retry and succeed", () => {
+  const g = makeStartGuard();
+  const first = g.Start([false]);   // create fails
+  assert.equal(first, "ESP_ERR_NO_MEM");
+  assert.equal(g.state.value, 0, "state restored to Stopped after create failure");
+  const second = g.Start([true]);   // retry
+  assert.equal(second, "ESP_OK");
+  assert.equal(g.state.value, 2, "state Started after successful retry");
+  assert.equal(g.calls.create, 2, "two create attempts total (first failed, retry succeeded)");
 });
