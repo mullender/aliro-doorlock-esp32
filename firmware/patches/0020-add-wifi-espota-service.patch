@@ -1,0 +1,591 @@
+Add the inactive Wi-Fi ESP-OTA service module (Wi-Fi variants
+only; Thread never applies). This is the FreeRTOS listener task
+that will later wire the espota protocol + transfer helpers to
+the AliroLocalOta core. Nothing calls AliroEspotaServiceStart()
+in this task; activation is a later patch.
+
+Scope:
+  * NEW main/aliro_espota_service.h: declares
+      esp_err_t AliroEspotaServiceStart(void);
+    plus constants (UDP 3232, 8 KiB task stack, 3 s auth wait,
+    5 s TCP connect, 500 ms restart delay, 256 B UDP buffer).
+  * NEW main/aliro_espota_service.cpp:
+      - Idempotent start via a static-mutex-guarded s_started.
+      - xTaskCreateStatic (no heap) with module-static
+        s_listener_stack + s_listener_tcb.
+      - UDP bind to :3232. Outer loop rebinds on a dead
+        socket. Inner loop resets SO_RCVTIMEO to 0 before
+        every invitation recvfrom (close+rebind on reset
+        failure); n > 0 -> run one session; n == 0 -> ignore;
+        n < 0 with EINTR -> retry; other errno ->
+        close+rebind.
+      - Session:
+          1. ParseInvitation. Reject without Abort (no
+             transaction yet).
+          2. Nonce via esp_fill_random.
+          3. FormatChallenge + sendto AUTH; full send result
+             checked before waiting.
+          4. Absolute deadline for AUTH wait: computed once,
+             each recvfrom uses the remaining time via
+             SO_RCVTIMEO so off-peer traffic cannot extend it.
+             Off-peer packets (IP or UDP source port
+             mismatch) are drained.
+          5. ParseAuth + VerifyAuth. Verify fail -> reset;
+             no Abort.
+          6. AliroLocalOtaBegin(size) BEFORE the final UDP
+             OK. Begin fail -> best-effort "Error: begin\n"
+             and reset; NO Abort.
+          7. Final UDP OK. Send fail -> Abort x 1 and reset.
+          8. TCP connect (non-blocking + select on writable +
+             SO_ERROR + absolute deadline). Connect fail
+             after Begin -> Abort x 1 and reset.
+          9. AliroEspotaRunTransfer. Consumes the transaction
+             on every return; NEVER Abort after this.
+         10. Close TCP socket on every path.
+         11. esp_restart only on helper == ESP_OK, after a
+             500 ms delay. Failures keep listening.
+      - Fixed static 256 B UDP receive buffer; no heap.
+
+  * WIRE patch 0020 into nanoc6-wifi and atoms3-lite-wifi
+    source_patches. nanoc6-thread source_patches unchanged.
+
+Non-goals: no app_main caller, no service activation, no mDNS,
+no filesystem command, no Arduino runtime, no HTTP / settings /
+credentials / heap / extras. No CMakeLists.txt change.
+
+diff --git a/examples/door_lock/main/aliro_espota_service.h b/examples/door_lock/main/aliro_espota_service.h
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_service.h
+@@ -0,0 +1,72 @@
++/*
++   Inactive Wi-Fi ESP-OTA service module. Wi-Fi variants only;
++   Thread never applies, compiles, or links this file. Nothing
++   calls AliroEspotaServiceStart() in this task; activation is
++   a later patch. Idempotent start. One session at a time.
++*/
++
++#pragma once
++
++#include <esp_err.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Size / timing constants.
++enum {
++    /*
++       Standard Arduino espota UDP port. Not configurable at this
++       task's scope.
++    */
++    kAliroEspotaServiceUdpPort = 3232,
++    /*
++       Small named FreeRTOS task stack, in bytes. Recorded here so
++       a later high-water measurement can right-size it.
++    */
++    kAliroEspotaServiceTaskStackBytes = 8192,
++    /*
++       Bounded wait for the client's AUTH response, in
++       milliseconds. Overrun ends the session and returns the
++       task to the invitation-listen state.
++    */
++    kAliroEspotaServiceAuthTimeoutMs = 3000,
++    /*
++       Bounded TCP connect deadline when the server dials the
++       client's advertised port after the UDP OK.
++    */
++    kAliroEspotaServiceTcpConnectTimeoutMs = 5000,
++    /*
++       Short delay between AliroEspotaRunTransfer returning
++       ESP_OK and esp_restart(), so the TCP FIN and any logging
++       can flush.
++    */
++    kAliroEspotaServiceRestartDelayMs = 500,
++    /*
++       Maximum UDP payload we ever hand to the invitation or
++       auth parsers. The two grammars are fixed-length; anything
++       larger is malformed by definition.
++    */
++    kAliroEspotaServiceUdpBufBytes = 256,
++};
++
++/*
++   Start the espota service task exactly once. Idempotent: a
++   second call while the task is running returns ESP_OK and does
++   nothing.
++
++   This entry point is INACTIVE in the task-6 patch: no code path
++   in the door-lock firmware calls it yet. Activation is a later
++   patch. Returning ESP_OK from a duplicate call, rather than an
++   error, means a future activation can be wired without extra
++   guard logic.
++
++   Returns ESP_OK on success (task spawned or already running).
++   Returns non-ESP_OK if the task cannot be spawned.
++*/
++esp_err_t AliroEspotaServiceStart(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/examples/door_lock/main/aliro_espota_service.cpp b/examples/door_lock/main/aliro_espota_service.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/door_lock/main/aliro_espota_service.cpp
+@@ -0,0 +1,454 @@
++/*
++   Inactive Wi-Fi ESP-OTA service module. Wi-Fi variants only;
++   Thread never applies, compiles, or links this file. Nothing
++   calls AliroEspotaServiceStart() in this task. Abort ownership
++   rules are stated in the patch preamble and enforced at each
++   call site below.
++*/
++
++#include "aliro_espota_service.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++
++#include <esp_err.h>
++#include <esp_log.h>
++#include <esp_random.h>
++#include <esp_system.h>
++#include <esp_timer.h>
++
++#include <freertos/FreeRTOS.h>
++#include <freertos/semphr.h>
++#include <freertos/task.h>
++
++#include "aliro_espota_protocol.h"
++#include "aliro_espota_transfer.h"
++#include "aliro_local_ota.h"
++
++namespace {
++
++const char *TAG = "aliro_espota_svc";
++
++/*
++   Idempotent-start guard. A static bool + mutex; a second
++   Start() call while the task is running returns ESP_OK and
++   does nothing.
++*/
++StaticSemaphore_t s_start_mutex_buf;
++SemaphoreHandle_t s_start_mutex = nullptr;
++bool              s_started    = false;
++
++/*
++   Static UDP receive buffer. Fixed-size; no heap; sized to hold
++   the exact fixed-length invitation and auth grammars (both fit
++   well under 256 bytes).
++*/
++static_assert(kAliroEspotaServiceUdpBufBytes == 256,
++              "UDP buffer must be exactly 256 bytes");
++uint8_t s_udp_buf[kAliroEspotaServiceUdpBufBytes];
++
++/*
++   Static FreeRTOS task storage. xTaskCreateStatic uses caller-
++   owned TCB and stack backing, so no heap is used to spawn the
++   listener task. The stack size is pinned by
++   kAliroEspotaServiceTaskStackBytes.
++*/
++StackType_t   s_listener_stack[kAliroEspotaServiceTaskStackBytes / sizeof(StackType_t)];
++StaticTask_t  s_listener_tcb;
++
++/*
++   Set / clear per-socket receive timeout on the caller-provided
++   socket. Returns true on success. `ms == 0` disables the
++   timeout (idle invitation-listen mode) by zeroing both fields.
++*/
++bool set_recv_timeout_ms(int sock, int ms) {
++    struct timeval tv;
++    tv.tv_sec  = ms / 1000;
++    tv.tv_usec = (ms % 1000) * 1000;
++    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
++}
++
++/*
++   Monotonic milliseconds since boot. Used to compute absolute
++   deadlines that off-peer datagrams cannot extend.
++*/
++int64_t now_ms() {
++    return esp_timer_get_time() / 1000;
++}
++
++/*
++   Send a bounded UDP failure line back to the peer. Best-effort;
++   ignore the send-side result — we only use it so a curious
++   client sees a text reason for the reset.
++*/
++void send_udp_line(int udp_sock,
++                   const struct sockaddr_in *peer,
++                   const char *msg, size_t len) {
++    if (udp_sock < 0 || peer == nullptr || msg == nullptr) return;
++    sendto(udp_sock, msg, len, 0,
++           reinterpret_cast<const struct sockaddr *>(peer),
++           sizeof(*peer));
++}
++
++/*
++   Bind a UDP socket to :3232. Returns >= 0 on success or -1.
++*/
++int bind_udp_listener() {
++    int s = socket(AF_INET, SOCK_DGRAM, 0);
++    if (s < 0) return -1;
++    struct sockaddr_in addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family      = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_ANY);
++    addr.sin_port        = htons(kAliroEspotaServiceUdpPort);
++    if (bind(s, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
++        close(s);
++        return -1;
++    }
++    return s;
++}
++
++/*
++   Connect a TCP socket to (peer_ip, peer_port) with a strict
++   bounded deadline. Approach: put the socket in non-blocking
++   mode, issue connect(), then wait on select() until the socket
++   becomes writable OR the absolute deadline expires. Read
++   SO_ERROR on the writable event to distinguish real connect
++   success from a failed SYN. Restores the socket to blocking on
++   success so downstream recv / send use the normal blocking
++   API.
++
++   Returns the connected fd on success. On any failure (socket
++   create, fcntl, connect init, select, SO_ERROR, deadline) the
++   fd is closed here and -1 is returned.
++
++   The bounded connect is required so a client that drops off
++   between UDP OK and TCP accept cannot pin this task.
++*/
++int connect_tcp_bounded(uint32_t peer_ip_net, uint16_t peer_port,
++                        int timeout_ms) {
++    int s = socket(AF_INET, SOCK_STREAM, 0);
++    if (s < 0) return -1;
++
++    // Non-blocking mode so connect() returns EINPROGRESS.
++    int flags = fcntl(s, F_GETFL, 0);
++    if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
++        close(s);
++        return -1;
++    }
++
++    struct sockaddr_in dst;
++    memset(&dst, 0, sizeof(dst));
++    dst.sin_family      = AF_INET;
++    dst.sin_addr.s_addr = peer_ip_net;
++    dst.sin_port        = htons(peer_port);
++
++    int rc = connect(s, reinterpret_cast<struct sockaddr *>(&dst), sizeof(dst));
++    if (rc == 0) {
++        // Immediate connect. Restore blocking and return.
++        if (fcntl(s, F_SETFL, flags) < 0) { close(s); return -1; }
++        return s;
++    }
++    if (rc < 0 && errno != EINPROGRESS) {
++        close(s);
++        return -1;
++    }
++
++    // Wait on the absolute deadline. select() timeout is
++    // recomputed from the deadline on every retry so any spurious
++    // EINTR does not extend the bound.
++    const int64_t deadline = now_ms() + timeout_ms;
++    for (;;) {
++        int64_t remaining = deadline - now_ms();
++        if (remaining <= 0) { close(s); return -1; }
++        fd_set wset;
++        FD_ZERO(&wset);
++        FD_SET(s, &wset);
++        struct timeval tv;
++        tv.tv_sec  = remaining / 1000;
++        tv.tv_usec = (remaining % 1000) * 1000;
++        int sr = select(s + 1, nullptr, &wset, nullptr, &tv);
++        if (sr > 0 && FD_ISSET(s, &wset)) break;
++        if (sr == 0) { close(s); return -1; }              // timed out
++        if (sr < 0 && errno == EINTR) continue;            // retry
++        close(s); return -1;
++    }
++    // Writable -> ask SO_ERROR whether the connect really
++    // succeeded.
++    int so_err = 0;
++    socklen_t so_len = sizeof(so_err);
++    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &so_len) != 0 ||
++        so_err != 0) {
++        close(s);
++        return -1;
++    }
++    // Restore blocking for downstream recv / send.
++    if (fcntl(s, F_SETFL, flags) < 0) { close(s); return -1; }
++    return s;
++}
++
++/*
++   One session, driven synchronously. Consumes one UDP packet
++   already buffered in s_udp_buf as the invitation, runs the
++   full challenge / response + Begin + TCP transfer, and returns
++   to the caller (the task loop) so the loop can keep listening.
++*/
++void run_one_session(int udp_sock,
++                     size_t inv_len,
++                     const struct sockaddr_in *peer) {
++    /*
++       1. Parse and validate the invitation. Reject early — we
++          have not called Begin yet, so no Abort is needed.
++    */
++    aliro_espota_invitation_t invitation;
++    if (AliroEspotaParseInvitation(
++            reinterpret_cast<const char *>(s_udp_buf), inv_len,
++            &invitation) != ESP_OK) {
++        ESP_LOGW(TAG, "invitation parse failed; peer ignored");
++        return;
++    }
++
++    /*
++       2. Nonce + challenge. Random bytes via esp_fill_random
++          (never micros()/random(); those are ArduinoOTA quirks).
++          The full challenge send result is checked before we
++          commit to waiting for the auth response.
++    */
++    uint8_t nonce[kAliroEspotaNonceBytes];
++    esp_fill_random(nonce, sizeof(nonce));
++    char challenge[kAliroEspotaChallengeLen];
++    if (AliroEspotaFormatChallenge(nonce, challenge,
++                                   sizeof(challenge)) != ESP_OK) {
++        ESP_LOGE(TAG, "challenge format failed");
++        return;
++    }
++    ssize_t ch_n = sendto(udp_sock, challenge, sizeof(challenge), 0,
++                          reinterpret_cast<const struct sockaddr *>(peer),
++                          sizeof(*peer));
++    if (ch_n != static_cast<ssize_t>(sizeof(challenge))) {
++        ESP_LOGE(TAG, "AUTH challenge send failed");
++        return;
++    }
++
++    /*
++       3. Bounded wait for the AUTH response. The deadline is
++          ABSOLUTE: computed once here, then every recvfrom
++          picks up the remaining time so repeated off-peer
++          datagrams cannot extend the total window. During the
++          wait the socket only accepts a packet from the SAME
++          peer (IP + UDP source port). Off-peer packets are
++          drained and ignored so an off-peer client cannot
++          hijack an in-flight session.
++    */
++    const int64_t auth_deadline_ms =
++        now_ms() + kAliroEspotaServiceAuthTimeoutMs;
++    aliro_espota_auth_t auth;
++    bool have_auth = false;
++    while (!have_auth) {
++        int64_t remaining = auth_deadline_ms - now_ms();
++        if (remaining <= 0) {
++            ESP_LOGW(TAG, "AUTH window expired");
++            return;
++        }
++        int rms = remaining > 0x7fffffff
++                    ? 0x7fffffff : static_cast<int>(remaining);
++        if (!set_recv_timeout_ms(udp_sock, rms)) {
++            ESP_LOGE(TAG, "setsockopt SO_RCVTIMEO failed");
++            return;
++        }
++        struct sockaddr_in from;
++        socklen_t from_len = sizeof(from);
++        ssize_t n = recvfrom(udp_sock, s_udp_buf, sizeof(s_udp_buf), 0,
++                             reinterpret_cast<struct sockaddr *>(&from),
++                             &from_len);
++        if (n <= 0) {
++            // -1 with EAGAIN/EWOULDBLOCK = auth window expired;
++            //  0 = peer sent an empty packet (skip); other = err
++            ESP_LOGW(TAG, "AUTH window expired or recv error");
++            return;
++        }
++        if (from.sin_addr.s_addr != peer->sin_addr.s_addr ||
++            from.sin_port        != peer->sin_port) {
++            // Off-peer packet — drop and keep waiting under the
++            // ABSOLUTE deadline (this loop iteration recomputes
++            // the remaining time so off-peer traffic cannot
++            // extend the total window).
++            continue;
++        }
++        if (AliroEspotaParseAuth(reinterpret_cast<const char *>(s_udp_buf),
++                                 static_cast<size_t>(n),
++                                 &auth) != ESP_OK) {
++            ESP_LOGW(TAG, "AUTH parse failed; peer ignored");
++            return;
++        }
++        have_auth = true;
++    }
++
++    /*
++       4. Verify. Reset on any failure; no Abort (Begin has not
++          happened yet).
++    */
++    if (AliroEspotaVerifyAuth(nonce, &auth) != ESP_OK) {
++        ESP_LOGW(TAG, "AUTH verification failed");
++        return;
++    }
++
++    /*
++       5. Reserve the shared OTA transaction BEFORE the final
++          UDP OK. If Begin fails, send a bounded failure line
++          and do NOT call Abort (the core released the guard).
++    */
++    esp_err_t bx = AliroLocalOtaBegin(invitation.size);
++    if (bx != ESP_OK) {
++        static const char kErr[] = "Error: begin\n";
++        send_udp_line(udp_sock, peer, kErr, sizeof(kErr) - 1);
++        return;
++    }
++
++    /*
++       6. Final UDP OK. If the send fails, Abort exactly once
++          because the transaction is open.
++    */
++    static const char kOk[] = "OK";
++    ssize_t ok_n = sendto(udp_sock, kOk, 2, 0,
++                          reinterpret_cast<const struct sockaddr *>(peer),
++                          sizeof(*peer));
++    if (ok_n != 2) {
++        ESP_LOGE(TAG, "UDP OK send failed after Begin");
++        AliroLocalOtaAbort();
++        return;
++    }
++
++    /*
++       7. Connect TCP OUT to the client's advertised port with a
++          bounded timeout. Connect failure after Begin -> Abort
++          exactly once.
++    */
++    int tcp = connect_tcp_bounded(peer->sin_addr.s_addr,
++                                  invitation.client_port,
++                                  kAliroEspotaServiceTcpConnectTimeoutMs);
++    if (tcp < 0) {
++        ESP_LOGE(TAG, "TCP connect to client failed after Begin");
++        AliroLocalOtaAbort();
++        return;
++    }
++
++    /*
++       8. Run the body transfer. The helper consumes the
++          transaction on EVERY return, so this task NEVER calls
++          AliroLocalOtaAbort after this point. The TCP socket is
++          always closed after the helper.
++    */
++    esp_err_t rc = AliroEspotaRunTransfer(tcp, &invitation);
++    close(tcp);
++
++    if (rc == ESP_OK) {
++        /*
++           9. Success -> short delay for the FIN / logs to flush,
++              then restart into the new OTA slot.
++        */
++        vTaskDelay(pdMS_TO_TICKS(kAliroEspotaServiceRestartDelayMs));
++        esp_restart();
++        // esp_restart does not return.
++    }
++    /* Failure -> continue listening. Nothing to Abort here. */
++}
++
++/*
++   Persistent listener task. Binds UDP :3232 once, then loops
++   forever handling one session at a time. Errors that only
++   affect the socket are logged and swallowed so the task never
++   exits.
++*/
++void listener_task(void *arg) {
++    (void)arg;
++    for (;;) {
++        int udp_sock = bind_udp_listener();
++        if (udp_sock < 0) {
++            ESP_LOGE(TAG, "UDP bind failed; retrying in 1 s");
++            vTaskDelay(pdMS_TO_TICKS(1000));
++            continue;
++        }
++        bool rebind = false;
++        while (!rebind) {
++            /*
++               Restore the UDP socket to idle invitation-listen
++               mode BEFORE every recvfrom. This clears any
++               SO_RCVTIMEO set during a prior session's AUTH
++               window so a stale timeout cannot persist and
++               truncate the next invitation wait. If the reset
++               itself fails, treat the socket as dead: close
++               and fall back to the outer bind loop so a fresh
++               socket handles the next invitation.
++            */
++            if (!set_recv_timeout_ms(udp_sock, 0)) {
++                ESP_LOGE(TAG, "idle SO_RCVTIMEO reset failed; rebinding");
++                rebind = true;
++                break;
++            }
++            struct sockaddr_in peer;
++            socklen_t peer_len = sizeof(peer);
++            ssize_t n = recvfrom(udp_sock, s_udp_buf, sizeof(s_udp_buf), 0,
++                                 reinterpret_cast<struct sockaddr *>(&peer),
++                                 &peer_len);
++            if (n > 0) {
++                run_one_session(udp_sock, static_cast<size_t>(n), &peer);
++                continue;
++            }
++            if (n == 0) {
++                // Zero-length datagram: legal, ignore and
++                // keep listening.
++                continue;
++            }
++            // n < 0: classify the error. Retry on EINTR only;
++            // close+rebind on any other negative error so we do
++            // not tight-loop on a broken descriptor. Idle
++            // listening has NO SO_RCVTIMEO so EAGAIN /
++            // EWOULDBLOCK are not expected here — treat them
++            // as real errors too.
++            if (errno == EINTR) continue;
++            ESP_LOGE(TAG, "idle recvfrom failed (errno %d); rebinding",
++                     errno);
++            rebind = true;
++        }
++        // rebind == true: socket dead or idle-reset failed.
++        // Close and rebind on the next outer iteration.
++        close(udp_sock);
++    }
++}
++
++}  // namespace
++
++esp_err_t AliroEspotaServiceStart(void) {
++    if (s_start_mutex == nullptr) {
++        s_start_mutex = xSemaphoreCreateMutexStatic(&s_start_mutex_buf);
++        if (s_start_mutex == nullptr) return ESP_FAIL;
++    }
++    xSemaphoreTake(s_start_mutex, portMAX_DELAY);
++    if (s_started) {
++        // Idempotent: already running.
++        xSemaphoreGive(s_start_mutex);
++        return ESP_OK;
++    }
++    // Static task spawn — no heap. TCB + stack backing are the
++    // module-static s_listener_tcb / s_listener_stack.
++    TaskHandle_t task = xTaskCreateStatic(
++        listener_task, "aliro_espota",
++        sizeof(s_listener_stack) / sizeof(StackType_t),
++        nullptr, tskIDLE_PRIORITY + 3,
++        s_listener_stack, &s_listener_tcb);
++    if (task == nullptr) {
++        xSemaphoreGive(s_start_mutex);
++        return ESP_ERR_NO_MEM;
++    }
++    s_started = true;
++    xSemaphoreGive(s_start_mutex);
++    return ESP_OK;
++}

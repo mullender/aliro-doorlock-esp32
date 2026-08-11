@@ -9073,3 +9073,290 @@ test("phase 3 task 5 state model: final-OK send failure returns ESP_FAIL without
   assert.equal(mock.calls.abort, 0,
     "final-OK send failure must NOT trigger a stale Abort — transaction is already committed");
 });
+
+// -----------------------------------------------------------------------
+// Phase 3 task 6: inactive espota service module
+// -----------------------------------------------------------------------
+
+const PHASE3_TASK6_PATCH = "firmware/patches/0020-add-wifi-espota-service.patch";
+
+function phase3Task6PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE3_TASK6_PATCH}`, import.meta.url), "utf8");
+}
+
+function extractPhase3Task6NewFile(basename) {
+  const patch = phase3Task6PatchText();
+  const lines = patch.split("\n");
+  const header = `+++ b/examples/door_lock/main/${basename}`;
+  let i = lines.findIndex((line) => line === header);
+  assert.ok(i > 0,
+    `patch 0020 must add examples/door_lock/main/${basename}`);
+  const body = [];
+  for (i++; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("diff --git ") || line.startsWith("+++ b/")) break;
+    if (line.startsWith("@@")) continue;
+    if (line.startsWith("+")) body.push(line.slice(1));
+  }
+  return body.join("\n");
+}
+
+test("phase 3 task 6: patch 0020 wired to both Wi-Fi variants; Thread excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE3_TASK6_PATCH),
+      `${id} must include ${PHASE3_TASK6_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE3_TASK6_PATCH), false,
+    "Thread must NOT include the Wi-Fi-only espota-service patch");
+});
+
+test("phase 3 task 6: patch 0020 creates exactly two files under examples/door_lock/main/", () => {
+  const patch = phase3Task6PatchText();
+  const paths = patch.match(/^diff --git a\/([^\s]+) /gm) || [];
+  for (const line of paths) {
+    const m = line.match(/^diff --git a\/([^\s]+) /);
+    assert.match(m[1], /^examples\/door_lock\/main\/aliro_espota_service\.(h|cpp)$/,
+      `patch 0020 must only touch aliro_espota_service.h/.cpp; saw ${m[1]}`);
+  }
+  assert.equal((patch.match(/^new file mode 100644$/gm) || []).length, 2);
+});
+
+test("phase 3 task 6: header declares Start() and required constants; UDP port 3232", () => {
+  const header = extractPhase3Task6NewFile("aliro_espota_service.h");
+  assert.match(header, /esp_err_t\s+AliroEspotaServiceStart\s*\(\s*void\s*\)\s*;/,
+    "single Start() entry point");
+  assert.match(header, /kAliroEspotaServiceUdpPort\s*=\s*3232\b/,
+    "UDP port must be 3232");
+  assert.match(header, /kAliroEspotaServiceTaskStackBytes\s*=\s*8192\b/,
+    "small named task stack (recorded for high-water measurement)");
+  assert.match(header, /kAliroEspotaServiceAuthTimeoutMs\s*=\s*3000\b/,
+    "bounded AUTH timeout");
+  assert.match(header, /kAliroEspotaServiceTcpConnectTimeoutMs\s*=\s*5000\b/,
+    "bounded TCP connect timeout");
+  assert.match(header, /extern\s+"C"\s*\{/, "C linkage");
+});
+
+test("phase 3 task 6: xTaskCreateStatic + module-static TCB and stack (no heap)", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp, /xTaskCreateStatic\s*\(/,
+    "task must be spawned via xTaskCreateStatic (no heap)");
+  assert.match(cpp, /StackType_t\s+s_listener_stack\s*\[/,
+    "s_listener_stack must be a module-static StackType_t array");
+  assert.match(cpp, /StaticTask_t\s+s_listener_tcb\s*;/,
+    "s_listener_tcb must be a module-static StaticTask_t");
+  assert.equal(/xTaskCreate\s*\(/.test(cpp.replace(/xTaskCreateStatic/g, "")), false,
+    "must NOT use xTaskCreate (heap)");
+  const code = cpp.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  for (const t of ["malloc(", "calloc(", "realloc(", "operator new", " new ", "heap_caps_"]) {
+    assert.equal(code.includes(t), false, `no heap: ${t}`);
+  }
+});
+
+test("phase 3 task 6: fixed 256 B UDP buffer + static_assert; no per-session allocation", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp, /static_assert\s*\(\s*kAliroEspotaServiceUdpBufBytes\s*==\s*256\b/,
+    "static_assert on 256 B UDP buffer");
+  assert.match(cpp, /uint8_t\s+s_udp_buf\s*\[\s*kAliroEspotaServiceUdpBufBytes\s*\]/,
+    "s_udp_buf must be a module-static fixed array");
+});
+
+test("phase 3 task 6 idempotent Start: static mutex + s_started guard", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp, /xSemaphoreCreateMutexStatic\s*\(\s*&\s*s_start_mutex_buf\s*\)/,
+    "start mutex must be static");
+  assert.match(cpp,
+    /if\s*\(\s*s_started\s*\)\s*\{\s*[\s\S]{0,100}?xSemaphoreGive\s*\(\s*s_start_mutex\s*\)\s*;\s*return\s+ESP_OK\s*;/,
+    "second Start() returns ESP_OK without spawning again");
+});
+
+test("phase 3 task 6 UDP flow: bind :3232, esp_fill_random, FormatChallenge, sendto AUTH with full-send check", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp, /htons\s*\(\s*kAliroEspotaServiceUdpPort\s*\)/,
+    "must use htons(kAliroEspotaServiceUdpPort) to set the listen port");
+  assert.match(cpp, /\bbind\s*\(\s*s\s*,/,
+    "must call bind() on the UDP socket");
+  assert.match(cpp, /esp_fill_random\s*\(\s*nonce\s*,\s*sizeof\s*\(\s*nonce\s*\)\s*\)/,
+    "nonce must be esp_fill_random (never micros()/random)");
+  assert.match(cpp, /AliroEspotaFormatChallenge\s*\(\s*nonce\s*,\s*challenge\s*,\s*sizeof\s*\(\s*challenge\s*\)\s*\)/,
+    "must format challenge via AliroEspotaFormatChallenge");
+  assert.match(cpp,
+    /ssize_t\s+ch_n\s*=\s*sendto\s*\([\s\S]*?if\s*\(\s*ch_n\s*!=\s*static_cast<ssize_t>\(\s*sizeof\s*\(\s*challenge\s*\)\s*\)\s*\)\s*\{[\s\S]{0,120}?return\s*;/,
+    "full AUTH challenge send result checked before waiting");
+});
+
+test("phase 3 task 6 AUTH wait: ABSOLUTE deadline; off-peer packets ignored; same-peer IP+port match", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp,
+    /const\s+int64_t\s+auth_deadline_ms\s*=\s*now_ms\s*\(\s*\)\s*\+\s*kAliroEspotaServiceAuthTimeoutMs\s*;/,
+    "AUTH deadline must be absolute (computed once)");
+  assert.match(cpp,
+    /int64_t\s+remaining\s*=\s*auth_deadline_ms\s*-\s*now_ms\s*\(\s*\)\s*;/,
+    "each recvfrom recomputes the remaining time from the absolute deadline");
+  assert.match(cpp,
+    /if\s*\(\s*from\.sin_addr\.s_addr\s*!=\s*peer->sin_addr\.s_addr\s*\|\|\s*from\.sin_port\s*!=\s*peer->sin_port\s*\)/,
+    "off-peer packets must be dropped by IP+port comparison");
+});
+
+test("phase 3 task 6 Begin ownership: Begin BEFORE final UDP OK; no Abort on Begin failure", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  const bxIdx = cpp.indexOf("AliroLocalOtaBegin(invitation.size)");
+  const okIdx = cpp.indexOf('static const char kOk[]');
+  assert.ok(bxIdx > 0 && okIdx > bxIdx,
+    "Begin must be called BEFORE the final UDP OK");
+  // Begin failure branch must NOT call Abort
+  const beginFail = cpp.match(
+    /esp_err_t\s+bx\s*=\s*AliroLocalOtaBegin[\s\S]*?if\s*\(\s*bx\s*!=\s*ESP_OK\s*\)\s*\{([\s\S]*?)\n\s{4}\}/);
+  assert.ok(beginFail, "must find bx != ESP_OK branch");
+  assert.equal(/AliroLocalOtaAbort\s*\(/.test(beginFail[1]), false,
+    "Begin failure branch must NOT call AliroLocalOtaAbort");
+});
+
+test("phase 3 task 6 Abort ownership: UDP-OK send failure Aborts x 1; TCP connect failure after Begin Aborts x 1; NEVER Abort after RunTransfer", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp,
+    /ok_n\s*!=\s*2\s*\)\s*\{[\s\S]{0,200}?AliroLocalOtaAbort\s*\(\s*\)\s*;\s*return\s*;/,
+    "UDP OK send failure must Abort exactly once");
+  assert.match(cpp,
+    /tcp\s*<\s*0\s*\)\s*\{[\s\S]{0,200}?AliroLocalOtaAbort\s*\(\s*\)\s*;\s*return\s*;/,
+    "TCP connect failure after Begin must Abort exactly once");
+  // No Abort after AliroEspotaRunTransfer
+  const afterXfer = cpp.match(/AliroEspotaRunTransfer\s*\([^)]*\)\s*;\s*close\s*\(\s*tcp\s*\)\s*;([\s\S]*?)^\}\s*$/m);
+  assert.ok(afterXfer, "must find code between RunTransfer and function end");
+  assert.equal(/AliroLocalOtaAbort\s*\(/.test(afterXfer[1]), false,
+    "helper NEVER calls AliroLocalOtaAbort after AliroEspotaRunTransfer");
+  assert.match(afterXfer[1],
+    /if\s*\(\s*rc\s*==\s*ESP_OK\s*\)\s*\{[\s\S]{0,300}?vTaskDelay\s*\(\s*pdMS_TO_TICKS\s*\(\s*kAliroEspotaServiceRestartDelayMs\s*\)\s*\)\s*;\s*esp_restart\s*\(\s*\)\s*;/,
+    "esp_restart only after RunTransfer == ESP_OK, after the restart-delay");
+});
+
+test("phase 3 task 6 TCP connect: non-blocking + select + SO_ERROR + absolute deadline (bound guaranteed)", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp, /fcntl\s*\([^)]*,\s*F_SETFL\s*,\s*flags\s*\|\s*O_NONBLOCK\s*\)/,
+    "must set O_NONBLOCK via fcntl");
+  assert.match(cpp, /if\s*\(\s*rc\s*<\s*0\s*&&\s*errno\s*!=\s*EINPROGRESS\s*\)\s*\{\s*close\s*\(\s*s\s*\)\s*;\s*return\s+-\s*1\s*;\s*\}/,
+    "non-EINPROGRESS connect error closes fd + returns -1");
+  assert.match(cpp, /const\s+int64_t\s+deadline\s*=\s*now_ms\s*\(\s*\)\s*\+\s*timeout_ms\s*;/,
+    "absolute deadline computed for select loop");
+  assert.match(cpp, /select\s*\(\s*s\s*\+\s*1\s*,\s*nullptr\s*,\s*&\s*wset\s*,\s*nullptr\s*,\s*&\s*tv\s*\)/,
+    "select on writable set");
+  assert.match(cpp, /getsockopt\s*\(\s*s\s*,\s*SOL_SOCKET\s*,\s*SO_ERROR\s*,\s*&\s*so_err\s*,\s*&\s*so_len\s*\)/,
+    "SO_ERROR checked after writable");
+});
+
+test("phase 3 task 6 socket lifecycle: idle SO_RCVTIMEO reset before every invitation recvfrom; close+rebind on reset failure or non-EINTR error; retry EINTR; ignore n==0", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  assert.match(cpp,
+    /if\s*\(\s*!\s*set_recv_timeout_ms\s*\(\s*udp_sock\s*,\s*0\s*\)\s*\)\s*\{[\s\S]{0,120}?rebind\s*=\s*true\s*;\s*break\s*;/,
+    "idle SO_RCVTIMEO reset failure closes+rebinds");
+  assert.match(cpp, /if\s*\(\s*n\s*==\s*0\s*\)\s*\{[\s\S]{0,120}?continue\s*;/,
+    "zero-length datagram is ignored and listen continues");
+  assert.match(cpp, /if\s*\(\s*errno\s*==\s*EINTR\s*\)\s*continue\s*;/,
+    "EINTR is retried");
+  assert.match(cpp,
+    /ESP_LOGE\s*\([\s\S]{0,300}?"idle recvfrom failed[\s\S]{0,200}?rebind\s*=\s*true\s*;/,
+    "any other negative errno closes+rebinds (no tight loop)");
+});
+
+test("phase 3 task 6 non-goals: NO app_main caller, NO mDNS, NO filesystem, NO Arduino, NO HTTP change, NO settings/credentials, NO heap", () => {
+  const cpp = extractPhase3Task6NewFile("aliro_espota_service.cpp");
+  const header = extractPhase3Task6NewFile("aliro_espota_service.h");
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const both = strip(cpp) + "\n" + strip(header);
+  for (const t of [
+    "app_main", "AliroLocalWeb", "aliro_settings", "aliro_pairing",
+    "mdns_", "esp_mdns", "mDNS",
+    "LittleFS", "SPIFFS", "esp_vfs_",
+    "Arduino.h", "ArduinoOTA",
+    "httpd_", "esp_http_server",
+    "cJSON",
+  ]) {
+    assert.equal(both.includes(t), false,
+      `patch 0020 must NOT introduce ${t}`);
+  }
+});
+
+/*
+   JS state-model of the service session, mirroring the C
+   control flow. Each test drives one specific scenario.
+*/
+function makeSvcMock({
+    parseInvitationReturn = "ESP_OK",
+    verifyAuthReturn = "ESP_OK",
+    beginReturn = "ESP_OK",
+    okSendResult = 2,           // sendto returns bytes actually sent
+    connectResult = "ok",       // "ok" | "timeout" | "err"
+    runTransferReturn = "ESP_OK",
+} = {}) {
+  const calls = { begin: 0, abort: 0, runTransfer: 0, restart: 0, close: 0 };
+  const state = { busy: false };
+  const ota = {
+    Begin() { calls.begin++; if (beginReturn === "ESP_OK") state.busy = true; return beginReturn; },
+    Abort() { if (state.busy) { calls.abort++; state.busy = false; } },
+  };
+  function runSession() {
+    if (parseInvitationReturn !== "ESP_OK") return;
+    // (nonce + AUTH send + AUTH wait already succeeded)
+    if (verifyAuthReturn !== "ESP_OK") return;
+    const bx = ota.Begin();
+    if (bx !== "ESP_OK") return;  // Begin fail: no Abort
+    if (okSendResult !== 2) { ota.Abort(); return; }
+    if (connectResult !== "ok") { ota.Abort(); return; }
+    // RunTransfer consumes the transaction on every return.
+    calls.runTransfer++;
+    state.busy = false;
+    calls.close++;
+    if (runTransferReturn === "ESP_OK") { calls.restart++; }
+  }
+  return { calls, state, ota, runSession };
+}
+
+test("phase 3 task 6 state model: happy path -> RunTransfer once, restart once, no Abort", () => {
+  const s = makeSvcMock();
+  s.runSession();
+  assert.equal(s.calls.begin, 1);
+  assert.equal(s.calls.runTransfer, 1);
+  assert.equal(s.calls.restart, 1);
+  assert.equal(s.calls.abort, 0);
+});
+
+test("phase 3 task 6 state model: verify fail -> no Begin, no Abort", () => {
+  const s = makeSvcMock({verifyAuthReturn: "ESP_ERR_INVALID_STATE"});
+  s.runSession();
+  assert.equal(s.calls.begin, 0);
+  assert.equal(s.calls.abort, 0);
+});
+
+test("phase 3 task 6 state model: Begin fail -> no Abort, no restart", () => {
+  const s = makeSvcMock({beginReturn: "ESP_ERR_INVALID_STATE"});
+  s.runSession();
+  assert.equal(s.calls.begin, 1);
+  assert.equal(s.calls.abort, 0);
+  assert.equal(s.calls.restart, 0);
+});
+
+test("phase 3 task 6 state model: UDP OK send failure after Begin -> Abort x 1", () => {
+  const s = makeSvcMock({okSendResult: -1});
+  s.runSession();
+  assert.equal(s.calls.begin, 1);
+  assert.equal(s.calls.abort, 1);
+  assert.equal(s.calls.runTransfer, 0);
+});
+
+test("phase 3 task 6 state model: TCP connect failure after Begin -> Abort x 1", () => {
+  const s = makeSvcMock({connectResult: "timeout"});
+  s.runSession();
+  assert.equal(s.calls.begin, 1);
+  assert.equal(s.calls.abort, 1);
+  assert.equal(s.calls.runTransfer, 0);
+  assert.equal(s.calls.restart, 0);
+});
+
+test("phase 3 task 6 state model: RunTransfer failure -> no Abort by service, no restart", () => {
+  const s = makeSvcMock({runTransferReturn: "ESP_FAIL"});
+  s.runSession();
+  assert.equal(s.calls.runTransfer, 1);
+  assert.equal(s.calls.abort, 0);
+  assert.equal(s.calls.restart, 0);
+});
