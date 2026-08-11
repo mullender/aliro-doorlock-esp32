@@ -1,0 +1,44 @@
+Activate the Wi-Fi ESPOTA service in app_main. Wi-Fi variants
+only; Thread excluded.
+
+Edits examples/door_lock/main/app_main.cpp only:
+  * Add #include "aliro_espota_service.h" next to the accepted
+    "aliro_local_web.h" include.
+  * Call AliroEspotaServiceStart() once, after esp_matter::start
+    and after aliro_local_web_bind_wifi_lifecycle().
+  * Treat the start error as non-fatal: log one warning with
+    esp_err_to_name(err). Do NOT use ABORT_APP_ON_FAILURE.
+
+Wire patch 0021 to nanoc6-wifi and atoms3-lite-wifi
+source_patches. nanoc6-thread source_patches unchanged.
+
+Non-goals: no change to the ESPOTA service, no HTTP change, no
+settings, no credentials, no other runtime behavior.
+
+diff --git a/examples/door_lock/main/app_main.cpp b/examples/door_lock/main/app_main.cpp
+--- a/examples/door_lock/main/app_main.cpp
++++ b/examples/door_lock/main/app_main.cpp
+@@ -31,6 +31,7 @@
+ #include <setup_payload/OnboardingCodesUtil.h>
+ #endif
+
++#include "aliro_espota_service.h"
+ #include "aliro_local_web.h"
+
+ static const char *TAG = "app_main";
+@@ -227,6 +228,15 @@
+     /* Trusted-LAN HTTP foundation (Wi-Fi variants only). Non-fatal on error. */
+     aliro_local_web_bind_wifi_lifecycle();
+
++    /* Wi-Fi ESPOTA service. Wi-Fi variants only. Non-fatal on error. */
++    {
++        esp_err_t espota_err = AliroEspotaServiceStart();
++        if (espota_err != ESP_OK) {
++            ESP_LOGW(TAG, "AliroEspotaServiceStart failed: %s",
++                     esp_err_to_name(espota_err));
++        }
++    }
++
+ #if CONFIG_ENABLE_ENCRYPTED_OTA
+     err = esp_matter_ota_requestor_encrypted_init(s_decryption_key, s_decryption_key_len);
+     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialized the encrypted OTA, err: %d", err));

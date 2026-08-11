@@ -9490,3 +9490,115 @@ test("phase 3 task 6 correction 1 state model: xTaskCreateStatic failure restore
   assert.equal(g.state.value, 2, "state Started after successful retry");
   assert.equal(g.calls.create, 2, "two create attempts total (first failed, retry succeeded)");
 });
+
+// -----------------------------------------------------------------------
+// Phase 3 task 7: activate ESPOTA service in app_main
+// -----------------------------------------------------------------------
+
+const PHASE3_TASK7_PATCH = "firmware/patches/0021-activate-wifi-espota-service.patch";
+
+function phase3Task7PatchText() {
+  return readFileSync(
+    new URL(`../../${PHASE3_TASK7_PATCH}`, import.meta.url), "utf8");
+}
+
+test("phase 3 task 7: patch 0021 wired to both Wi-Fi variants; Thread excluded", () => {
+  const variants = phase2VariantsJson().variants;
+  for (const id of ["nanoc6-wifi", "atoms3-lite-wifi"]) {
+    assert.ok(variants[id].source_patches.includes(PHASE3_TASK7_PATCH),
+      `${id} must include ${PHASE3_TASK7_PATCH}`);
+  }
+  assert.equal(variants["nanoc6-thread"].source_patches.includes(PHASE3_TASK7_PATCH), false,
+    "Thread must NOT include the ESPOTA activation patch");
+});
+
+test("phase 3 task 7: patch 0021 edits only examples/door_lock/main/app_main.cpp", () => {
+  const patch = phase3Task7PatchText();
+  const paths = patch.match(/^diff --git a\/([^\s]+) /gm) || [];
+  assert.equal(paths.length, 1, "patch must touch exactly one file");
+  const m = paths[0].match(/^diff --git a\/([^\s]+) /);
+  assert.equal(m[1], "examples/door_lock/main/app_main.cpp",
+    `patch must only touch app_main.cpp; saw ${m[1]}`);
+  assert.ok(!/^new file mode/m.test(patch),
+    "patch must not create any new files");
+});
+
+test("phase 3 task 7: exactly one include of aliro_espota_service.h next to aliro_local_web.h", () => {
+  const patch = phase3Task7PatchText();
+  const addedIncludes = (patch.match(/^\+#include "aliro_espota_service\.h"/gm) || []).length;
+  assert.equal(addedIncludes, 1,
+    "must add exactly one #include \"aliro_espota_service.h\"");
+  // Prove adjacency to the accepted local-web include: the diff hunk should
+  // contain the new include on a `+` line and the accepted web include as
+  // context on an adjacent line.
+  assert.match(patch,
+    /\+#include\s+"aliro_espota_service\.h"\s*\n\s*#include\s+"aliro_local_web\.h"/,
+    "the new include must be adjacent to the accepted aliro_local_web.h include");
+});
+
+test("phase 3 task 7: exactly one AliroEspotaServiceStart() call, and no other reference to the entry point", () => {
+  const patch = phase3Task7PatchText();
+  const startCalls = (patch.match(/^\+.*AliroEspotaServiceStart\s*\(\s*\)/gm) || []).length;
+  assert.equal(startCalls, 1,
+    "must add exactly one AliroEspotaServiceStart() call");
+});
+
+test("phase 3 task 7: call order is Matter start, then web lifecycle, then ESPOTA start", () => {
+  const patch = phase3Task7PatchText();
+  /*
+     Search only inside the diff hunks (after the first `@@`)
+     so the header prose does not falsely satisfy the order.
+     The reconstructed post-patch stream is `+` + ` ` lines in
+     file order.
+  */
+  const hunkStart = patch.indexOf("\n@@");
+  assert.ok(hunkStart > 0, "must have at least one diff hunk");
+  const reconstructed = patch.slice(hunkStart).split("\n")
+    .filter((l) => l.startsWith("+") || l.startsWith(" "))
+    .map((l) => l.slice(1))
+    .join("\n");
+  const matterIdx = reconstructed.indexOf("aliro_local_web_bind_wifi_lifecycle()");
+  const espotaIdx = reconstructed.indexOf("AliroEspotaServiceStart()");
+  assert.ok(matterIdx > 0, "must reference aliro_local_web_bind_wifi_lifecycle as context");
+  assert.ok(espotaIdx > 0, "must add AliroEspotaServiceStart()");
+  assert.ok(espotaIdx > matterIdx,
+    "AliroEspotaServiceStart() must come AFTER aliro_local_web_bind_wifi_lifecycle() in file order");
+});
+
+test("phase 3 task 7: start failure is non-fatal — one ESP_LOGW with esp_err_to_name, NO ABORT_APP_ON_FAILURE", () => {
+  const patch = phase3Task7PatchText();
+  /*
+     Extract only the ADDED lines that surround the
+     AliroEspotaServiceStart call so we assert on the exact
+     activation block, not on unrelated context (the app_main
+     already uses ABORT_APP_ON_FAILURE for other calls).
+  */
+  const addedBlock = patch.split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+    .map((l) => l.slice(1))
+    .join("\n");
+  assert.match(addedBlock,
+    /esp_err_t\s+espota_err\s*=\s*AliroEspotaServiceStart\s*\(\s*\)\s*;\s*if\s*\(\s*espota_err\s*!=\s*ESP_OK\s*\)\s*\{[\s\S]{0,300}?ESP_LOGW\s*\([\s\S]{0,300}?esp_err_to_name\s*\(\s*espota_err\s*\)[\s\S]{0,10}\)/,
+    "activation block must capture the return, then ESP_LOGW with esp_err_to_name(err)");
+  assert.equal(/ABORT_APP_ON_FAILURE\s*\([^;]*espota/.test(addedBlock), false,
+    "activation must NOT use ABORT_APP_ON_FAILURE — start failure is non-fatal");
+  assert.equal(/ESP_LOGE[\s\S]{0,200}espota/i.test(addedBlock), false,
+    "activation must NOT log at ERROR level — a single WARN is enough");
+});
+
+test("phase 3 task 7: NO other runtime behavior changes (no HTTP / settings / credentials / restart / stop calls added)", () => {
+  const patch = phase3Task7PatchText();
+  const added = patch.split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+    .map((l) => l.slice(1))
+    .join("\n");
+  for (const forbidden of [
+    "httpd_register_uri_handler", "httpd_start", "httpd_stop",
+    "AliroSettings", "esp_restart", "ABORT_APP_ON_FAILURE",
+    "AliroLocalWeb", "esp_wifi_", "nvs_", "mdns_",
+    "AliroEspotaServiceStop",
+  ]) {
+    assert.equal(added.includes(forbidden), false,
+      `activation patch must NOT add ${forbidden}`);
+  }
+});
