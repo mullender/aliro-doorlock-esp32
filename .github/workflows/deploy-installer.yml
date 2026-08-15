@@ -90,10 +90,9 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - name: Checkout main with submodules
+      - name: Checkout the deployment ref with submodules
         uses: actions/checkout@v4
         with:
-          ref: main
           # `recursive` pulls installer/vendor/esp-web-tools and any of
           # its own submodules.
           submodules: recursive
