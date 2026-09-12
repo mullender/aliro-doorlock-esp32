@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Aliro door-lock installer</title>
+  <meta name="description" content="Build and flash an open Matter door-lock reader with Aliro NFC credentials." />
+  <meta name="theme-color" content="#071211" />
+  <title>Aliro Lock — Matter door-lock firmware</title>
   <style>
     :root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --line: #ccc; --accent: #067a46; --action: #067a46; --error: #a11; --warn-bg: #fff3cd; --warn-fg: #533f03; --warn-border: #ffcc00; }
     @media (prefers-color-scheme: dark) {
@@ -109,36 +111,142 @@
       .qr-box { border: none; }
     }
   </style>
+  <link rel="stylesheet" href="./site.css" />
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main">Skip to content</a>
 
-<h1>Aliro door-lock installer</h1>
-<p>
-  Flash the <strong>Aliro door-lock reader</strong> firmware to a
-  supported ESP32 board over USB, then commission it into Apple Home,
-  Google Home, or Home Assistant as a Matter door lock. The installer
-  ships three variants: M5Stack NanoC6 over Thread, M5Stack NanoC6 over
-  Wi-Fi, and M5Stack AtomS3 Lite over Wi-Fi. Thread variants need a
-  Thread border router on your LAN; Wi-Fi variants need a 2.4 GHz Wi-Fi
-  network the phone can also see.
-</p>
+<header class="site-nav">
+  <a class="brand" href="#main" aria-label="Aliro Lock home">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 28 28" role="img">
+        <path d="M8.5 12V8.5a5.5 5.5 0 0 1 11 0V12" />
+        <rect x="5" y="11" width="18" height="13" rx="3" />
+        <circle cx="14" cy="17" r="1.7" />
+      </svg>
+    </span>
+    <span>Aliro<span class="brand-accent">Lock</span></span>
+  </a>
+  <nav aria-label="Primary navigation">
+    <a href="#hardware-heading">Hardware</a>
+    <a href="#connection-heading">Installer</a>
+    <a href="https://github.com/mullender/aliro-doorlock-esp32">Source</a>
+  </nav>
+</header>
 
-<section class="hardware-card" aria-labelledby="hardware-heading">
+<main id="main">
+
+<section class="hero" aria-labelledby="hero-title">
+  <div class="hero-copy">
+    <p class="eyebrow">NFC credentials · Matter control · local firmware</p>
+    <h1 id="hero-title">A wallet key for the lock you build.</h1>
+    <p class="hero-lede">
+      Flash an M5Stack board over USB, add it to your smart home, and use
+      an Aliro credential at the NFC reader. Choose Matter over Thread or
+      Wi-Fi from one firmware matrix.
+    </p>
+    <div class="hero-actions">
+      <a class="button button-primary" href="#connection-heading">Open the installer</a>
+      <a class="button" href="#hardware-heading">Choose hardware</a>
+    </div>
+    <ul class="hero-facts" aria-label="Project facts">
+      <li><strong>3</strong><span>firmware variants</span></li>
+      <li><strong>$13</strong><span>NanoC6 build</span></li>
+      <li><strong>0</strong><span>cloud services</span></li>
+    </ul>
+  </div>
+
+  <div class="hero-visual" aria-label="A phone presents an Aliro credential to an NFC reader connected to a Matter lock">
+    <div class="visual-header">
+      <span>credential path</span>
+      <span class="live"><i aria-hidden="true"></i> local</span>
+    </div>
+    <svg viewBox="0 0 620 330" role="img" aria-labelledby="visual-title visual-desc">
+      <title id="visual-title">Aliro credential and Matter lock flow</title>
+      <desc id="visual-desc">A phone sends an NFC credential to an M5Stack reader. The reader updates a Matter lock over Thread or Wi-Fi.</desc>
+      <defs>
+        <linearGradient id="signal-gradient" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="var(--accent)" stop-opacity="0" />
+          <stop offset="0.5" stop-color="var(--accent)" />
+          <stop offset="1" stop-color="var(--accent)" stop-opacity="0" />
+        </linearGradient>
+      </defs>
+      <g class="visual-grid">
+        <path d="M30 55H590M30 110H590M30 165H590M30 220H590M30 275H590" />
+        <path d="M85 25V305M195 25V305M305 25V305M415 25V305M525 25V305" />
+      </g>
+      <g class="phone" transform="translate(88 76)">
+        <rect width="104" height="178" rx="18" />
+        <rect class="screen" x="9" y="13" width="86" height="145" rx="12" />
+        <path class="key-mark" d="M37 77a15 15 0 1 1 26 10l-8 8h-9v9h-9V92l8-8a15 15 0 0 1-8-7Z" />
+        <circle class="key-hole" cx="52" cy="69" r="5" />
+        <line x1="39" y1="166" x2="65" y2="166" />
+      </g>
+      <g class="nfc-waves">
+        <path d="M216 124q28 34 0 68" />
+        <path d="M233 108q43 50 0 100" />
+        <path d="M250 92q59 66 0 132" />
+      </g>
+      <g class="reader" transform="translate(291 96)">
+        <rect width="126" height="138" rx="15" />
+        <circle cx="63" cy="56" r="31" />
+        <circle cx="63" cy="56" r="18" />
+        <path d="M43 109h40" />
+        <circle class="status-dot" cx="63" cy="109" r="5" />
+      </g>
+      <path class="matter-link" d="M417 165H493" />
+      <circle class="matter-pulse" cx="455" cy="165" r="6" />
+      <g class="lock" transform="translate(492 98)">
+        <path d="M20 54V34a32 32 0 0 1 64 0v20" />
+        <rect x="4" y="52" width="96" height="92" rx="15" />
+        <circle cx="52" cy="92" r="8" />
+        <path d="M52 100v18" />
+      </g>
+      <text x="140" y="286" text-anchor="middle">wallet</text>
+      <text x="354" y="286" text-anchor="middle">NFC reader</text>
+      <text x="544" y="286" text-anchor="middle">Matter lock</text>
+    </svg>
+    <div class="transport-strip">
+      <span><i class="dot thread-dot" aria-hidden="true"></i> Thread</span>
+      <span><i class="dot wifi-dot" aria-hidden="true"></i> Wi-Fi</span>
+      <span class="transport-note">one board · one transport</span>
+    </div>
+  </div>
+</section>
+
+<section class="hardware-card numbered-section" data-section="01 / HARDWARE" aria-labelledby="hardware-heading">
   <h2 id="hardware-heading">Build a $13 tap-to-lock or unlock Matter lock</h2>
+  <p class="section-lede">Choose one controller, then add the same NFC reader. The Grove cable connects them without soldering.</p>
+
+  <div class="product-grid">
+    <a class="product-card" href="https://shop.m5stack.com/products/m5stack-nanoc6-dev-kit" target="_blank" rel="noreferrer">
+      <span class="product-kind">Controller · recommended</span>
+      <span class="product-art board-art" aria-hidden="true"><i></i><i></i><i></i></span>
+      <strong>M5Stack NanoC6</strong>
+      <span class="product-detail">Matter over Thread or Wi-Fi</span>
+      <span class="product-price">$5.95 <em>View at M5Stack ↗</em></span>
+    </a>
+    <a class="product-card" href="https://shop.m5stack.com/products/atoms3-lite-esp32s3-dev-kit" target="_blank" rel="noreferrer">
+      <span class="product-kind">Controller · Wi-Fi</span>
+      <span class="product-art atom-art" aria-hidden="true"><i></i></span>
+      <strong>M5Stack AtomS3 Lite</strong>
+      <span class="product-detail">Matter over Wi-Fi</span>
+      <span class="product-price">$7.50 <em>View at M5Stack ↗</em></span>
+    </a>
+    <a class="product-card" href="https://shop.m5stack.com/products/nfc-universal-unit-st25r3916" target="_blank" rel="noreferrer">
+      <span class="product-kind">Reader · required</span>
+      <span class="product-art nfc-art" aria-hidden="true"><i></i><i></i></span>
+      <strong>NFC Universal Unit</strong>
+      <span class="product-detail">ST25R3916 · Grove I²C</span>
+      <span class="product-price">$7.00 <em>View at M5Stack ↗</em></span>
+    </a>
+  </div>
+
+  <p class="hardware-total">About $13 total for NanoC6 plus NFC before tax and shipping.</p>
   <p>
-    Connect a
-    <a href="https://shop.m5stack.com/products/m5stack-nanoc6-dev-kit">M5Stack NanoC6 Dev Kit</a>
-    (about $6) to an
-    <a href="https://shop.m5stack.com/products/nfc-universal-unit-st25r3916">M5Stack NFC Universal Unit</a>
-    ($7.00).
-  </p>
-  <p class="hardware-total">About $13 total before tax and shipping.</p>
-  <p>
-    The result is a virtual Matter-over-Thread door lock. Tap a tested
-    Apple Home Key at the NFC reader, then use the lock state to start an
-    automation. For example, unlock a real lock, open a garage door,
-    disarm an alarm, or run another action.
+    The result is a virtual Matter door lock. Tap a tested Apple Home Key at
+    the NFC reader, then use the lock state to start an automation. For
+    example, unlock a real lock, open a garage door, or disarm an alarm.
   </p>
   <p>
     Aliro is designed for wallet credentials across smart-home ecosystems.
@@ -158,7 +266,7 @@
   </p>
 </section>
 
-<section class="serial-card connection-card" aria-labelledby="connection-heading">
+<section class="serial-card connection-card numbered-section" data-section="02 / CONNECT" aria-labelledby="connection-heading">
   <h2 id="connection-heading">Connect and read lock status</h2>
   <p>
     Connect the lock to read its boot status, pairing codes, and Matter
@@ -331,27 +439,32 @@
   </div>
 </section>
 
-<h2>Before you start</h2>
-<ul>
-  <li>A USB-C data-capable cable and one supported board with the Unit
-    NFC (ST25R3916) attached over Grove: an M5Stack NanoC6 for the
-    Thread or the Wi-Fi variant, or an M5Stack AtomS3 Lite for the
-    Wi-Fi variant.</li>
-  <li>Chrome or Edge on macOS, Linux, or Windows (Web Serial API required).
-    Safari and Firefox do not support Web Serial.</li>
-  <li>The Matter transport your chosen variant uses:
-    <ul>
-      <li>Thread variant: a Thread border router on your LAN
-        (Home Assistant + SkyConnect / ZBT-1 / ZBT-2, Apple HomePod mini
-        or second-generation HomePod, or Google Nest Hub 2nd gen).</li>
-      <li>Wi-Fi variant: a 2.4 GHz Wi-Fi network the phone that
-        commissions the lock can also reach.</li>
-    </ul>
-  </li>
-  <li>Bluetooth on your phone; Matter commissioning runs over BLE.</li>
-</ul>
+<section class="page-section numbered-section" data-section="03 / PREPARE">
+  <h2>Before you start</h2>
+  <ul class="check-list">
+    <li>A USB-C data cable and one supported board with the NFC Universal
+      Unit attached over Grove.</li>
+    <li>Chrome or Edge on macOS, Linux, or Windows. Safari and Firefox do
+      not support Web Serial.</li>
+    <li>Bluetooth on your phone. Matter commissioning starts over BLE.</li>
+  </ul>
+  <div class="transport-grid" aria-label="Matter transport requirements">
+    <article>
+      <span class="transport-label"><i class="dot thread-dot" aria-hidden="true"></i> Matter over Thread</span>
+      <strong>NanoC6</strong>
+      <p>Needs a Thread border router on your LAN, such as a HomePod mini,
+        Nest Hub 2nd gen, or Home Assistant with a Thread radio.</p>
+    </article>
+    <article>
+      <span class="transport-label"><i class="dot wifi-dot" aria-hidden="true"></i> Matter over Wi-Fi</span>
+      <strong>NanoC6 or AtomS3 Lite</strong>
+      <p>Needs a 2.4 GHz Wi-Fi network that the phone can reach during
+        commissioning. This variant also hosts the local status page.</p>
+    </article>
+  </div>
+</section>
 
-<section class="install-card update-card" aria-labelledby="update-heading">
+<section class="install-card update-card numbered-section" data-section="04 / UPDATE" aria-labelledby="update-heading">
   <h2 id="update-heading">Update firmware — keep setup</h2>
   <div class="version-list">
     <span>Installed: <strong id="installed-version">Unknown</strong></span>
@@ -391,7 +504,7 @@
   setup data to a remote service.
 </div>
 
-<section class="install-card" aria-labelledby="decommission-heading">
+<section class="install-card numbered-section" data-section="05 / REMOVE" aria-labelledby="decommission-heading">
   <h2 id="decommission-heading">Remove or reset the lock</h2>
   <ul>
     <li>To remove one Matter service, remove the lock in that service's app. Do not erase the lock while other services use it.</li>
@@ -400,7 +513,7 @@
   </ul>
 </section>
 
-<section class="install-card danger-card" aria-labelledby="factory-heading">
+<section class="install-card danger-card numbered-section" data-section="06 / FACTORY INSTALL" aria-labelledby="factory-heading">
   <h2 id="factory-heading">Factory install — erase everything</h2>
   <p><strong>Use this for a first install or recovery.</strong> It erases the
     entire flash. You will lose Matter fabrics, Matter transport
@@ -457,7 +570,7 @@
   removing <code>?dev=1</code> from the URL.
 </div>
 
-<section class="serial-card" aria-labelledby="serial-heading">
+<section class="serial-card numbered-section" data-section="07 / CONSOLE" aria-labelledby="serial-heading">
   <h2 id="serial-heading">Logs and device controls</h2>
   <p>
     Review the local device log or use the manual controls. If the log contains

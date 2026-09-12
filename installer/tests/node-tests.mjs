@@ -3478,6 +3478,8 @@ test("deploy-installer.yml calls scripts/assemble_release.py before Pages upload
   assert.match(workflow, /--out     work\/assembled/);
   // The verified output gets copied into _site before Pages runs.
   assert.match(workflow, /cp -R work\/assembled\/\. _site\//);
+  assert.match(workflow, /cp installer\/site\.css _site\/site\.css/,
+    "workflow must publish the landing-page stylesheet");
   // Order: the assemble step must appear BEFORE upload-pages-artifact.
   const assemblePos = workflow.indexOf("Assemble the matrix release");
   const uploadPos = workflow.indexOf("upload-pages-artifact");
@@ -4070,6 +4072,21 @@ test("HTML wires the three-variant selector, warning, and inert update button wi
   assert.match(html, /Thread border router/);
   assert.match(html, /2\.4 GHz Wi-Fi/);
   assert.match(html, /AtomS3 Lite/);
+});
+
+test("installer landing page links the local stylesheet and each supported M5Stack product", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../site.css", import.meta.url), "utf8");
+
+  assert.match(html, /<link rel="stylesheet" href="\.\/site\.css"\s*\/>/);
+  assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/m5stack-nanoc6-dev-kit"/);
+  assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/atoms3-lite-esp32s3-dev-kit"/);
+  assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/nfc-universal-unit-st25r3916"/);
+  assert.match(html, /About \$13 total for NanoC6 plus NFC/);
+  assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;/,
+    "landing styles must not expose hidden recovery controls");
+  assert.match(css, /esp-web-install-button:not\(:defined\)\s*>\s*button\[slot\]\s*\{\s*display:\s*none;/,
+    "an unloaded installer component must not expose every fallback button");
 });
 
 // Correction 2 finding 1: an eligible preserving update must remain

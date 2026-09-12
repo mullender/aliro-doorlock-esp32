@@ -280,6 +280,7 @@ jobs:
           mkdir -p _site _site/vendor _site/vendor/dist _site/js
 
           cp installer/index.html _site/index.html
+          cp installer/site.css _site/site.css
           cp installer/js/*.js _site/js/
           cp installer/vendor/qrcode.js _site/vendor/qrcode.js
           cp -r installer/vendor/esp-web-tools/dist/web/* _site/vendor/dist/
