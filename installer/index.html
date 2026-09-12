@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="Build and flash an open Matter door-lock reader with Aliro NFC credentials." />
   <meta name="theme-color" content="#071211" />
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
   <title>Aliro Lock — Matter door-lock firmware</title>
   <style>
     :root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --line: #ccc; --accent: #067a46; --action: #067a46; --error: #a11; --warn-bg: #fff3cd; --warn-fg: #533f03; --warn-border: #ffcc00; }
@@ -138,12 +139,12 @@
 
 <section class="hero" aria-labelledby="hero-title">
   <div class="hero-copy">
-    <p class="eyebrow">NFC credentials · Matter control · local firmware</p>
-    <h1 id="hero-title">A wallet key for the lock you build.</h1>
+    <p class="eyebrow">Virtual Matter lock · NFC credentials · local firmware</p>
+    <h1 id="hero-title">A virtual lock for your real entrance.</h1>
     <p class="hero-lede">
-      Flash an M5Stack board over USB, add it to your smart home, and use
-      an Aliro credential at the NFC reader. Choose Matter over Thread or
-      Wi-Fi from one firmware matrix.
+      Aliro Lock is a virtual lock in Apple Home, Google Home, or Home
+      Assistant. Tap an Aliro credential at its NFC reader, then use the
+      virtual lock state to trigger your real door, gate, or garage.
     </p>
     <div class="hero-actions">
       <a class="button button-primary" href="#connection-heading">Open the installer</a>
@@ -152,7 +153,7 @@
     <ul class="hero-facts" aria-label="Project facts">
       <li><strong>3</strong><span>firmware variants</span></li>
       <li><strong>$13</strong><span>NanoC6 build</span></li>
-      <li><strong>0</strong><span>cloud services</span></li>
+      <li><strong>Virtual</strong><span>Matter lock</span></li>
     </ul>
   </div>
 
@@ -204,14 +205,51 @@
       </g>
       <text x="140" y="286" text-anchor="middle">wallet</text>
       <text x="354" y="286" text-anchor="middle">NFC reader</text>
-      <text x="544" y="286" text-anchor="middle">Matter lock</text>
+      <text x="544" y="286" text-anchor="middle">virtual lock</text>
     </svg>
     <div class="transport-strip">
       <span><i class="dot thread-dot" aria-hidden="true"></i> Thread</span>
       <span><i class="dot wifi-dot" aria-hidden="true"></i> Wi-Fi</span>
-      <span class="transport-note">one board · one transport</span>
+      <span class="transport-note">automation → real entrance</span>
     </div>
   </div>
+</section>
+
+<section class="automation-story" aria-labelledby="automation-heading">
+  <div class="story-intro">
+    <p class="eyebrow">How it works</p>
+    <h2 id="automation-heading">Turn a tap into an automation.</h2>
+    <p>
+      This reader does not drive a lock motor. It reports a lock or unlock
+      state through Matter. Your smart-home platform uses that state to run
+      an automation for a compatible lock, door strike, gate, or garage door.
+    </p>
+    <div class="platform-list" aria-label="Supported smart-home platforms">
+      <span>Apple Home</span>
+      <span>Google Home</span>
+      <span>Home Assistant</span>
+    </div>
+  </div>
+  <ol class="automation-flow">
+    <li>
+      <span>01</span>
+      <div><strong>Tap</strong><p>Present Apple Home Key or another Aliro credential to the separate NFC reader.</p></div>
+    </li>
+    <li>
+      <span>02</span>
+      <div><strong>Signal</strong><p>The reader changes the state of its virtual Matter lock.</p></div>
+    </li>
+    <li>
+      <span>03</span>
+      <div><strong>Act</strong><p>Your automation opens or closes the real entrance.</p></div>
+    </li>
+  </ol>
+  <p class="retrofit-note">
+    <strong>Already have a smart lock without NFC or Home Key?</strong>
+    Keep it. Add this reader as the trigger and let your hub connect the
+    virtual lock to the existing device. This does not change or certify
+    the existing lock.
+  </p>
 </section>
 
 <section class="hardware-card numbered-section" data-section="01 / HARDWARE" aria-labelledby="hardware-heading">

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Aliro Lock</title>
+  <rect width="64" height="64" rx="14" fill="#071211"/>
+  <path d="M21 28v-7a11 11 0 0 1 22 0v7" fill="none" stroke="#43e5b0" stroke-width="4" stroke-linecap="round"/>
+  <rect x="14" y="27" width="36" height="27" rx="7" fill="#10221f" stroke="#43e5b0" stroke-width="3"/>
+  <circle cx="32" cy="39" r="3.5" fill="#43e5b0"/>
+  <path d="M32 42v6" stroke="#43e5b0" stroke-width="3" stroke-linecap="round"/>
+</svg>

@@ -3480,6 +3480,8 @@ test("deploy-installer.yml calls scripts/assemble_release.py before Pages upload
   assert.match(workflow, /cp -R work\/assembled\/\. _site\//);
   assert.match(workflow, /cp installer\/site\.css _site\/site\.css/,
     "workflow must publish the landing-page stylesheet");
+  assert.match(workflow, /cp installer\/favicon\.svg _site\/favicon\.svg/,
+    "workflow must publish the favicon");
   // Order: the assemble step must appear BEFORE upload-pages-artifact.
   const assemblePos = workflow.indexOf("Assemble the matrix release");
   const uploadPos = workflow.indexOf("upload-pages-artifact");
@@ -4077,8 +4079,12 @@ test("HTML wires the three-variant selector, warning, and inert update button wi
 test("installer landing page links the local stylesheet and each supported M5Stack product", () => {
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
   const css = readFileSync(new URL("../site.css", import.meta.url), "utf8");
+  const favicon = readFileSync(new URL("../favicon.svg", import.meta.url), "utf8");
 
   assert.match(html, /<link rel="stylesheet" href="\.\/site\.css"\s*\/>/);
+  assert.match(html, /<link rel="icon" href="\.\/favicon\.svg" type="image\/svg\+xml"\s*\/>/);
+  assert.match(favicon, /<svg[^>]*viewBox="0 0 64 64"/);
+  assert.match(favicon, /#43e5b0/);
   assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/m5stack-nanoc6-dev-kit"/);
   assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/atoms3-lite-esp32s3-dev-kit"/);
   assert.match(html, /href="https:\/\/shop\.m5stack\.com\/products\/nfc-universal-unit-st25r3916"/);
@@ -4087,6 +4093,16 @@ test("installer landing page links the local stylesheet and each supported M5Sta
     "landing styles must not expose hidden recovery controls");
   assert.match(css, /esp-web-install-button:not\(:defined\)\s*>\s*button\[slot\]\s*\{\s*display:\s*none;/,
     "an unloaded installer component must not expose every fallback button");
+});
+
+test("landing page explains the virtual-lock automation path", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+
+  assert.match(html, /Aliro Lock is a virtual lock in Apple Home, Google Home, or Home\s+Assistant\./);
+  assert.match(html, /virtual Matter lock/);
+  assert.match(html, /compatible lock, door strike, gate, or garage door/);
+  assert.match(html, /Already have a smart lock without NFC or Home Key\?/);
+  assert.match(html, /This does not change or certify\s+the existing lock\./);
 });
 
 // Correction 2 finding 1: an eligible preserving update must remain

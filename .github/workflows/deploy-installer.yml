@@ -281,6 +281,7 @@ jobs:
 
           cp installer/index.html _site/index.html
           cp installer/site.css _site/site.css
+          cp installer/favicon.svg _site/favicon.svg
           cp installer/js/*.js _site/js/
           cp installer/vendor/qrcode.js _site/vendor/qrcode.js
           cp -r installer/vendor/esp-web-tools/dist/web/* _site/vendor/dist/
